@@ -42,11 +42,16 @@ import kotlinx.coroutines.launch
  * - Hold display-scoped [SCREEN_BRIGHT_WAKE_LOCK] Monitor + heartbeat [userActivity] on pane
  *   VDs for the whole AA session (Samsung OWN_DISPLAY_GROUP must not ColorFade).
  * - **Phone panel:** when DEFAULT_DISPLAY idle since last wake / real phone
- *   [userActivity](TOUCH|BUTTON|ACCESSIBILITY) exceeds [Settings.System.SCREEN_OFF_TIMEOUT],
- *   force [IPowerManager.goToSleep] on display 0 — **unless** the phone front task is a
- *   real user app (e.g. Maps). Do not rely on the system idle timer (AA / apps on VDs hold
- *   global bright locks that block it). Car / VD interaction must not reset that clock
- *   ([onVirtualDisplayUserInteraction] only keeps panes awake).
+ *   [userActivity](TOUCH|BUTTON|ACCESSIBILITY) exceeds the effective timeout
+ *   ([Settings.System.SCREEN_OFF_TIMEOUT] capped at 10s while the handset front is
+ *   launcher/SystemUI/lock), force [IPowerManager.goToSleep] on display 0 — **unless**
+ *   the phone front task is a real user app (e.g. Maps). Do not rely on the system idle
+ *   timer (AA / apps on VDs hold global bright locks that block it). Car / VD interaction
+ *   must not reset that clock ([onVirtualDisplayUserInteraction] only keeps panes awake).
+ *   Accidental flip/touch must not leave the panel bright for a full system timeout on
+ *   top of dual VDs (OEM thermal can then kill gearhead / VD tasks).
+ * - SCREEN_OFF: immediate pane keep-awake; full 10× reassert burst at most once per 8s
+ *   (flip thrashing must not storm PowerManager).
  * - Never use [ACQUIRE_CAUSES_WAKEUP] — leaks to the phone panel on Samsung. Pane OFF/DOZE uses
  *   a short display-scoped bright pulse without WAKEUP; phone SCREEN_OFF path is userActivity only.
  * - Presentation VD: no wake lock / userActivity / WAKEUP pulse (shares displayGroup 0).
@@ -66,6 +71,12 @@ class DisplaySessionPolicy(
         /** After phone SCREEN_OFF, reassert before the next heartbeat. */
         private const val SCREEN_OFF_REASSERT_COUNT = 10
         private const val SCREEN_OFF_REASSERT_INTERVAL_MS = 400L
+        /**
+         * Min gap between full SCREEN_OFF reassert bursts. Flip/touch thrashing can
+         * fire OFF→ON→OFF; skip the 10× reinforce loop when too soon (first keep-awake
+         * on each OFF still runs from onReceive).
+         */
+        private const val SCREEN_OFF_BURST_MIN_INTERVAL_MS = 8_000L
         /** PowerManager.USER_ACTIVITY_EVENT_OTHER */
         private const val USER_ACTIVITY_EVENT_OTHER = 0
         /** PowerManager.USER_ACTIVITY_EVENT_BUTTON */
@@ -92,6 +103,13 @@ class DisplaySessionPolicy(
         private const val PSEUDO_OFF_POLL_MS = 2_000L
         /** Back off after a forced sleep so SCREEN_OFF / VD keep-awake can settle. */
         private const val PSEUDO_OFF_FORCE_MIN_INTERVAL_MS = 8_000L
+        /**
+         * AA session + phone on launcher/SystemUI/lock: cap idle before force sleep.
+         * Accidental wake (flip/touch) must not leave the panel bright for the full
+         * [Settings.System.SCREEN_OFF_TIMEOUT] (often 30s+) on top of dual VDs.
+         * Real FG user apps still skip pseudo-off entirely.
+         */
+        private const val PSEUDO_OFF_AA_IDLE_CAP_MS = 10_000L
         /** PowerManager.GO_TO_SLEEP_REASON_TIMEOUT */
         private const val GO_TO_SLEEP_REASON_TIMEOUT = 2
         /**
@@ -117,6 +135,8 @@ class DisplaySessionPolicy(
     private var mPhoneWasInteractive = false
     private var mLastDefaultDisplayState = Display.STATE_UNKNOWN
     private var mLastForcePhoneOffAt = 0L
+    /** Uptime when the last full SCREEN_OFF reassert burst was started. */
+    private var mLastScreenOffBurstAt = 0L
     private var mScreenReceiverRegistered = false
     private var iPowerManagerService: Any? = null
     private var iPowerManagerUserActivity: Method? = null
@@ -555,7 +575,8 @@ class DisplaySessionPolicy(
         val now = SystemClock.uptimeMillis()
         if (now - mLastForcePhoneOffAt < PSEUDO_OFF_FORCE_MIN_INTERVAL_MS) return
         val idleMs = phoneDisplayGroupIdleMs()
-        val timeoutMs = screenOffTimeoutMs()
+        // No FG handset app: cap below system timeout so accidental wake cools fast.
+        val timeoutMs = screenOffTimeoutMs().coerceAtMost(PSEUDO_OFF_AA_IDLE_CAP_MS)
         if (idleMs < timeoutMs) return
         if (forcePhonePanelOff("pseudo-idle-${idleMs}ms/${timeoutMs}ms")) {
             mLastForcePhoneOffAt = now
@@ -640,6 +661,12 @@ class DisplaySessionPolicy(
     }
 
     private fun startScreenOffReassertBurst() {
+        val now = SystemClock.uptimeMillis()
+        if (now - mLastScreenOffBurstAt < SCREEN_OFF_BURST_MIN_INTERVAL_MS) {
+            // onReceive already did a single keep-awake; skip reinforce storm.
+            return
+        }
+        mLastScreenOffBurstAt = now
         cancelScreenOffReassertBurst()
         mScreenOffReassertJob = CoroutineScope(Dispatchers.Default).launch {
             // First assert already ran from onReceive; reinforce while DreamManager settles.

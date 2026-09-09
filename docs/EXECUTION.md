@@ -255,17 +255,19 @@ VD flags（`SplitVdLifecycle.vdFlags`）——**不要加 `VIRTUAL_DISPLAY_FLAG_
 | AA `onDestroy` / Fragment `onDestroy` | `CoreApi.onDestroyDisplay` → `policy.onDestroy` → **延迟 180s** 再 `controller.onDestroy()` |
 | 180s 内重连 | `onResume`：`cancelAndJoin` 销毁任务，VD 复用 |
 | 180s 到 | 释放 lock、拆 VD、清 profile lock、forceStop 窗内应用 |
-| 手机 SCREEN_OFF | 立刻 keep-awake + 约 4s burst；heartbeat 改为 3s |
+| 手机 SCREEN_OFF | 立刻 keep-awake；完整约 4s burst 最短间隔 **8s**（抖动时跳过加固循环）；heartbeat 改为 3s |
 | 手机主屏触控/按键 | 重置伪熄屏 idle（`PowerManagerService.userActivity` display 0） |
 | 手机主屏前台用户应用（如地图） | **跳过**伪熄屏 `goToSleep`；回桌面后再计时 |
+| 手机主屏为桌面/锁屏/SystemUI | 伪熄超时 = `min(SCREEN_OFF_TIMEOUT, **10s**)`，缩短误触亮屏窗口 |
 | 触控/按键（车机 / VD） | `onVirtualDisplayUserInteraction`（1s 节流）；**不**续手机伪熄屏 |
 
 Keep-awake 硬规则：
 
 - AA 窗 **不许停在 ColorFade/OFF**（三星 `OWN_DISPLAY_GROUP` 会跟手机一起 doze）。
 - `IPowerManager.userActivity` **只走带 displayId 的四参重载**；禁止全局 overload（会亮手机主屏）。
-- 伪熄屏：系统 idle 被 VD 全局锁挡住时，按 `SCREEN_OFF_TIMEOUT` 对 display 0 `goToSleep`；计时锚点 = 亮屏 / 会话开始 / **主屏** TOUCH·BUTTON·A11Y；主屏前台为用户应用时不强制熄；车机操作不重置。
+- 伪熄屏：系统 idle 被 VD 全局锁挡住时，对 display 0 `goToSleep`；无手机 FG 用户应用时超时上限 **10s**（`min(SCREEN_OFF_TIMEOUT, 10s)`），有地图等 FG 应用则跳过；计时锚点 = 亮屏 / 会话开始 / **主屏** TOUCH·BUTTON·A11Y；车机操作不重置。
 - `ACQUIRE_CAUSES_WAKEUP` 只做短 pulse，不要长持。
+- 手机 `SCREEN_OFF`：每次立刻单次 keep-awake；完整 reassert burst 最短间隔 **8s**。
 
 `SplitDisplayController.onDestroy`：先 persist 快照 → 卸 TaskStackListener → `removeTask` 窗内任务 → `forceStopPackageAsUser` → `VirtualDisplay.release`。
 
