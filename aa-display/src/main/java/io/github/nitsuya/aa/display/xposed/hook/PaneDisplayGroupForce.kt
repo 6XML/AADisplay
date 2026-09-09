@@ -162,13 +162,48 @@ object PaneDisplayGroupForce {
 
     private fun alwaysUnlockedDisplayFlag(): Int? {
         return try {
-            Class.forName("android.view.Display")
+            (AndroidHook.loadSystemClass("android.view.Display") ?: Display::class.java)
                 .getField("FLAG_ALWAYS_UNLOCKED")
                 .getInt(null)
         } catch (_: Throwable) {
             // AOSP Display.FLAG_ALWAYS_UNLOCKED — not VIRTUAL_DISPLAY_FLAG_ALWAYS_UNLOCKED.
             1 shl 9
         }
+    }
+
+    /**
+     * Prefer an existing [DisplayGroup] instance's Class (always on the right loader),
+     * then [AndroidHook.loadSystemClass], then mapper's ClassLoader.
+     */
+    private fun resolveDisplayGroupClass(
+        mapperObj: Any,
+        groups: SparseArray<Any>,
+        defaultGroup: Any?,
+    ): Class<*>? {
+        defaultGroup?.javaClass?.let { return it }
+        for (i in 0 until groups.size()) {
+            groups.valueAt(i)?.javaClass?.let { return it }
+        }
+        AndroidHook.loadSystemClass("com.android.server.display.DisplayGroup")?.let { return it }
+        val cl = mapperObj.javaClass.classLoader ?: return null
+        return runCatching {
+            Class.forName("com.android.server.display.DisplayGroup", false, cl)
+        }.getOrNull()
+    }
+
+    private fun newDisplayGroupInstance(dgClass: Class<*>, groupId: Int): Any? {
+        runCatching {
+            return dgClass.getConstructor(Int::class.javaPrimitiveType).newInstance(groupId)
+        }
+        for (ctor in dgClass.declaredConstructors) {
+            if (ctor.parameterTypes.size != 1) continue
+            if (ctor.parameterTypes[0] != Int::class.javaPrimitiveType) continue
+            return runCatching {
+                ctor.isAccessible = true
+                ctor.newInstance(groupId)
+            }.getOrNull()
+        }
+        return null
     }
 
     private fun manualMoveToOwnGroup(mapperObj: Any, display: Any) {
@@ -202,8 +237,16 @@ object PaneDisplayGroupForce {
 
         var newGroup = groups.get(newGroupId)
         if (newGroup == null) {
-            val dgClass = Class.forName("com.android.server.display.DisplayGroup")
-            newGroup = dgClass.getConstructor(Int::class.javaPrimitiveType).newInstance(newGroupId)
+            // Never Class.forName without system_server CL — module InMemoryDex cannot see
+            // services.jar (Samsung A13 / LSPosed: CNFE spam every keyguard policy retry).
+            val dgClass = resolveDisplayGroupClass(mapperObj, groups, defaultGroup) ?: run {
+                log(TAG, "manualMove: DisplayGroup class unavailable (stay group 0)")
+                return
+            }
+            newGroup = newDisplayGroupInstance(dgClass, newGroupId) ?: run {
+                log(TAG, "manualMove: DisplayGroup ctor failed for id=$newGroupId")
+                return
+            }
             groups.put(newGroupId, newGroup)
         }
 
@@ -315,9 +358,12 @@ object PaneDisplayGroupForce {
 
     private fun findDms(): Any? {
         runCatching {
-            val localServices = Class.forName("com.android.server.LocalServices")
+            val localServices = AndroidHook.loadSystemClass("com.android.server.LocalServices")
+                ?: return@runCatching null
             val getService = localServices.getMethod("getService", Class::class.java)
-            val internalClass = Class.forName("com.android.server.display.DisplayManagerInternal")
+            val internalClass = AndroidHook.loadSystemClass(
+                "com.android.server.display.DisplayManagerInternal",
+            ) ?: return@runCatching null
             val internal = getService.invoke(null, internalClass) ?: return@runCatching null
             findFieldValue(internal, "this\$0")
                 ?: findFieldValue(internal, "mService")
