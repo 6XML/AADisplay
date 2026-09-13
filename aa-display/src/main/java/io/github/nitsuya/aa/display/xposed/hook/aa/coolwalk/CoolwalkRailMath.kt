@@ -30,6 +30,25 @@ object CoolwalkRailMath {
 
     fun absoluteFacetRailBand(): IntRange = FACET_RAIL_ABS_MIN..FACET_RAIL_ABS_MAX
 
+    /**
+     * LayoutInfo ctor width/height are in **dp** (see `mLayoutWidthDp`); Coolwalk rail math and
+     * `content_bounds` are in **px**. At 144dpi, 1280×720px arrives as 1422×800 — treating that
+     * as px inflated fullHu, blocked DrawingSpec widen (gap 225 ≠ one rail), and locked profile
+     * at 1197. At 160dpi dp==px so the bug was latent; 213dpi often still converged because
+     * dp-full stayed below the px content_bounds edge.
+     */
+    fun layoutInfoDpToPx(dp: Int, densityDpi: Int): Int {
+        if (dp <= 0) return 0
+        if (densityDpi <= 0 || densityDpi == 160) return dp
+        return (dp * densityDpi + 80) / 160
+    }
+
+    fun layoutInfoPxToDp(px: Int, densityDpi: Int): Int {
+        if (px <= 0) return 0
+        if (densityDpi <= 0 || densityDpi == 160) return px
+        return (px * 160 + densityDpi / 2) / densityDpi
+    }
+
     fun railPxRange(fullW: Int): IntRange {
         if (fullW <= 0) return absoluteFacetRailBand()
         val max = (fullW * 0.25f).roundToInt().coerceAtLeast(120).coerceAtMost(fullW / 2)
@@ -71,9 +90,11 @@ object CoolwalkRailMath {
     fun isPlausibleRailGap(gap: Int, fullW: Int, observedRailWidthPx: Int = 0): Boolean {
         if (gap <= 1 || fullW <= 0) return false
         if (gap !in absoluteFacetRailBand()) return false
+        // When a live FacetBar width is known, require a match — do not fall through to the
+        // %‑of‑HU band (unrelated gaps next to an 83px rail were accepted and poisoned fullHu).
         if (observedRailWidthPx > 1) {
             val jitter = maxOf(RAIL_MEASUREMENT_JITTER_PX, observedRailWidthPx / 5)
-            if (abs(gap - observedRailWidthPx) <= jitter) return true
+            return abs(gap - observedRailWidthPx) <= jitter
         }
         // Single rail only — reject 2×rail (720+80+80) via ~15% HU cap, absolute max 160px.
         val maxSingle = minOf(

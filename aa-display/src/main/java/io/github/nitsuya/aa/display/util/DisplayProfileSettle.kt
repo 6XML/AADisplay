@@ -87,6 +87,9 @@ internal object DisplayProfileSettle {
      * Live AaDisplayActivity presentation width (Car SDK VirtualDisplay), or 0 if absent.
      * system_server can see this private VD; used to detect content-slot stuck after
      * FacetBar starve (right gutter = fullHu − presentationW).
+     *
+     * Car SDK often names the surface `gearhead/<obfuscated>` (e.g. `…/xdn`), **not**
+     * `AaDisplayActivity` — matching only the activity class name left stuck-detection blind.
      */
     fun observeAaDisplayPresentationWidthPx(context: Context): Int {
         val dm = context.getSystemService(DisplayManager::class.java) ?: return 0
@@ -94,7 +97,20 @@ internal object DisplayProfileSettle {
         for (display in dm.displays) {
             if (display.displayId == Display.DEFAULT_DISPLAY) continue
             val name = runCatching { display.name }.getOrNull() ?: continue
-            if (!name.contains("AaDisplayActivity", ignoreCase = true)) continue
+            if (isRailDisplayName(name)) continue
+            if (name.contains("Dashboard", ignoreCase = true)) continue
+            if (name.startsWith("AADisplay-")) continue
+            val namedActivity = name.contains("AaDisplayActivity", ignoreCase = true)
+            val flags = runCatching { display.flags }.getOrDefault(0)
+            val presentationFlag = (flags and Display.FLAG_PRESENTATION) != 0
+            // Prefer explicit activity name; else gearhead Car presentation surfaces.
+            if (!namedActivity && !presentationFlag) continue
+            if (!namedActivity &&
+                !name.contains("gearhead", ignoreCase = true) &&
+                !name.contains("projection", ignoreCase = true)
+            ) {
+                continue
+            }
             val w = runCatching { display.mode.physicalWidth }.getOrNull() ?: continue
             val h = runCatching { display.mode.physicalHeight }.getOrNull() ?: continue
             if (w <= 1 || h <= 1) continue

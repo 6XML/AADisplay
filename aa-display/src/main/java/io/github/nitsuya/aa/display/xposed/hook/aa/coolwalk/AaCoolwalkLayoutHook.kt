@@ -1,10 +1,16 @@
 package io.github.nitsuya.aa.display.xposed.hook.aa.coolwalk
 
 import android.content.res.Resources
+import android.hardware.display.DisplayManager
+import android.util.DisplayMetrics
+import android.view.Display
+import com.github.kyuubiran.ezxhelper.init.InitFields
 import com.github.kyuubiran.ezxhelper.utils.findMethod
 import com.github.kyuubiran.ezxhelper.utils.hookAfter
 import com.github.kyuubiran.ezxhelper.utils.hookBefore
 import com.github.kyuubiran.ezxhelper.utils.loadClass
+import io.github.nitsuya.aa.display.util.DisplayDpiStore
+import io.github.nitsuya.aa.display.util.DisplayProfileSettle
 import io.github.nitsuya.aa.display.xposed.util.log
 import io.github.nitsuya.aa.display.xposed.util.logDebug
 import java.lang.reflect.Modifier
@@ -29,6 +35,7 @@ object AaCoolwalkLayoutHook {
                 ctor.hookAfter { param ->
                     val instance = param.thisObject ?: return@hookAfter
                     forceVerticalRailOnLayoutInfoInstance(env, instance)
+                    // mLayoutWidthDp holds px after [forceVerticalRailOnLayoutInfoArgs] conversion.
                     val w = env.mLayoutWidthDp
                     val h = env.mLayoutHeightDp
                     if (w > 0 && h > 0) {
@@ -62,8 +69,14 @@ object AaCoolwalkLayoutHook {
     private fun forceVerticalRailOnLayoutInfoArgs(env: CoolwalkHookEnv, args: Array<Any?>) {
         if (args.size < 6) return
         if (isAuxiliaryLayoutType(args)) return
-        (args[1] as? Int)?.takeIf { it > 0 }?.let { env.mLayoutWidthDp = it }
-        (args[2] as? Int)?.takeIf { it > 0 }?.let { env.mLayoutHeightDp = it }
+        val densityDpi = resolveLayoutInfoDensityDpi()
+        val rawW = args[1] as? Int ?: 0
+        val rawH = args[2] as? Int ?: 0
+        // Ctor args are dp; coordinator / content_bounds / DrawingSpec use px.
+        val widthPx = CoolwalkRailMath.layoutInfoDpToPx(rawW, densityDpi)
+        val heightPx = CoolwalkRailMath.layoutInfoDpToPx(rawH, densityDpi)
+        if (widthPx > 0) env.mLayoutWidthDp = widthPx
+        if (heightPx > 0) env.mLayoutHeightDp = heightPx
 
         val beforeLayoutId = args[0] as? Int
         val beforeType = args[3]
@@ -76,18 +89,51 @@ object AaCoolwalkLayoutHook {
         if (args[5] is Boolean) {
             args[5] = true
         }
-        widenLayoutInfoToFullHu(env, args)
+        widenLayoutInfoToFullHu(env, args, densityDpi)
 
         if (beforeRail != true ||
-            (env.resLayoutLeftResourceId != 0 && beforeLayoutId != env.resLayoutLeftResourceId)
+            (env.resLayoutLeftResourceId != 0 && beforeLayoutId != env.resLayoutLeftResourceId) ||
+            (densityDpi != 160 && (rawW != widthPx || rawH != heightPx))
         ) {
             logDebug(
                 CoolwalkHookEnv.TAG,
                 "AaUiHook: force vertical rail args " +
                     "layoutId=$beforeLayoutId→${args[0]} type=$beforeType→${args[3]} " +
-                    "hasVerticalRail=$beforeRail→${args[5]} size=${env.mLayoutWidthDp}x${env.mLayoutHeightDp}",
+                    "hasVerticalRail=$beforeRail→${args[5]} " +
+                    "sizeDp=${rawW}x$rawH→px=${env.mLayoutWidthDp}x${env.mLayoutHeightDp} dpi=$densityDpi",
             )
         }
+    }
+
+    /**
+     * HU / projection density for LayoutInfo dp↔px. Prefer live landscape VirtualDevice;
+     * fall back to manual override / last HU dpi (e.g. user-selected 144).
+     */
+    private fun resolveLayoutInfoDensityDpi(): Int {
+        runCatching {
+            val dm = InitFields.appContext.getSystemService(DisplayManager::class.java) ?: return@runCatching
+            for (display in dm.displays) {
+                if (display.displayId == Display.DEFAULT_DISPLAY) continue
+                val name = runCatching { display.name }.getOrNull() ?: continue
+                if (DisplayProfileSettle.isRailDisplayName(name)) continue
+                if (name.contains("Dashboard", ignoreCase = true)) continue
+                if (name.startsWith("AADisplay-")) continue
+                val metrics = DisplayMetrics()
+                @Suppress("DEPRECATION")
+                display.getRealMetrics(metrics)
+                if (metrics.widthPixels >= metrics.heightPixels &&
+                    metrics.densityDpi in DisplayDpiStore.MIN_DPI..DisplayDpiStore.MAX_DPI
+                ) {
+                    return metrics.densityDpi
+                }
+            }
+        }
+        val cr = runCatching { InitFields.appContext.contentResolver }.getOrNull()
+        val configured = DisplayDpiStore.loadConfigured(cr)
+        if (configured in DisplayDpiStore.MIN_DPI..DisplayDpiStore.MAX_DPI) return configured
+        val huLast = DisplayDpiStore.loadLastHuReported(cr)
+        if (huLast in DisplayDpiStore.MIN_DPI..DisplayDpiStore.MAX_DPI) return huLast
+        return DisplayMetrics.DENSITY_DEFAULT
     }
 
     private fun forceVerticalRailOnLayoutInfoInstance(env: CoolwalkHookEnv, instance: Any) {
@@ -117,26 +163,31 @@ object AaCoolwalkLayoutHook {
     /**
      * After forcing vertical rail, widen the canvas to this-connection full HU once
      * content_bounds reclaim zeroed the compositor slot. hasVerticalRail stays true.
+     * [args] width/height stay in **dp**; [CoolwalkHookEnv.mLayoutWidthDp] stores **px**.
      */
-    private fun widenLayoutInfoToFullHu(env: CoolwalkHookEnv, args: Array<Any?>) {
-        val rawW = args[1] as? Int ?: return
-        if (rawW <= 0) return
-        val h = (args[2] as? Int)?.takeIf { it > 0 } ?: env.mLayoutHeightDp
+    private fun widenLayoutInfoToFullHu(env: CoolwalkHookEnv, args: Array<Any?>, densityDpi: Int) {
+        val rawDp = args[1] as? Int ?: return
+        if (rawDp <= 0) return
+        val rawPx = CoolwalkRailMath.layoutInfoDpToPx(rawDp, densityDpi)
+        val hPx = (args[2] as? Int)?.takeIf { it > 0 }
+            ?.let { CoolwalkRailMath.layoutInfoDpToPx(it, densityDpi) }
+            ?: env.mLayoutHeightDp
         CoolwalkRailCoordinator.syncExternalTruth()
         CoolwalkRailCoordinator.maybeBeginReconnectIfNeeded("layoutInfo:pre-widen")
         val snap = CoolwalkRailCoordinator.current()
         val rail = snap.touchRailWidthPx
-        val sessionH = snap.layoutHeightPx.takeIf { it > 0 } ?: h
-        val anchor = CoolwalkRailCoordinator.resolveAnchorFullHuWidth(rawW, h, rail)
-        val fullHu = CoolwalkRailMath.pickConnectionFullHuWidth(anchor, sessionH, rawW, h, rail)
+        val sessionH = snap.layoutHeightPx.takeIf { it > 0 } ?: hPx
+        val anchor = CoolwalkRailCoordinator.resolveAnchorFullHuWidth(rawPx, hPx, rail)
+        val fullHu = CoolwalkRailMath.pickConnectionFullHuWidth(anchor, sessionH, rawPx, hPx, rail)
         val snapForResolve = snap.copy(fullHuWidthPx = fullHu)
-        val target = CoolwalkRailMath.resolveLayoutCanvasTargetPx(snapForResolve, rawW, h)
-        if (target <= rawW) return
-        args[1] = target
-        env.mLayoutWidthDp = target
+        val targetPx = CoolwalkRailMath.resolveLayoutCanvasTargetPx(snapForResolve, rawPx, hPx)
+        if (targetPx <= rawPx) return
+        args[1] = CoolwalkRailMath.layoutInfoPxToDp(targetPx, densityDpi)
+        env.mLayoutWidthDp = targetPx
         logDebug(
             CoolwalkHookEnv.TAG,
-            "AaUiHook: widen LayoutInfo canvas ${rawW}→$target (hasVerticalRail kept)",
+            "AaUiHook: widen LayoutInfo canvas ${rawDp}dp/${rawPx}px→${args[1]}dp/${targetPx}px " +
+                "(hasVerticalRail kept dpi=$densityDpi)",
         )
     }
 

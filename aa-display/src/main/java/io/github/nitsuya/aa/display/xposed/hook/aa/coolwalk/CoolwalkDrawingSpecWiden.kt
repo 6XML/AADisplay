@@ -25,13 +25,14 @@ object CoolwalkDrawingSpecWiden {
     private val gearheadInstalled = AtomicBoolean(false)
     private val aaDisplayInstalled = AtomicBoolean(false)
     private val creatorHookedClasses = ConcurrentHashMap.newKeySet<Class<*>>()
+    private val ctorHookedClasses = ConcurrentHashMap.newKeySet<Class<*>>()
 
     fun installGearhead(classLoader: ClassLoader) {
         if (!gearheadInstalled.compareAndSet(false, true)) return
         installOnClass(classLoader, ::resolveTargetWidthGearhead, "gearhead")
     }
 
-    /** AADisplay loads DrawingSpec from gearhead dex after Application.onCreate. */
+    /** AADisplay loads DrawingSpec from gearhead / Car host dex after Application.onCreate. */
     fun installAaDisplayLazy() {
         if (!aaDisplayInstalled.compareAndSet(false, true)) return
         val loader = runCatching { InitFields.appContext.classLoader }.getOrNull() ?: return
@@ -39,10 +40,20 @@ object CoolwalkDrawingSpecWiden {
             return
         }
         hookClassLoaderForDrawingSpec(loader)
+        scheduleAaDisplayInstallRetry(loader)
         logDebug(TAG, "DrawingSpec lazy loadClass hook armed (aadisplay)")
     }
 
     private fun hookClassLoaderForDrawingSpec(loader: ClassLoader) {
+        fun afterLoad(result: Any?) {
+            val clazz = result as? Class<*> ?: return
+            if (clazz.name != DRAWING_SPEC) return
+            installOnClass(
+                clazz.classLoader ?: loader,
+                ::resolveTargetWidthAaDisplay,
+                "aadisplay-lazy",
+            )
+        }
         runCatching {
             findMethod(ClassLoader::class.java) {
                 name == "loadClass" && parameterCount == 2 &&
@@ -50,12 +61,48 @@ object CoolwalkDrawingSpecWiden {
                     parameterTypes[1] == Boolean::class.javaPrimitiveType
             }.hookAfter { param ->
                 if (param.args[0] != DRAWING_SPEC) return@hookAfter
-                val clazz = param.result as? Class<*> ?: return@hookAfter
-                installOnClass(clazz.classLoader ?: loader, ::resolveTargetWidthAaDisplay, "aadisplay-lazy")
+                afterLoad(param.result)
             }
         }.onFailure { e ->
-            log(TAG, "DrawingSpec loadClass hook failed", e)
+            log(TAG, "DrawingSpec loadClass(2) hook failed", e)
         }
+        // Some host loaders resolve via loadClass(String) only.
+        runCatching {
+            findMethod(ClassLoader::class.java) {
+                name == "loadClass" && parameterCount == 1 &&
+                    parameterTypes[0] == String::class.java
+            }.hookAfter { param ->
+                if (param.args[0] != DRAWING_SPEC) return@hookAfter
+                afterLoad(param.result)
+            }
+        }.onFailure { e ->
+            log(TAG, "DrawingSpec loadClass(1) hook failed", e)
+        }
+    }
+
+    /** Car host ClassLoader may appear after first projection frame — retry briefly. */
+    private fun scheduleAaDisplayInstallRetry(appLoader: ClassLoader) {
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        var attempts = 0
+        val retry = object : Runnable {
+            override fun run() {
+                if (ctorHookedClasses.isNotEmpty() || creatorHookedClasses.isNotEmpty()) return
+                val loaders = listOfNotNull(
+                    appLoader,
+                    Thread.currentThread().contextClassLoader,
+                    runCatching { InitFields.appContext.classLoader }.getOrNull(),
+                ).distinct()
+                for (cl in loaders) {
+                    if (installOnClass(cl, ::resolveTargetWidthAaDisplay, "aadisplay-retry-$attempts")) {
+                        return
+                    }
+                }
+                if (++attempts < 24) {
+                    handler.postDelayed(this, 250L)
+                }
+            }
+        }
+        handler.postDelayed(retry, 100L)
     }
 
     private fun installOnClass(
@@ -75,6 +122,7 @@ object CoolwalkDrawingSpecWiden {
         resolveWidth: (Int, Int) -> Int,
         source: String,
     ): Boolean {
+        if (!ctorHookedClasses.add(specClass)) return true
         var hooked = 0
         for (ctor in specClass.declaredConstructors) {
             val p = ctor.parameterTypes
@@ -97,8 +145,10 @@ object CoolwalkDrawingSpecWiden {
         }
         if (hooked > 0) {
             logDebug(TAG, "hooked DrawingSpec constructors=$hooked source=$source")
+            return true
         }
-        return hooked > 0
+        ctorHookedClasses.remove(specClass)
+        return false
     }
 
     private fun installCreatorOnClass(

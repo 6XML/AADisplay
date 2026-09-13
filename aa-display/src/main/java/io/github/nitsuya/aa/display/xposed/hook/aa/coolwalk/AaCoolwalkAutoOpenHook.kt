@@ -98,16 +98,26 @@ object AaCoolwalkAutoOpenHook {
             return
         }
         val now = SystemClock.uptimeMillis()
-        // Starve + content_bounds often fire together — keep the first delay chain.
-        if (lastFullBleedRelaunchScheduleUptimeMs >= 0L &&
+        // Starve + content_bounds often fire together. Non-force keeps the first chain;
+        // force=true (content_bounds-widen / stuck-slot) must replace — otherwise a
+        // premature schedule 2ms earlier drops the widen relaunch and DrawingSpec stays
+        // at the content slot (right gutter).
+        val withinDebounce = lastFullBleedRelaunchScheduleUptimeMs >= 0L &&
             now - lastFullBleedRelaunchScheduleUptimeMs < FULL_BLEED_RELAUNCH_DEBOUNCE_MS
-        ) {
+        if (withinDebounce && !force) {
             logDebug(
                 CoolwalkHookEnv.TAG,
                 "AaUiHook: full-bleed relaunch debounced ($reason) " +
                     "elapsed=${now - lastFullBleedRelaunchScheduleUptimeMs}ms",
             )
             return
+        }
+        if (withinDebounce && force) {
+            logDebug(
+                CoolwalkHookEnv.TAG,
+                "AaUiHook: full-bleed relaunch replaced ($reason) " +
+                    "elapsed=${now - lastFullBleedRelaunchScheduleUptimeMs}ms",
+            )
         }
         lastFullBleedRelaunchScheduleUptimeMs = now
         env.mAaDisplayShownThisSession = false
