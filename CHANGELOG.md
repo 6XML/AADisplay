@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Added
+- **无线 CarPlay Source 出口（双轨 AA + CarPlay）：** 本模块进程内 `carplay/` — Bonjour `_carplay-ctrl._tcp.`、BT RFCOMM iAP2 骨架、RTSP 控制、AVC 编码、测试图案 / AA 壳 tee、`CarPlayProjectionService` FGS、`CarPlayHostActivity`（仅 CP 时 ImageReader → `CoreApi.onCreateSplitDisplay`）。触控经 `CarPlayInputBridge` → `touchAaDisplay`；音频出站占位。AIDL 追加 `reportCarPlaySessionLive` / `isCarPlaySessionLive`；`DisplaySessionPolicy` 感知 CP 会话。状态页可启停。协议为自研骨架（不 vendor CatPlay）；外参见 [docs/CARPLAY_REFS.md](docs/CARPLAY_REFS.md)（[WirelessCarPlay](https://github.com/45clouds/WirelessCarPlay) MIT：iAP2/CarPlay/认证 PDF 只读对照）。
+- **CarPlay RTP interleaved + 本地 loopback：** `RtpH264Packetizer`（RFC 6184 / FU-A）经 RTSP `$` 通道送 AVC；RECORD 后 `sendVideoAccessUnit`；debug 下 `CarPlayLocalLoopback` 自驱 SETUP/RECORD。FairPlay/HU 强校验仍待真机。
+- **CarPlay iAP2 Link Sync / Identification（对 diplay RFCOMM）：** 正确 detect（`FF55…`）+ `FF5A` 成帧/校验和；Source 侧 SYN/ACK 协商；发 `0x1D00`、收 `0x1D01`、回 `0x1D02`。`CarPlayBluetoothLink` dial bonded iAP2 UUID + listen 兜底。
+- **CarPlay iAP2 Auth + Wi-Fi / StartSession：** Source 走 `0xAA00…0xAA05`（收证+挑战，发 `AA05`，不验签）；随后 `0x4E0E`/`0x4E0D`/`0x5702`/`0x4300`；解析 `0x5703` 与 `0x4301`；`CarPlayWifiHandoff`（API29+ specifier）+ 有 IP 时 dial 控制口。FairPlay / pair-setup 仍待真机。
+- **CarPlay 联调修正（DiPlay 真机）：** phone UUID `…cafe` listen + accessory `…caff` dial；RFCOMM 连通后主动重发 detect；`GET /ctrl-int/1/connect` 回 binary-plist MIME。旧 APK 仍打 `iAP inbound` 日志时说明未装上本改动。
+- **CarPlay 真机推进：** 对 DiPlay 已跑通 iAP2 Ident/Auth/`0x5703`/`0x4301`；StartSession 后以 AirPlay **客户端**探测 `GET /info`/`OPTIONS`。已连同网时跳过 WiFi specifier。
+- **CarPlay AirPlay Pair-Setup + Pair-Verify（对 DiPlay）：** TLV8 + SRP-3072/SHA-512（PIN `3939`）走 **persistent M1–M6**（DiPlay 忽略 transient FLAGS，且只在 M6 持久化 controller LTPK）；随后 **pair-verify** X25519 → `Control-Salt` Write/Read 密钥。Ed25519/X25519 用 BouncyCastle（与 DiPlay 同，规避三星 API33 无平台 Ed25519）。对照 DiPlay `PairSetup` / `PairVerify` / `AirPlaySession`（ControlCipher 仅在 verify M4 之后启用）。
+- **CarPlay 加密控制帧 + SETUP/RECORD：** pair-verify 后用 Control-Write/Read 做 HAP 成帧（`u16le` + ChaCha20-Poly1305，长度作 AAD、分向计数 nonce，帧长上限 `0x4000` 对齐 DiPlay）；主动发 SETUP(session) → RECORD → SETUP(screen type=110)。
+- **CarPlay screen dataPort 出画：** SETUP 回 `dataPort` 后 TCP 连上；用 **pair-verify X25519 shared**（非 SRP sessionKey）派生 `DataStream-Salt{id}` / `DataStream-Output-Encryption-Key`（DiPlay `CarPlayMediaEngine.outputKey`）；128B 头 + AVC（CONFIG/VIDEO，ChaCha AAD=头）。无 FairPlay 的 HKP 路径先跑通；legacy AES/`fp-setup` 仍待真机。
+- **CarPlay dial 等 WiFi：** StartSession 后先等 accessory WiFi `onAvailable`/已同 SSID，再 probe+重试 dial `IP:7000`（避免 handoff 未完成时 `ECONNABORTED`）。
+- **CarPlay bplist 端口解析：** 不再对 1/2/4 字节整数做符号扩展（DiPlay 把 `dataPort`/`eventPort` 写成无符号位型）；修掉 SETUP screen「有 body 却缺 dataPort」假阴性。
+- **CarPlay screen CONFIG→avcC：** DiPlay `detectConfig` 把 Annex-B/长度前缀 SPS+PPS 误判为 H265（rx 有帧、shown=0 黑屏）；改为发 ISO `AVCDecoderConfigurationRecord` + `avcC` fourcc 包装。真机对 DiPlay 已出画（`first frame rendered`）。
+- **CarPlay event 通道：** SETUP `eventPort` 上用 `Events-Salt` Write/Read 密钥（对照 DiPlay `acceptEvent`）；处理 `forceKeyFrame`→`MediaCodec` IDR、`hidSendReport` 触控→`CarPlayInputBridge`；/info `widthPixels`/`heightPixels` 作 HID 坐标空间。
+- **CarPlay 对 DiPlay 真机全链路（屏 + 音 + 触控）：** 双机联调（手机 Source ↔ DiPlay Host）跑通：screen 128B 头 **NTP 32.32 改小端**（对照 DiPlay `CarPlayMediaEngine` 解密布局）；event 通道密钥**互补交换**（`Events-Input/Output` 对调后事件流不再 `BAD_DECRYPT`）。音频 v1 = **16 kHz mono LPCM 440 Hz 音源**（DiPlay `onAudio` 直接渲染 PCM，无解码依赖；真实应用音频采集待 system 侧）。触控回传双模式：AA 在线走 `touchAaDisplay`，仅 CP 时按 `primaryRatio` 切左右窗 → `touchPane` 窗内像素。真机验证：`first decrypted frame` → 解码出画、tone 持续播放（`authFailures=0`）、OnePlus 触控 → 三星 `event touch` 往返。
+- **CarPlay 视频管线性能（1.4fps → 11+fps）：** tee 复用 canvas bitmap（原先每帧 5.5MB 分配压垮主线程 GC）；`CarPlayVideoEncoder` 双输入模式 — Surface 输入优先（`lockHardwareCanvas` 零拷贝），Qualcomm C2 `createInputSurface` `-38` 时回退 **buffer 输入**：旋转 ARGD8888 槽 + 后台线程 NV12 转换（主线程只 `getPixels`），转换跟不上即丢帧；编码分辨率 `ENCODE_*` = **1280×720**（16 对齐、与 tee 画布一致免缩放；HU 自行放大，像素数决定转换成本）；pump / worker 速率 + 丢帧计数心跳日志。
+- **CarPlay 稳定性：** `drainLoop` 整次迭代隔离异常 — codec 被并发 `start()/stop()` 释放后 `getOutputFormat` 不再 FATAL 崩进程（真机 re-SETUP 触发）；`ensureEncoder` 去重（`onVideoSetup` + `onSessionReady` 同 tick 双 start 与释放竞态）；`FrameEgressTee` start/stop 串行化到主 looper（worker 线程 re-SETUP 不再与 pump 竞态回收 bitmap）。
+- **出口通道选择（AA / CarPlay）：** `CarPlayChannel` app 侧持久化选择（默认 **AA** — 真车行为不变）；状态页新增「出口通道」单选（Android Auto / CarPlay）：选 CarPlay 启 Source（AA 未附时自动开仅 CP Host 分屏），切回 AA 即停 Source；FGS 系统重启（null intent）仅在用户选 CarPlay 时重新武装，杜绝 zombie 重启乱拨。状态行显示通道 / 会话 / 内容源（AA 壳 tee 双通道、Host 分屏、测试图）。
+
+
 ## 0.24#17.4-r14
 
 ### Added

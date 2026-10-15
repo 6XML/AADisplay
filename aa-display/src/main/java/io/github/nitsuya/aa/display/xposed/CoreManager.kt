@@ -364,6 +364,23 @@ object CoreManager : ICoreManager, DeathRecipient {
         return getService()?.recentTask
     }
 
+    override fun reportCarPlaySessionLive(live: Boolean) {
+        try {
+            getService()?.reportCarPlaySessionLive(live)
+        } catch (e: Throwable) {
+            Log.e(TAG, "reportCarPlaySessionLive failed", e)
+        }
+    }
+
+    override fun isCarPlaySessionLive(): Boolean {
+        return try {
+            getService()?.isCarPlaySessionLive ?: false
+        } catch (e: Throwable) {
+            Log.e(TAG, "isCarPlaySessionLive failed", e)
+            false
+        }
+    }
+
     private fun getService(): ICoreManager? {
         if (service != null) return service
         val pm = ServiceManager.getService("package")

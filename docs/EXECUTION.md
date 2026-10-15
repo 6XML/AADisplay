@@ -517,7 +517,51 @@ flowchart TB
 
 ---
 
-## 14. 改代码时的不变式（违反就会回归已修过的真机 bug）
+## 14. 无线 CarPlay 出口（与 AA 双轨）
+
+目标：同一套双 VD / 分屏，可同时或单独走 **Android Auto** 与 **手机直连无线 CarPlay Source**。
+
+```
+应用窗口 → system_server VirtualDisplay
+         → AA：AaMainFragment TextureView → gearhead GAL
+         → CarPlay：FrameEgressTee（壳合成或测试图案）→ AVC → CarPlaySourceSession
+                    （Bonjour _carplay-ctrl._tcp. + BT iAP2 + RTSP）
+```
+
+| 组件 | 路径 |
+|------|------|
+| FGS / 启停 | `carplay/CarPlayProjectionService.kt`（Intent `CONNECT` / `STOP`；系统重启仅在选择 CarPlay 通道时重武装） |
+| 通道选择 | `carplay/CarPlayChannel.kt`（app 侧 prefs；默认 AA，真车行为不变） |
+| 会话编排 | `carplay/CarPlaySourceSession.kt` |
+| 发现 / 链路 | `CarPlayBonjour`、`CarPlayBluetoothLink`（RFCOMM dial+listen）、`CarPlayRtspSession` |
+| iAP2 | `protocol/Iap2Framing` + `Iap2Csm` + `Iap2Session`：detect → Link Sync → Ident → Auth(`AA00…05`) → WiFi/`4300`→`4301`；`CarPlayWifiHandoff` 尝试加热点 |
+| 编码 / tee | `CarPlayVideoEncoder`（Surface 输入优先 / buffer 旋转槽 + 后台 NV12 转换回退；`ENCODE_*`=1280×720 16 对齐）、`FrameEgressTee`（主 looper pump，壳 tee > Host 分屏 > 测试图） |
+| 音频出站 | `CarPlayAudioEgress.kt`（v1：16 kHz mono LPCM tone；真实应用音频采集待 system 侧） |
+| 仅 CP Host | `CarPlayHostActivity`（双 ImageReader 窗格 → 合成进 tee；`CoreApi.onCreateSplitDisplay`） |
+| 触控回传 | `CarPlayInputBridge` → AA 在线 `CoreApi.touchAaDisplay`；仅 CP 按 `primaryRatio` 切窗 → `CoreApi.touchPane`（窗内像素） |
+| 仲裁 | `ProjectionSessionGate`（app）+ `reportCarPlaySessionLive`（system_server） |
+
+**不变式补充**
+
+- CarPlay 协议栈 **只跑在 AADisplay 进程**；VD 仍只经 `CoreApi`。
+- AA 在线时 **禁止** 把 VD 唯一 sink 换成 encoder；用壳 tee。
+- 不 vendor CatPlay / 不开 CarLife 包名伪装；LSPosed scope 仍仅 `android` + gearhead。
+- Debug 下本机 RTSP loopback 可验证 RTP interleaved；Source dial（对 DiPlay）：persistent Pair-Setup M1–M6 → Pair-Verify → 加密 SETUP/RECORD → `eventPort`（Events-* ChaCha：forceKeyFrame / HID 触控）→ `dataPort` screen 流（DataStream ChaCha 密钥来自 pair-verify shared + avcC CONFIG + AVC）。FairPlay AES 路径仍需真机抓包对照。
+- screen 128B 头 **NTP 32.32 = little-endian**、event 通道 `Events-Input/Output` 密钥**互补交换**（对照 DiPlay 真机解密布局；方向写反即对端持续 `BAD_DECRYPT`）。
+- encoder `start()/stop()` 会并发释放 codec：drain / converter 线程对 codec 的调用必须整次隔离异常（released codec 的调用 FATAL 会崩进程）；`ensureEncoder` 同 tick 重复调用要按「已在目标尺寸运行」去重。
+
+**外部协议参考（只读对照，不检入上游 binaries/PDF）**
+
+- [docs/CARPLAY_REFS.md](CARPLAY_REFS.md) — 以 [45clouds/WirelessCarPlay](https://github.com/45clouds/WirelessCarPlay)（MIT）的 iAP2 / CarPlay / BT 配件 / 认证 PDF 与 mDNS 为主；对照本模块 `Iap2Framing`、`CarPlayBonjour`、`CarPlayRtspSession`，并说明与「RPi USB 中继」角色差异。
+- [docs/CARPLAY_MAC_TEST.md](CARPLAY_MAC_TEST.md) — Mac CarPlay Simulator（Host）组网联调步骤 + `tools/carplay-test/carplay_probe.sh` 分层探测（Bonjour / RTSP / btsnoop）。
+
+**真机验证状态（对 DiPlay 0.2.19，双机）**：screen 解码出画（`first decrypted frame` → decoder render）、audio LPCM tone 播放（`authFailures=0`）、event 通道长活、触控往返（Host tap → Source `event touch` → 窗格）。画面帧率受 **Source 手机 app 前后台 cgroup** 影响（后台约 2–4fps、前台 11–15fps）——正常使用（用户从状态页发起）即前台，无需额外处理。
+
+状态页（`MainActivity`）「出口通道」单选 **Android Auto / CarPlay**（默认 AA，真车行为不变）：选 CarPlay 启 Source（AA 未附时自动开仅 Host 分屏），切回 AA 停 Source；也可单独打开仅 Host Activity。
+
+---
+
+## 15. 改代码时的不变式（违反就会回归已修过的真机 bug）
 
 1. 跨进程显示 **只经** `CoreApi` / `ICoreManager`。
 2. 不要给 VD 加 `VIRTUAL_DISPLAY_FLAG_PRESENTATION`。
@@ -535,14 +579,16 @@ flowchart TB
 14. 不要重新引入 `aadisplay_config` SharedPreferences。
 15. 不要在 App 进程申请 Magisk `su`。
 16. 新钩子：`object` + `BaseHook`/`AaHook`，`tagName` = `AAD_*`。
+17. CarPlay 不进 system_server；AA 在线时 VD sink 仍给 TextureView，CarPlay 只用 tee。
 
 ---
 
-## 15. 按任务从哪读起
+## 16. 按任务从哪读起
 
 | 要改什么 | 从这些文件顺着读 |
 |----------|------------------|
 | 开机 / 作用域 / 进哪个进程 | `XposedInit.kt`、`AndroidHook.kt`、`AndroidAutoHook.kt` |
+| 无线 CarPlay 出口 | §14、[CARPLAY_REFS.md](CARPLAY_REFS.md)、`carplay/*`、`ICoreManager.reportCarPlaySessionLive` |
 | Binder 拿不到 / 未激活 | `BridgeService.kt`、`CoreManager.kt`、`CoreApi.kt`、`MainActivity.kt` |
 | 车机没自动打开本模块 | `AaUiHook` Auto Open、`AaActivityService`、`AaSignatureHook` |
 | 双窗创建 / 闪烁 / 尺寸 | `AaMainFragment.requestDisplay`、`CoreManagerService` profile lock、`DisplayProfileSettle`、`SplitVdLifecycle` |

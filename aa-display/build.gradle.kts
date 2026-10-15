@@ -118,6 +118,9 @@ dependencies {
     implementation("androidx.media:media:1.7.0")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    // Ed25519 / X25519 for AirPlay pair-setup/verify — matching DiPlay (Samsung API 33
+    // Conscrypt often lacks KeyPairGenerator("Ed25519")).
+    implementation("org.bouncycastle:bcprov-jdk18on:1.79")
 
     compileOnly(project(":lib-stub"))
     implementation("dev.rikka.tools.refine:runtime:4.4.0")

@@ -126,6 +126,17 @@ class DisplaySessionPolicy(
     val isAaSessionLive: Boolean
         get() = mDestroyJob?.isActive != true
 
+    @Volatile
+    private var carPlaySessionLive = false
+
+    /** Mirrored from [ICoreManager.reportCarPlaySessionLive] for dual-egress logging. */
+    fun onCarPlaySessionLiveChanged(live: Boolean) {
+        carPlaySessionLive = live
+        log(TAG, "CarPlay session live=$live aaLive=$isAaSessionLive")
+    }
+
+    fun isCarPlaySessionLive(): Boolean = carPlaySessionLive
+
     private var mKeepAwakeJob: Job? = null
     private var mPseudoOffJob: Job? = null
     private var mScreenOffReassertJob: Job? = null

@@ -21,6 +21,8 @@ jadx-*.zip
 /tools/jadx/
 /tools/jadx-home/
 /tools/jadx-out/
+# Local reference checkout of the DiPlay app source (nested repo; protocol ground truth only)
+/DiPlay-CN/
 # Local reverse-engineering / agent scratch (do not ship)
 .tmp/
 .cursor/debug-*.log

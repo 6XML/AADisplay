@@ -139,4 +139,14 @@ interface ICoreManager {
     int getEffectiveVdDensityDpi();
     /** Last HU-reported density before manual override; 0 when unknown. */
     int getReportedHostDensityDpi();
+
+    /**
+     * AADisplay process reports wireless CarPlay Source session liveness.
+     * Used so Delay Destroy / egress arbitration can keep VDs while CarPlay is live.
+     * Appended at end for Stub ordinals.
+     */
+    oneway void reportCarPlaySessionLive(boolean live);
+
+    /** True while a CarPlay Source session has reported live. */
+    boolean isCarPlaySessionLive();
 }

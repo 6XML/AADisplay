@@ -46,6 +46,9 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
     @Volatile
     private var coolwalkReconnectEpochMs = 0L
 
+    @Volatile
+    private var carPlaySessionLive = false
+
     companion object {
         const val TAG = "CoreManagerService"
 
@@ -916,6 +919,12 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
 
     override fun onDestroyDisplay() {
         runMain {
+            if (carPlaySessionLive) {
+                logDebug(
+                    TAG,
+                    "onDestroyDisplay while CarPlay live — Delay Destroy still armed; CP egress may keep using VDs",
+                )
+            }
             mSplitController?.launch?.flushPersistOnAaDisconnect()
             val finishTeardown: () -> Unit = {
                 mSplitController?.onDestroy()
@@ -1128,6 +1137,14 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
         return mSplitController?.getRecentTask()
             ?: RecentTask(emptyList(), emptyList(), emptyList())
     }
+
+    override fun reportCarPlaySessionLive(live: Boolean) {
+        carPlaySessionLive = live
+        mSessionPolicy?.onCarPlaySessionLiveChanged(live)
+        logDebug(TAG, "reportCarPlaySessionLive live=$live")
+    }
+
+    override fun isCarPlaySessionLive(): Boolean = carPlaySessionLive
 
     private fun noteUserInteraction() {
         mSessionPolicy?.onVirtualDisplayUserInteraction()
