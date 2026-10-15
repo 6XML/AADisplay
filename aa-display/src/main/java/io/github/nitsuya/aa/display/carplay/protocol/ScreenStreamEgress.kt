@@ -19,6 +19,11 @@ import java.util.concurrent.atomic.AtomicLong
  * reads bytes 8..15 LE — a big-endian write yields a garbage sender time).
  * Key = HKDF(pairVerify.shared, "DataStream-Salt{id}", "DataStream-Output-Encryption-Key")
  * (DiPlay CarPlayMediaEngine.outputKey / dataStreamKey).
+ *
+ * Writes stay synchronous + per-frame flush: an earlier async sender with coalesced flush
+ * flooded DiPlay (~2MB/s) and reset the control channel ("连不上"). Periodic hitch from
+ * IDR bursts is mitigated in [CarPlayVideoEncoder] (intra-refresh when available, else
+ * ~10s GOP) — not by reordering the wire path.
  */
 class ScreenStreamEgress private constructor(
     private val socket: Socket,

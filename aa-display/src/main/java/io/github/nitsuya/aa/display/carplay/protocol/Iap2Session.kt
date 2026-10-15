@@ -28,6 +28,8 @@ class Iap2Session(
     private val onAuthComplete: (() -> Unit)? = null,
     private val onWifiConfig: ((Iap2Csm.WifiConfig) -> Unit)? = null,
     private val onCarPlayStart: ((Iap2Csm.CarPlayStart) -> Unit)? = null,
+    private val onNowPlayingUpdates: (() -> Unit)? = null,
+    private val onFileTransferDatagram: ((ByteArray) -> Unit)? = null,
 ) {
     private enum class State {
         Idle,
@@ -48,8 +50,18 @@ class Iap2Session(
     private var ourSeq: Int = 0
     private var peerSeq: Int = 0
     private var controlSessionId: Int = 0x01
+    private var fileTransferSessionId: Int = 0x0C
     private var ourLsp: LinkSyncPayload = LinkSyncPayload.defaultForSource()
     private var peerLsp: LinkSyncPayload? = null
+    private var nowPlayingUpdatesRequested = false
+
+    // Sender-side window: datagrams queued until the peer's cumulative ack frees space.
+    // The DiPlay link engine drops packets beyond peer maxOutgoing (+slack), so unbounded
+    // back-to-back sends (artwork bursts) would tear the link.
+    private val fileTransferQueue = ArrayDeque<ByteArray>()
+    private var peerMaxOutgoing = 5
+    private var lastPeerAck: Int? = null
+    private var unackedCount = 0
 
     private val detectSeen = AtomicBoolean(false)
     private val synSent = AtomicBoolean(false)
@@ -123,8 +135,14 @@ class Iap2Session(
         ourSeq = 0
         peerSeq = 0
         controlSessionId = 0x01
+        fileTransferSessionId = 0x0C
         ourLsp = LinkSyncPayload.defaultForSource()
         peerLsp = null
+        fileTransferQueue.clear()
+        peerMaxOutgoing = 5
+        lastPeerAck = null
+        unackedCount = 0
+        nowPlayingUpdatesRequested = false
         detectSeen.set(false)
         synSent.set(false)
         startIdentSent.set(false)
@@ -199,11 +217,38 @@ class Iap2Session(
         if (packet.payload.isNotEmpty() && !packet.hasSyn) {
             peerSeq = packet.seq
             sendLinkLocked(CONTROL_ACK, sessionId = 0, payload = ByteArray(0))
+            if (packet.hasAck) {
+                trackPeerAckLocked(packet.ack)
+            }
             if (packet.sessionId == controlSessionId ||
                 peerLsp?.sessions?.any { it.first == packet.sessionId && it.second == 0 } == true
             ) {
                 handleControlPayloadLocked(packet.payload)
+            } else if (packet.sessionId == fileTransferSessionId) {
+                onFileTransferDatagram?.invoke(packet.payload)
+                flushFileTransferQueueLocked()
             }
+        }
+    }
+
+    /**
+     * Peer cumulative-ack bookkeeping: bounds the unacked window so queued file-transfer
+     * datagrams respect the peer's [LinkSyncPayload.maxOutgoing] (the DiPlay engine drops
+     * anything beyond it).
+     */
+    private fun trackPeerAckLocked(ack: Int) {
+        val last = lastPeerAck
+        if (last == null || ack == last) {
+            if (last == null) {
+                lastPeerAck = ack
+                unackedCount = 0
+            }
+            return
+        }
+        val delta = (ack - last + 256) % 256
+        if (delta in 1 until 128) {
+            unackedCount = (unackedCount - delta).coerceAtLeast(0)
+            lastPeerAck = ack
         }
     }
 
@@ -216,6 +261,10 @@ class Iap2Session(
         peerLsp = lsp
         peerSeq = packet.seq
         controlSessionId = lsp.controlSessionId()
+        peerMaxOutgoing = lsp.maxOutgoing.coerceIn(1, 255)
+        fileTransferSessionId =
+            lsp.sessions.firstOrNull { it.second == Iap2Framing.SESSION_TYPE_FILE_TRANSFER }?.first
+                ?: 0x0C
         val peerIds = lsp.sessions.map { it.first to it.second }.toSet()
         val intersect = ourLsp.sessions.filter { (id, type, _) -> (id to type) in peerIds }
         if (intersect.isNotEmpty()) {
@@ -325,6 +374,14 @@ class Iap2Session(
                         "ssid=${start.ssid} ips=${start.ipAddresses} ver=${start.sourceVersion}",
                 )
                 onCarPlayStart?.invoke(start)
+            }
+
+            Iap2Csm.START_NOW_PLAYING_UPDATES -> {
+                if (!nowPlayingUpdatesRequested) {
+                    nowPlayingUpdatesRequested = true
+                    Log.i(CarPlayConsts.TAG, "iAP StartNowPlayingUpdates (0x5000) — now playing stream armed")
+                }
+                onNowPlayingUpdates?.invoke()
             }
 
             Iap2Csm.REQUEST_AUTH_CERTIFICATE,
@@ -477,5 +534,73 @@ class Iap2Session(
             payload = payload,
         )
         sendRaw(frame)
+    }
+
+    // ------------------------------------------------------------------
+    // CarPlay NowPlaying (0x5001) + iAP2 v2 file transfer (session 12)
+    // ------------------------------------------------------------------
+
+    /** True once the host sent StartNowPlayingUpdates (0x5000). */
+    val nowPlayingUpdates: Boolean
+        get() = nowPlayingUpdatesRequested
+
+    /**
+     * Sends one NowPlayingUpdate. Group bodies are nested TLV8 (DiPlay
+     * [Iap2BodyReader.optionalGroup] shape); empty groups are omitted, an omitted field
+     * keeps its previous value, and a present empty string clears it. Safe from any thread.
+     */
+    fun sendNowPlaying(mediaItem: Map<Int, ByteArray>, playback: Map<Int, ByteArray>) {
+        val params = linkedMapOf<Int, ByteArray>()
+        if (mediaItem.isNotEmpty()) params[0] = Iap2Csm.encodeGroup(mediaItem)
+        if (playback.isNotEmpty()) params[1] = Iap2Csm.encodeGroup(playback)
+        if (params.isEmpty()) return
+        synchronized(lock) {
+            if (state == State.Dead || state == State.Idle) return
+            sendControlLocked(Iap2Framing.encodeCsm(Iap2Csm.NOW_PLAYING_UPDATE, params))
+        }
+    }
+
+    /**
+     * Queues one file-transfer datagram (session 12) and sends as many as the peer window
+     * allows; the remainder flushes on the next peer ack. The caller owns the 2-byte
+     * [id, flags|opcode] header + payload layout. Safe from any thread.
+     */
+    fun sendFileTransfer(datagram: ByteArray) {
+        synchronized(lock) {
+            if (state == State.Dead || state == State.Idle || !linkReady) return
+            if (fileTransferQueue.isNotEmpty()) {
+                if (fileTransferQueue.size < FILE_TRANSFER_QUEUE_CAP) {
+                    fileTransferQueue += datagram
+                } else {
+                    Log.w(
+                        CarPlayConsts.TAG,
+                        "iAP file-transfer queue full (${fileTransferQueue.size}) — dropping ${datagram.size}B",
+                    )
+                }
+                return
+            }
+            if (unackedCount >= peerMaxOutgoing) {
+                fileTransferQueue += datagram
+                return
+            }
+            sendFileTransferLocked(datagram)
+        }
+    }
+
+    private fun sendFileTransferLocked(datagram: ByteArray) {
+        ourSeq = (ourSeq + 1) and 0xFF
+        unackedCount++
+        sendLinkLocked(CONTROL_ACK, sessionId = fileTransferSessionId, payload = datagram)
+    }
+
+    private fun flushFileTransferQueueLocked() {
+        if (fileTransferQueue.isEmpty() || !linkReady) return
+        while (unackedCount < peerMaxOutgoing && fileTransferQueue.isNotEmpty()) {
+            sendFileTransferLocked(fileTransferQueue.removeFirst())
+        }
+    }
+
+    private companion object {
+        const val FILE_TRANSFER_QUEUE_CAP = 4_096
     }
 }

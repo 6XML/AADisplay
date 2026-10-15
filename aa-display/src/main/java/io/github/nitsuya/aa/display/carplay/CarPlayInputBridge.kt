@@ -4,7 +4,9 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.MotionEvent
 import io.github.nitsuya.aa.display.CoreApi
+import io.github.nitsuya.aa.display.egress.ProjectionSessionGate
 import io.github.nitsuya.aa.display.ui.aa.split.SplitPane
+import kotlin.math.abs
 
 /**
  * Maps normalized CarPlay screen coordinates (0..1) onto AADisplay injection paths.
@@ -13,6 +15,9 @@ import io.github.nitsuya.aa.display.ui.aa.split.SplitPane
  * [CoreApi.touchAaDisplay]. CarPlay-only (no AA UI): the image is the split display, so
  * touches land on the pane VirtualDisplay that owns the touched half
  * ([CoreApi.touchPane]), re-normalized into that pane's pixel space.
+ *
+ * Host chrome (divider / peel / Recents / picker) mirrors AA [SplitDividerView] semantics:
+ * short tap → swap, long-press → Recents, drag → ratio with settle on UP, edge → fullscreen.
  */
 object CarPlayInputBridge {
     @Volatile
@@ -25,17 +30,72 @@ object CarPlayInputBridge {
     @Volatile
     var primaryRatio: Float = SplitPane.DEFAULT_RATIO
 
+    /**
+     * Visible fullscreen pane while Host is in peel mode; [SplitPane.FULLSCREEN_NONE] = split.
+     * Mirrored for [CarPlayGlCompositor] and gesture routing.
+     */
+    @Volatile
+    var fullscreenPane: Int = SplitPane.FULLSCREEN_NONE
+
+    /** Half-width of the divider-strip hit zone, as a fraction of shell width. */
+    private const val DIVIDER_ZONE = 0.04f
+    /** Peel tab hit band at the left edge while fullscreen (fraction of width). */
+    private const val PEEL_ZONE = 0.05f
+    private const val RATIO_PREVIEW_INTERVAL_MS = 100L
+    /** Normalized move slop before a press becomes a drag (~AA touchSlop × 2). */
+    private const val DRAG_SLOP = 0.02f
+
+    @Volatile
+    private var chromeArmed = false
+    @Volatile
+    private var chromeDragging = false
+    @Volatile
+    private var chromeDownX = 0f
+    @Volatile
+    private var chromeDownAt = 0L
+    @Volatile
+    private var ratioAtDown = SplitPane.DEFAULT_RATIO
+    @Volatile
+    private var lastPreviewAt = 0L
+    @Volatile
+    private var paneDownX = 0f
+    @Volatile
+    private var paneDownY = 0f
+    @Volatile
+    private var paneDownAt = 0L
+    @Volatile
+    private var paneDownPane = SplitPane.PRIMARY
+    @Volatile
+    private var paneMoved = false
+
     fun injectNormalized(xNorm: Float, yNorm: Float, action: Int) {
+        val x = xNorm.coerceIn(0f, 1f)
+        val y = yNorm.coerceIn(0f, 1f)
+
+        if (CarPlayAppPickerOverlay.isVisible()) {
+            CarPlayAppPickerOverlay.onTouch(x, y, action)
+            return
+        }
+        if (CarPlayRecentsOverlay.isVisible()) {
+            CarPlayRecentsOverlay.onTouch(x, y, action)
+            return
+        }
+
+        // Host-only chrome: divider / peel (AA shell already owns chrome when tee'd).
+        if (ProjectionSessionGate.shouldUseCarPlayHost()) {
+            if (handleChrome(x, y, action)) return
+        }
+
         val w = shellWidthPx.coerceAtLeast(1)
         val h = shellHeightPx.coerceAtLeast(1)
-        val x = (xNorm.coerceIn(0f, 1f) * (w - 1)).toFloat()
-        val y = (yNorm.coerceIn(0f, 1f) * (h - 1)).toFloat()
+        val px = (x * (w - 1)).toFloat()
+        val py = (y * (h - 1)).toFloat()
         val now = SystemClock.uptimeMillis()
-        val event = MotionEvent.obtain(now, now, action, x, y, 0)
+        val event = MotionEvent.obtain(now, now, action, px, py, 0)
         try {
             val ok = try {
                 if (ProjectionSessionGate.shouldUseCarPlayHost()) {
-                    routeToPane(xNorm, yNorm, action, w, h)
+                    routeToPane(x, y, action, w, h)
                 } else {
                     CoreApi.touchAaDisplay(event)
                     true
@@ -53,21 +113,244 @@ object CarPlayInputBridge {
     }
 
     /**
+     * Divider / peel gestures. Returns true when the event was consumed as chrome
+     * (do not forward into a pane).
+     */
+    private fun handleChrome(x: Float, y: Float, action: Int): Boolean {
+        val fs = fullscreenPane
+        val inFullscreen = SplitPane.isFullscreenPane(fs)
+        when (action) {
+            MotionEvent.ACTION_DOWN -> {
+                chromeArmed = if (inFullscreen) {
+                    x < PEEL_ZONE
+                } else {
+                    abs(x - primaryRatio.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO)) < DIVIDER_ZONE
+                }
+                if (!chromeArmed) return false
+                chromeDragging = false
+                chromeDownX = x
+                chromeDownAt = SystemClock.uptimeMillis()
+                ratioAtDown = primaryRatio.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO)
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!chromeArmed) return false
+                val heldMs = SystemClock.uptimeMillis() - chromeDownAt
+                val dist = abs(x - chromeDownX)
+                if (!chromeDragging) {
+                    // Hold still during the long-press window so jitter does not start a drag.
+                    if (heldMs < SplitPane.DIVIDER_TAP_STACK_MIN_MS && dist <= DRAG_SLOP) {
+                        return true
+                    }
+                    if (dist > DRAG_SLOP) {
+                        chromeDragging = true
+                    }
+                }
+                if (chromeDragging) {
+                    if (inFullscreen) {
+                        // Inward peel preview: map left-edge drag to an exit ratio hint.
+                        primaryRatio = x.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO)
+                    } else {
+                        previewRatio(x)
+                    }
+                }
+                return true
+            }
+            MotionEvent.ACTION_UP,
+            MotionEvent.ACTION_CANCEL -> {
+                if (!chromeArmed) return false
+                chromeArmed = false
+                val heldMs = SystemClock.uptimeMillis() - chromeDownAt
+                val dist = abs(x - chromeDownX)
+                val ratioDelta = abs(x - ratioAtDown)
+                val wasDragging = chromeDragging
+                chromeDragging = false
+
+                if (inFullscreen) {
+                    handlePeelUp(x, heldMs, dist, wasDragging, action == MotionEvent.ACTION_CANCEL)
+                } else {
+                    handleDividerUp(x, heldMs, dist, ratioDelta, wasDragging, action == MotionEvent.ACTION_CANCEL)
+                }
+                return true
+            }
+            else -> return chromeArmed
+        }
+    }
+
+    private fun handleDividerUp(
+        x: Float,
+        heldMs: Long,
+        dist: Float,
+        ratioDelta: Float,
+        wasDragging: Boolean,
+        cancelled: Boolean,
+    ) {
+        if (cancelled) {
+            primaryRatio = ratioAtDown
+            return
+        }
+        if (SplitPane.qualifiesDividerLongPress(false, heldMs) &&
+            SplitPane.qualifiesDividerRecentOnUp(true, wasDragging, dist, DRAG_SLOP, ratioDelta)
+        ) {
+            primaryRatio = ratioAtDown
+            CarPlayRecentsOverlay.open()
+            return
+        }
+        if (SplitPane.shouldDividerSwapOnUp(wasDragging, false, heldMs, dist, DRAG_SLOP, ratioDelta)) {
+            performSwap()
+            return
+        }
+        if (wasDragging || dist > DRAG_SLOP) {
+            settleRatioOrFullscreen(x)
+        } else {
+            primaryRatio = ratioAtDown
+        }
+    }
+
+    private fun handlePeelUp(
+        x: Float,
+        heldMs: Long,
+        dist: Float,
+        wasDragging: Boolean,
+        cancelled: Boolean,
+    ) {
+        if (cancelled) {
+            // Keep fullscreen; compositor reads fullscreenPane.
+            return
+        }
+        if (SplitPane.qualifiesDividerLongPress(false, heldMs) && dist <= DRAG_SLOP * 3f) {
+            CarPlayRecentsOverlay.open()
+            return
+        }
+        if (!wasDragging && heldMs <= SplitPane.DIVIDER_TAP_SWAP_MAX_MS && dist <= DRAG_SLOP) {
+            // Tap peel → flip visible fullscreen pane (AA peel tap).
+            val other = if (fullscreenPane == SplitPane.PRIMARY) {
+                SplitPane.SECONDARY
+            } else {
+                SplitPane.PRIMARY
+            }
+            enterFullscreen(other)
+            return
+        }
+        if (wasDragging && x > SplitPane.FULLSCREEN_EXIT_RATIO) {
+            exitFullscreen(x.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO))
+        }
+    }
+
+    private fun performSwap() {
+        val next = SplitPane.clampRatio(1f - primaryRatio)
+        primaryRatio = next
+        try {
+            CoreApi.swapSplitPanes()
+            Log.i(CarPlayConsts.TAG, "CarPlay divider tap → swap ratio=$next")
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "swapSplitPanes failed", e)
+        }
+    }
+
+    private fun previewRatio(x: Float) {
+        val ratio = x.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO)
+        primaryRatio = ratio
+        val now = SystemClock.uptimeMillis()
+        if (now - lastPreviewAt < RATIO_PREVIEW_INTERVAL_MS) return
+        lastPreviewAt = now
+        // Preview only updates local ratio for GL; VD resize waits for settle on UP.
+    }
+
+    private fun settleRatioOrFullscreen(rawX: Float) {
+        SplitPane.fullscreenPaneForRawRatio(rawX)?.let { pane ->
+            enterFullscreen(pane)
+            return
+        }
+        val ratio = rawX.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO)
+        primaryRatio = ratio
+        try {
+            CoreApi.setSplitRatio(ratio)
+            Log.i(CarPlayConsts.TAG, "CarPlay divider settle ratio=$ratio")
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "setSplitRatio($ratio) failed", e)
+        }
+    }
+
+    private fun enterFullscreen(pane: Int) {
+        if (!SplitPane.isFullscreenPane(pane)) return
+        fullscreenPane = pane
+        try {
+            CoreApi.setSplitFullscreen(pane)
+            Log.i(CarPlayConsts.TAG, "CarPlay enter fullscreen pane=$pane")
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "setSplitFullscreen($pane) failed", e)
+        }
+    }
+
+    private fun exitFullscreen(ratio: Float) {
+        val clamped = SplitPane.clampRatio(ratio)
+        primaryRatio = clamped
+        fullscreenPane = SplitPane.FULLSCREEN_NONE
+        try {
+            // AA order: write ratio first, then clear fullscreen (one VD resize).
+            CoreApi.setSplitRatio(clamped)
+            CoreApi.setSplitFullscreen(SplitPane.FULLSCREEN_NONE)
+            Log.i(CarPlayConsts.TAG, "CarPlay exit fullscreen ratio=$clamped")
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "exit fullscreen failed", e)
+        }
+    }
+
+    /**
      * Splits the full CarPlay image at [primaryRatio]: left half → PRIMARY pane VD,
      * right half → SECONDARY pane VD, each in its own display pixel space.
+     * Short tap on an empty pane opens the app picker (AA empty-pane parity).
      */
     private fun routeToPane(xNorm: Float, yNorm: Float, action: Int, w: Int, h: Int): Boolean {
-        val ratio = primaryRatio.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO)
-        val x = xNorm.coerceIn(0f, 1f)
-        val y = yNorm.coerceIn(0f, 1f)
-        val (pane, xPane, paneWidth) = if (x < ratio) {
-            Triple(SplitPane.PRIMARY, x / ratio, (w * ratio).toInt().coerceAtLeast(1))
+        val fs = fullscreenPane
+        val (pane, xPane, paneWidth) = if (SplitPane.isFullscreenPane(fs)) {
+            Triple(fs, xNorm.coerceIn(0f, 1f), w)
         } else {
-            val share = (1f - ratio).coerceAtLeast(0.01f)
-            Triple(SplitPane.SECONDARY, (x - ratio) / share, (w - w * ratio).toInt().coerceAtLeast(1))
+            val ratio = primaryRatio.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO)
+            val x = xNorm.coerceIn(0f, 1f)
+            if (x < ratio) {
+                Triple(SplitPane.PRIMARY, x / ratio, (w * ratio).toInt().coerceAtLeast(1))
+            } else {
+                val share = (1f - ratio).coerceAtLeast(0.01f)
+                Triple(
+                    SplitPane.SECONDARY,
+                    (x - ratio) / share,
+                    (w - w * ratio).toInt().coerceAtLeast(1),
+                )
+            }
+        }
+        when (action) {
+            MotionEvent.ACTION_DOWN -> {
+                paneDownX = xNorm
+                paneDownY = yNorm
+                paneDownAt = SystemClock.uptimeMillis()
+                paneDownPane = pane
+                paneMoved = false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (abs(xNorm - paneDownX) > DRAG_SLOP || abs(yNorm - paneDownY) > DRAG_SLOP) {
+                    paneMoved = true
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                val heldMs = SystemClock.uptimeMillis() - paneDownAt
+                if (!paneMoved && heldMs <= SplitPane.DIVIDER_TAP_SWAP_MAX_MS) {
+                    val empty = try {
+                        CoreApi.getPanePackage(paneDownPane).isNullOrEmpty()
+                    } catch (_: Throwable) {
+                        false
+                    }
+                    if (empty) {
+                        CarPlayAppPickerOverlay.show(paneDownPane)
+                        return true
+                    }
+                }
+            }
+            else -> Unit
         }
         val px = (xPane * (paneWidth - 1)).toFloat()
-        val py = (y * (h - 1)).toFloat()
+        val py = (yNorm.coerceIn(0f, 1f) * (h - 1)).toFloat()
         val now = SystemClock.uptimeMillis()
         val event = MotionEvent.obtain(now, now, action, px, py, 0)
         try {

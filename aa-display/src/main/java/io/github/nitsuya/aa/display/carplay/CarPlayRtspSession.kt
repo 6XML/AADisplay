@@ -345,7 +345,11 @@ class CarPlayRtspSession(
                 touchMaxY = accessoryTouchMaxY,
                 onForceKeyFrame = onForceKeyFrame,
                 onTouch = onTouchEvent,
+                onHidKey = { dev, code, pressed, extra ->
+                    CarPlayWheelController.onHidKey(dev, code, pressed, extra)
+                },
             )
+            if (ev != null) CarPlayWheelController.setEnabled(true)
             eventChannel.getAndSet(ev)?.close()
         } else {
             Log.w(CarPlayConsts.TAG, "SETUP session missing eventPort — no touch/forceKeyFrame")
@@ -429,16 +433,15 @@ class CarPlayRtspSession(
         onVideoSetup(w, h)
 
         // Audio: DiPlay [CarPlayMediaEngine.onAudio] answers dataPort/controlPort; the
-        // 16 kHz mono LPCM tone then plays on the host without any codec dependency.
-        if (CarPlayConsts.SEND_TEST_AUDIO) {
-            setupTestAudio(
-                peerHost,
-                sharedSecret,
-                { extra -> headers(extra) },
-                sessionUrl,
-                { req -> exchangeEncrypted(req) },
-            )
-        }
+        // 16 kHz mono LPCM stream then carries real app audio (system-side capture tap)
+        // — silence when nothing plays, so the SETUP always runs.
+        setupAudio(
+            peerHost,
+            sharedSecret,
+            { extra -> headers(extra) },
+            sessionUrl,
+            { req -> exchangeEncrypted(req) },
+        )
 
         onSessionReady()
         Log.i(CarPlayConsts.TAG, "screen egress armed — AVC frames → dataPort=$dataPort")
@@ -447,10 +450,10 @@ class CarPlayRtspSession(
 
     /**
      * SETUP(streams=[{type:100, audioType:"media", audioFormat:0x10(16k mono LPCM)}]) on the
-     * encrypted control channel, then starts the UDP tone against the answered ports.
-     * Non-fatal: a declined stream only costs the tone, not the screen.
+     * encrypted control channel, then starts the UDP audio pump against the answered ports.
+     * Non-fatal: a declined stream only costs the audio, not the screen.
      */
-    private fun setupTestAudio(
+    private fun setupAudio(
         peerHost: InetAddress,
         sharedSecret: ByteArray,
         headers: (Map<String, String>) -> LinkedHashMap<String, String>,
@@ -831,6 +834,7 @@ class CarPlayRtspSession(
         running.set(false)
         streaming.set(false)
         audioEgress.getAndSet(null)?.stop()
+        CarPlayWheelController.setEnabled(false)
         eventChannel.getAndSet(null)?.close()
         screenEgress.getAndSet(null)?.close()
         peer?.closeQuietly()

@@ -25,9 +25,9 @@ import androidx.core.view.isVisible
 import com.github.kyuubiran.ezxhelper.utils.tryOrNull
 import io.github.duzhaokun123.template.bases.BaseFragment
 import io.github.nitsuya.aa.display.CoreApi
-import io.github.nitsuya.aa.display.carplay.CarPlayProjectionService
-import io.github.nitsuya.aa.display.carplay.ProjectionSessionGate
 import io.github.nitsuya.aa.display.databinding.FragmentAaMainBinding
+import io.github.nitsuya.aa.display.egress.ProjectionSessionGate
+import io.github.nitsuya.aa.display.egress.ShellFrameEgress
 import io.github.nitsuya.aa.display.ui.aa.AaDisplayActivityKt
 import io.github.nitsuya.aa.display.ui.aa.split.SplitAppPickerController
 import io.github.nitsuya.aa.display.ui.aa.split.SplitPane
@@ -318,10 +318,10 @@ class AaMainFragment : BaseFragment<FragmentAaMainBinding>(FragmentAaMainBinding
 
     override fun onResume() {
         super.onResume()
-        ProjectionSessionGate.setAaUiAttached(true)
+        ShellFrameEgress.setAaUiAttached(true)
         baseBinding.splitContainer.post {
             reportAaUiDisplayId()
-            syncCarPlayShellTee("resume")
+            syncSecondaryShellTee("resume")
             if (displayId == Display.INVALID_DISPLAY) {
                 isDisplayCreateRequested = false
             }
@@ -361,8 +361,7 @@ class AaMainFragment : BaseFragment<FragmentAaMainBinding>(FragmentAaMainBinding
         // Drop coalesced MOVE before tearing down VDs — never inject after destroy.
         cancelPendingPaneTouches()
         tryOrNull { CoreApi.reportAaUiDisplayId(Display.INVALID_DISPLAY) }
-        ProjectionSessionGate.setAaUiAttached(false)
-        CarPlayProjectionService.attachShell(null)
+        ShellFrameEgress.setAaUiAttached(false)
         super.onDestroy()
         Log.d(TAG, "onDestroy: displayId=$displayId")
         clearDisplaySurfaces("destroy")
@@ -1390,7 +1389,7 @@ class AaMainFragment : BaseFragment<FragmentAaMainBinding>(FragmentAaMainBinding
                 reportAaUiDisplayId()
                 primarySurface?.let { CoreApi.setPaneSurface(SplitPane.PRIMARY, it) }
                 secondarySurface?.let { CoreApi.setPaneSurface(SplitPane.SECONDARY, it) }
-                syncCarPlayShellTee("onAvailableDisplay")
+                syncSecondaryShellTee("onAvailableDisplay")
                 registerControlReceivers()
                 // One reconnect settle pipeline (occupancy + optional ratio), not N parallel delays.
                 scheduleConnectSettle(create)
@@ -1398,15 +1397,18 @@ class AaMainFragment : BaseFragment<FragmentAaMainBinding>(FragmentAaMainBinding
         }
     }
 
-    /** When CarPlay Source is live, tee the composited split shell into the AVC encoder. */
-    private fun syncCarPlayShellTee(reason: String) {
+    /**
+     * Offer the composited split shell to a secondary egress (CarPlay installs the sink).
+     * AA UI must not import the carplay package — see [ShellFrameEgress].
+     */
+    private fun syncSecondaryShellTee(reason: String) {
         if (!isBaseBindingInitialized()) return
         val shell = baseBinding.splitContainer
-        CarPlayProjectionService.attachShell(shell)
-        CarPlayProjectionService.onShellSize(shell.width, shell.height)
+        ShellFrameEgress.attachShell(shell)
+        ShellFrameEgress.onShellSize(shell.width, shell.height)
         Log.d(
             TAG,
-            "syncCarPlayShellTee[$reason] tee=${ProjectionSessionGate.shouldTeeFromAaShell()} " +
+            "syncSecondaryShellTee[$reason] tee=${ProjectionSessionGate.shouldTeeFromAaShell()} " +
                 "${shell.width}x${shell.height}",
         )
     }

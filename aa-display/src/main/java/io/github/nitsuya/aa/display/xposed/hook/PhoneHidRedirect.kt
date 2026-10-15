@@ -429,7 +429,11 @@ object PhoneHidRedirect {
 
     fun isRedirectActive(): Boolean =
         try {
-            sessionLive && CoreManagerService.isAaSessionLive()
+            // AA session OR secondary egress (CarPlay Source) — split VDs must keep
+            // receiving pointer events in either mode.
+            sessionLive &&
+                (CoreManagerService.isAaSessionLive() ||
+                    CoreManagerService.isCarPlaySessionLive())
         } catch (_: Throwable) {
             false
         }

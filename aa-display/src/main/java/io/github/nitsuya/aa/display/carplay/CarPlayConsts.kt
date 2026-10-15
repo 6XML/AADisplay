@@ -22,8 +22,32 @@ object CarPlayConsts {
     /** Default test / fallback encode size before HU negotiates. */
     const val DEFAULT_VIDEO_WIDTH = 1920
     const val DEFAULT_VIDEO_HEIGHT = 720
-    const val DEFAULT_VIDEO_FPS = 30
-    const val DEFAULT_VIDEO_BITRATE = 8_000_000
+
+    /**
+     * Negotiated / supplied frame rate. The DiPlay host ignores the SETUP `fps` field (its
+     * decoder runs at its own 30..60 user setting), but the supply side must still produce
+     * 60 frames/s so a 60-configured host is never starved; other hosts (CarPlay Simulator)
+     * pace off the SETUP value.
+     */
+    const val DEFAULT_VIDEO_FPS = 60
+
+    /** Degraded supply rate when the link / encoder cannot hold [DEFAULT_VIDEO_FPS]. */
+    const val DEGRADED_VIDEO_FPS = 30
+
+    /** AVC bitrate per supply rate: 60 fps needs headroom for 1280x720 motion. */
+    const val BITRATE_FPS60 = 16_000_000
+    const val BITRATE_FPS30 = 8_000_000
+
+    /**
+     * Periodic IDR interval when the encoder lacks [FEATURE_IntraRefresh].
+     * Aligns with scrcpy's default (10s): shorter GOPs (2–5s) cause ~200KB WiFi
+     * bursts that hitch DiPlay even at a healthy 60fps supply. DiPlay can still
+     * request an IDR via event `forceKeyFrame`.
+     */
+    const val I_FRAME_INTERVAL_SEC = 10
+
+    /** Sustained actual-fps below this share of target triggers the 60→30 downgrade. */
+    const val DEGRADE_RATE_FRACTION = 0.5f
 
     /**
      * AVC encode resolution. The HU decodes whatever the source sends and scales to its
@@ -57,8 +81,10 @@ object CarPlayConsts {
     const val ENABLE_LOCAL_RTSP_LOOPBACK = false
 
     /**
-     * Play a synthesized 440 Hz LPCM tone on the CarPlay main audio stream (type 100).
-     * v1 stands in for real app audio, which needs a system-side capture tap.
+     * Real app audio (system-side [AudioPlaybackCapture] tap → 16 kHz mono LPCM) is the
+     * default content of the CarPlay main audio stream (type 100). When no captured audio
+     * is flowing, a silent frame is sent — unless [SEND_TEST_AUDIO] is enabled, in which
+     * case the 440 Hz tone stands in (pipeline debugging only).
      */
-    const val SEND_TEST_AUDIO = true
+    const val SEND_TEST_AUDIO = false
 }

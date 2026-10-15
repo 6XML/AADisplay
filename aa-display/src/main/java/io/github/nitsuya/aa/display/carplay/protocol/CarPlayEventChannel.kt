@@ -3,6 +3,7 @@ package io.github.nitsuya.aa.display.carplay.protocol
 import android.util.Log
 import android.view.MotionEvent
 import io.github.nitsuya.aa.display.carplay.CarPlayConsts
+import io.github.nitsuya.aa.display.carplay.CarPlayWheelController
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.net.InetAddress
@@ -29,11 +30,13 @@ class CarPlayEventChannel private constructor(
     private val onTouch: (xNorm: Float, yNorm: Float, action: Int) -> Unit,
     private val touchMaxX: Int,
     private val touchMaxY: Int,
+    private val onHidKey: (device: Int, code: Int, pressed: Boolean, extra: Int) -> Unit,
 ) {
     private val closed = AtomicBoolean(false)
     private val writeLock = Any()
     private val out = BufferedOutputStream(socket.getOutputStream(), 16 * 1024)
     @Volatile private var fingerDown = false
+    @Volatile private var knobBtns = 0
 
     fun start() {
         thread(name = "carplay-event", isDaemon = true) {
@@ -79,10 +82,12 @@ class CarPlayEventChannel private constructor(
             "hidSendReport" -> {
                 val uuid = dict["uuid"]?.toString()?.lowercase() ?: return
                 val report = dict["hidReport"] as? ByteArray ?: return
-                if (uuid == TOUCH_HID_UUID || uuid == TOUCH_HID_UUID_ALT) {
-                    parseTouchReport(report)
-                } else {
-                    Log.d(CarPlayConsts.TAG, "event hidSendReport uuid=$uuid len=${report.size} (ignored)")
+                when (uuid) {
+                    TOUCH_HID_UUID, TOUCH_HID_UUID_ALT -> parseTouchReport(report)
+                    KNOB_HID_UUID -> parseKnobReport(report)
+                    MEDIA_HID_UUID -> parseOneByteReport(CarPlayWheelController.DEV_MEDIA, report)
+                    TELEPHONY_HID_UUID -> parseOneByteReport(CarPlayWheelController.DEV_TELEPHONY, report)
+                    else -> Log.d(CarPlayConsts.TAG, "event hidSendReport uuid=$uuid len=${report.size} (ignored)")
                 }
             }
             else -> Log.d(CarPlayConsts.TAG, "event command type=${dict["type"]}")
@@ -126,6 +131,35 @@ class CarPlayEventChannel private constructor(
         }
     }
 
+    /**
+     * DiPlay [AirPlayHid.knobReport]: 4 bytes — [0] buttons (0x01 select / 0x02 home /
+     * 0x04 back), [1..2] absolute x/y, [3] relative wheel (signed 8 bit).
+     */
+    private fun parseKnobReport(report: ByteArray) {
+        if (report.size < 4) return
+        val btns = report[0].toInt() and 0xff
+        val wheel = report[3].toInt() // signed
+        val prev = knobBtns
+        knobBtns = btns
+        if (btns != 0) {
+            if (btns and 0x01 != 0) onHidKey(CarPlayWheelController.DEV_KNOB, CarPlayWheelController.KNOB_SELECT, true, 0)
+            if (btns and 0x02 != 0) onHidKey(CarPlayWheelController.DEV_KNOB, CarPlayWheelController.KNOB_HOME, true, 0)
+            if (btns and 0x04 != 0) onHidKey(CarPlayWheelController.DEV_KNOB, CarPlayWheelController.KNOB_BACK, true, 0)
+        } else if (prev != 0) {
+            onHidKey(CarPlayWheelController.DEV_KNOB, 0, false, 0)
+        }
+        if (wheel != 0) {
+            onHidKey(CarPlayWheelController.DEV_KNOB, CarPlayWheelController.KNOB_WHEEL, true, wheel)
+        }
+    }
+
+    /** Media / telephony: 1-byte usage index (0 = release). */
+    private fun parseOneByteReport(device: Int, report: ByteArray) {
+        if (report.isEmpty()) return
+        val v = report[0].toInt() and 0xff
+        onHidKey(device, if (v == 0) 0 else v, v != 0, v)
+    }
+
     private fun reply200(request: RtspMessage) {
         val cseq = request.headers.entries
             .firstOrNull { it.key.equals("CSeq", ignoreCase = true) }
@@ -158,9 +192,12 @@ class CarPlayEventChannel private constructor(
     }
 
     companion object {
-        /** DiPlay AirPlayHid.TOUCH_HID_UID = 0x2a2a2a2a */
+        /** DiPlay AirPlayHid device uuids (lowercase hex, no 0x prefix on the wire). */
         private const val TOUCH_HID_UUID = "2a2a2a2a"
         private const val TOUCH_HID_UUID_ALT = "2A2A2A2A"
+        private const val KNOB_HID_UUID = "2a2a2a2b"
+        private const val MEDIA_HID_UUID = "2a2a2a2c"
+        private const val TELEPHONY_HID_UUID = "2a2a2a2d"
 
         fun open(
             host: InetAddress,
@@ -170,6 +207,7 @@ class CarPlayEventChannel private constructor(
             touchMaxY: Int,
             onForceKeyFrame: () -> Unit,
             onTouch: (Float, Float, Int) -> Unit,
+            onHidKey: (Int, Int, Boolean, Int) -> Unit,
         ): CarPlayEventChannel? {
             if (eventPort <= 0 || eventPort > 65535) {
                 Log.w(CarPlayConsts.TAG, "eventPort invalid=$eventPort")
@@ -205,6 +243,7 @@ class CarPlayEventChannel private constructor(
                     onTouch = onTouch,
                     touchMaxX = touchMaxX,
                     touchMaxY = touchMaxY,
+                    onHidKey = onHidKey,
                 )
                 Log.i(
                     CarPlayConsts.TAG,

@@ -40,7 +40,12 @@ class CarPlayBonjour(
         override fun onServiceFound(serviceInfo: NsdServiceInfo?) {
             val info = serviceInfo ?: return
             Log.i(CarPlayConsts.TAG, "Bonjour found ${info.serviceName} type=${info.serviceType}")
-            nsd.resolveService(info, resolveListener)
+            // Skip our own advertisement — resolving it races with registration and is useless.
+            if (info.serviceName == "AADisplay-CarPlay") return
+            // NsdManager forbids reusing the same ResolveListener while a resolve is in flight.
+            // Two rapid onServiceFound callbacks used to crash the process (listener already in use),
+            // which tore down RFCOMM …cafe listen and made DiPlay SDP return scn=0.
+            resolveFound(info)
         }
 
         override fun onServiceLost(serviceInfo: NsdServiceInfo?) {
@@ -48,18 +53,27 @@ class CarPlayBonjour(
         }
     }
 
-    private val resolveListener = object : NsdManager.ResolveListener {
-        override fun onResolveFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) {
-            Log.e(CarPlayConsts.TAG, "Bonjour resolve failed code=$errorCode")
-        }
+    private fun resolveFound(info: NsdServiceInfo) {
+        val listener = object : NsdManager.ResolveListener {
+            override fun onResolveFailed(serviceInfo: NsdServiceInfo?, errorCode: Int) {
+                Log.e(CarPlayConsts.TAG, "Bonjour resolve failed code=$errorCode")
+            }
 
-        override fun onServiceResolved(serviceInfo: NsdServiceInfo?) {
-            val info = serviceInfo ?: return
-            Log.i(
-                CarPlayConsts.TAG,
-                "Bonjour resolved ${info.serviceName} host=${info.host} port=${info.port}",
-            )
-            onResolved(info)
+            override fun onServiceResolved(serviceInfo: NsdServiceInfo?) {
+                val resolved = serviceInfo ?: return
+                Log.i(
+                    CarPlayConsts.TAG,
+                    "Bonjour resolved ${resolved.serviceName} host=${resolved.host} port=${resolved.port}",
+                )
+                onResolved(resolved)
+            }
+        }
+        try {
+            nsd.resolveService(info, listener)
+        } catch (e: IllegalArgumentException) {
+            Log.w(CarPlayConsts.TAG, "Bonjour resolve skipped: ${e.message}")
+        } catch (e: Throwable) {
+            Log.e(CarPlayConsts.TAG, "Bonjour resolveService failed", e)
         }
     }
 

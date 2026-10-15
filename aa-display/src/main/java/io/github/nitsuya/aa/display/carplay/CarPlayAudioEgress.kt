@@ -1,6 +1,7 @@
 package io.github.nitsuya.aa.display.carplay
 
 import android.util.Log
+import io.github.nitsuya.aa.display.CoreApi
 import io.github.nitsuya.aa.display.carplay.protocol.BinaryPlist
 import io.github.nitsuya.aa.display.carplay.protocol.HkdfSha512
 import io.github.nitsuya.aa.display.carplay.protocol.RtspMessage
@@ -9,17 +10,25 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
+import java.util.Arrays
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.concurrent.thread
 import kotlin.math.PI
-import kotlin.math.min
 import kotlin.math.sin
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * CarPlay main audio (SETUP type 100) egress. v1 plays a synthesized 440 Hz tone.
+ * CarPlay main audio (SETUP type 100) egress: carries real phone app audio to the car.
+ *
+ * Content source: the system_server [io.github.nitsuya.aa.display.xposed.carplay.CarPlayAudioCapture]
+ * tap ([AudioPlaybackCapture]) — every non-call stream the user would hear on the phone
+ * (music / Douyin / nav TTS / notifications / alarms) at 16 kHz mono PCM16, pulled over
+ * [CoreApi.pullCarPlayAudio] and byte-swapped little→big-endian per packet. While the
+ * egress runs, [CoreApi.setCarPlayAudioEgressEnabled] mutes those streams locally so the
+ * car speaker is the only audible sink. Gaps (nothing playing) send silence; with
+ * [CarPlayConsts.SEND_TEST_AUDIO] the 440 Hz tone stands in for debugging.
  *
  * DiPlay host [com.shilapi.xcertplay.airplay.AudioStream] wire format: one UDP datagram
  * = 12-byte RTP header + ChaCha20-Poly1305 ciphertext + 16-byte tag + trailing 8-byte
@@ -45,6 +54,11 @@ class CarPlayAudioEgress(
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        try {
+            CoreApi.setCarPlayAudioEgressEnabled(true)
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "setCarPlayAudioEgressEnabled(true) failed — silence expected", e)
+        }
         worker = thread(name = "carplay-audio-tx", isDaemon = true) { pump() }
         Log.i(CarPlayConsts.TAG, "CarPlay audio TX started → $host:$dataPort (control=$controlPort)")
     }
@@ -53,6 +67,11 @@ class CarPlayAudioEgress(
         if (!running.compareAndSet(true, false)) return
         worker?.interrupt()
         worker = null
+        try {
+            CoreApi.setCarPlayAudioEgressEnabled(false)
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "setCarPlayAudioEgressEnabled(false) failed", e)
+        }
         Log.i(CarPlayConsts.TAG, "CarPlay audio TX stopped")
     }
 
@@ -65,23 +84,46 @@ class CarPlayAudioEgress(
         var timestamp = 0
         var nonceCounter = 0L
         var sampleTime = 0.0
-        val samples = ShortArray(SAMPLES_PER_PACKET)
+        val payload = ByteArray(SAMPLES_PER_PACKET * 2)
         val cipher = Cipher.getInstance("ChaCha20-Poly1305")
         val aad = ByteArray(8)
         var packets = 0
+        var pulledTotal = 0L
+        var pullFailLogged = false
         try {
             while (running.get()) {
-                for (i in samples.indices) {
-                    val value = (AMPLITUDE * sin(2.0 * PI * FREQUENCY_HZ * sampleTime / SAMPLE_RATE))
-                        .toInt()
-                    samples[i] = value.coerceIn(-32_768, 32_767).toShort()
-                    sampleTime += 1.0 / SAMPLE_RATE
+                // One 20 ms packet: 16 kHz mono s16le from the system-side capture tap;
+                // anything missing is sent as silence to keep the RTP cadence + clock.
+                Arrays.fill(payload, 0.toByte())
+                val got = try {
+                    CoreApi.pullCarPlayAudio(payload.size)
+                } catch (e: Throwable) {
+                    if (!pullFailLogged) {
+                        pullFailLogged = true
+                        Log.w(CarPlayConsts.TAG, "pullCarPlayAudio failed — silence until bridge recovers", e)
+                    }
+                    ByteArray(0)
                 }
-                val payload = ByteArray(samples.size * 2)
-                for (i in samples.indices) {
-                    val v = samples[i].toInt()
-                    payload[i * 2] = (v ushr 8).toByte()
-                    payload[i * 2 + 1] = v.toByte()
+                if (got.isNotEmpty()) {
+                    val n = minOf(got.size, payload.size)
+                    System.arraycopy(got, 0, payload, 0, n)
+                    // DiPlay byte-swaps before AudioTrack: the wire format is big-endian.
+                    for (i in 0 until n / 2) {
+                        val v = (payload[i * 2].toInt() and 0xff) or (payload[i * 2 + 1].toInt() shl 8)
+                        payload[i * 2] = (v ushr 8).toByte()
+                        payload[i * 2 + 1] = v.toByte()
+                    }
+                    pulledTotal += n
+                } else if (CarPlayConsts.SEND_TEST_AUDIO) {
+                    // Debug tone only while nothing is actually playing.
+                    for (i in 0 until SAMPLES_PER_PACKET) {
+                        val value = (AMPLITUDE * sin(2.0 * PI * FREQUENCY_HZ * sampleTime / SAMPLE_RATE))
+                            .toInt()
+                        val v = value.coerceIn(-32_768, 32_767)
+                        payload[i * 2] = (v ushr 8).toByte()
+                        payload[i * 2 + 1] = v.toByte()
+                        sampleTime += 1.0 / SAMPLE_RATE
+                    }
                 }
                 rtp[0] = 0x80.toByte()
                 rtp[1] = PAYLOAD_TYPE.toByte()
@@ -125,7 +167,8 @@ class CarPlayAudioEgress(
                 if (packets <= 3 || packets % 500 == 0) {
                     Log.i(
                         CarPlayConsts.TAG,
-                        "CarPlay audio packet=$packets bytes=${datagram.size} ts=$timestamp",
+                        "CarPlay audio packet=$packets bytes=${datagram.size} ts=$timestamp " +
+                            "pulled=${pulledTotal / 1024}KB",
                     )
                 }
                 Thread.sleep(PACKET_INTERVAL_MS)

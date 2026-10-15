@@ -25,6 +25,8 @@ import io.github.nitsuya.aa.display.xposed.cluster.ClusterLyricMirror
 import android.graphics.Point
 import android.view.Display
 import android.view.KeyEvent
+import io.github.nitsuya.aa.display.xposed.carplay.CarPlayAudioCapture
+import io.github.nitsuya.aa.display.xposed.carplay.CarPlayProcessBoost
 import io.github.nitsuya.aa.display.xposed.hook.PanePresentationGuard
 import io.github.nitsuya.aa.display.xposed.hook.PaneDisplayGroupForce
 import io.github.nitsuya.aa.display.xposed.hook.PhoneHidRedirect
@@ -46,11 +48,12 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
     @Volatile
     private var coolwalkReconnectEpochMs = 0L
 
-    @Volatile
-    private var carPlaySessionLive = false
-
     companion object {
         const val TAG = "CoreManagerService"
+
+        @Volatile
+        var carPlaySessionLive: Boolean = false
+            private set
 
         val instance: CoreManagerService by lazy {
             CoreManagerService().apply {
@@ -405,6 +408,10 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
                 .onFailure { log(TAG, "registerAaUiBroadcastReceivers failed", it) }
             runCatching { ClusterLyricMirror.start(systemContext) }
                 .onFailure { log(TAG, "ClusterLyricMirror.start failed", it) }
+            runCatching { CarPlayAudioCapture.install(systemContext) }
+                .onFailure { log(TAG, "CarPlayAudioCapture.install failed", it) }
+            runCatching { CarPlayProcessBoost.install(systemContext) }
+                .onFailure { log(TAG, "CarPlayProcessBoost.install failed", it) }
         }
 
         private fun registerAaUiBroadcastReceivers() {
@@ -471,6 +478,10 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
         /** AA UI attached (not Delay Destroy). Used by [PhoneHidRedirect]. */
         fun isAaSessionLive(): Boolean =
             mSplitController != null && mSessionPolicy?.isAaSessionLive == true
+
+        /** CarPlay Source session live (reported by the app). Used by [PhoneHidRedirect]. */
+        fun isCarPlaySessionLive(): Boolean =
+            mSplitController != null && carPlaySessionLive
 
         /**
          * True while app picker / Recents covers the shell.
@@ -1140,11 +1151,33 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
 
     override fun reportCarPlaySessionLive(live: Boolean) {
         carPlaySessionLive = live
-        mSessionPolicy?.onCarPlaySessionLiveChanged(live)
+        mSessionPolicy?.onSecondaryEgressLiveChanged(live)
+        runCatching { CarPlayProcessBoost.setBoost(live) }
+            .onFailure { logDebug(TAG, "CarPlayProcessBoost.setBoost failed") }
+        if (!live) {
+            // Fail-safe: a torn-down session must never leave the capture armed + phone muted.
+            runCatching { CarPlayAudioCapture.setEnabled(false) }
+                .onFailure { logDebug(TAG, "CarPlayAudioCapture disable on session end failed") }
+        }
         logDebug(TAG, "reportCarPlaySessionLive live=$live")
     }
 
     override fun isCarPlaySessionLive(): Boolean = carPlaySessionLive
+
+    override fun setCarPlayAudioEgressEnabled(enabled: Boolean) {
+        CarPlayAudioCapture.setEnabled(enabled)
+    }
+
+    override fun pullCarPlayAudio(maxBytes: Int): ByteArray = CarPlayAudioCapture.pull(maxBytes)
+
+    override fun scrollPane(pane: Int, x: Int, y: Int, vScroll: Int, hScroll: Int) {
+        runIO {
+            mSessionPolicy?.onVirtualDisplayUserInteraction()
+            runCatching {
+                mSplitController?.onHidScrollOnPane(pane, x.toFloat(), y.toFloat(), vScroll.toFloat(), hScroll.toFloat())
+            }.onFailure { logDebug(TAG, "scrollPane: ${it.message}") }
+        }
+    }
 
     private fun noteUserInteraction() {
         mSessionPolicy?.onVirtualDisplayUserInteraction()

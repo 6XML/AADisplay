@@ -26,6 +26,11 @@ object Iap2Csm {
     const val CARPLAY_AVAILABILITY = 0x4300
     const val CARPLAY_START_SESSION = 0x4301
 
+    /** Accessory asks the phone to start streaming NowPlaying updates. */
+    const val START_NOW_PLAYING_UPDATES = 0x5000
+    /** Phone → accessory incremental NowPlaying update (media + playback groups). */
+    const val NOW_PLAYING_UPDATE = 0x5001
+
     const val WIFI_SECURITY_WPA_WPA2 = 2
     const val WIRELESS_CP_AVAILABLE = 1
 

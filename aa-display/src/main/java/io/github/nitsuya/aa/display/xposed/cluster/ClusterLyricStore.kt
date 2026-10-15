@@ -26,6 +26,10 @@ object ClusterLyricStore {
     const val SETTINGS_POSITION_AT_MS = "aadisplay_cluster_np_position_at_ms"
     const val SETTINGS_PLAYBACK_STATE = "aadisplay_cluster_np_playback_state"
     const val SETTINGS_PLAYBACK_SPEED = "aadisplay_cluster_np_playback_speed"
+    /**
+     * Winner package (CarPlay SOURCE_APP field). Additive key — existing keys stay frozen.
+     */
+    const val SETTINGS_SOURCE_PKG = "aadisplay_cluster_np_source_pkg"
 
     /** Stale after this — gearhead must not keep injecting an old lyric. */
     const val STALE_AFTER_MS = 15_000L
@@ -100,6 +104,15 @@ object ClusterLyricStore {
             Settings.Global.putString(cr, SETTINGS_TRACK_MEDIA_ID, id)
         }.onFailure { e ->
             log(TAG, "publishTrackMediaId failed", e)
+        }
+    }
+
+    fun publishSourcePkg(cr: ContentResolver, pkg: String) {
+        val p = pkg.trim()
+        runCatching {
+            Settings.Global.putString(cr, SETTINGS_SOURCE_PKG, p)
+        }.onFailure { e ->
+            log(TAG, "publishSourcePkg failed", e)
         }
     }
 
@@ -181,6 +194,7 @@ object ClusterLyricStore {
             Settings.Global.putString(cr, SETTINGS_POSITION_AT_MS, "0")
             Settings.Global.putString(cr, SETTINGS_PLAYBACK_STATE, "0")
             Settings.Global.putString(cr, SETTINGS_PLAYBACK_SPEED, "1")
+            Settings.Global.putString(cr, SETTINGS_SOURCE_PKG, "")
             ClusterArtStore.clear(cr)
         }.onFailure { e ->
             log(TAG, "clear Settings.Global failed", e)

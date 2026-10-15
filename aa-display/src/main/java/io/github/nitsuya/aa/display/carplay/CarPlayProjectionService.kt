@@ -11,29 +11,54 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
-import android.view.View
 import io.github.nitsuya.aa.display.CoreApi
 import io.github.nitsuya.aa.display.R
+import io.github.nitsuya.aa.display.egress.ShellFrameEgress
 import io.github.nitsuya.aa.display.ui.main.MainActivity
 import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Foreground service owning [CarPlaySourceSession] for wireless CarPlay Source egress.
+ *
+ * Registers as the [ShellFrameEgress] sink so AA UI never imports this class.
  */
 class CarPlayProjectionService : Service() {
     companion object {
         private val sessionRef = AtomicReference<CarPlaySourceSession?>(null)
-        private val hostProviderRef = AtomicReference<FrameEgressTee.FrameProvider?>(null)
+        private val glCompositorRef = AtomicReference<CarPlayGlCompositor?>(null)
+
+        init {
+            ShellFrameEgress.install(
+                object : ShellFrameEgress.Sink {
+                    override fun attachShell(view: android.view.View?) {
+                        sessionRef.get()?.attachShellView(view)
+                    }
+
+                    override fun onShellSize(width: Int, height: Int) {
+                        sessionRef.get()?.onShellSize(width, height)
+                    }
+                },
+            )
+        }
 
         fun sessionOrNull(): CarPlaySourceSession? = sessionRef.get()
 
-        /** CarPlay-only host pane compositor (ImageReader → split frame); null to detach. */
-        fun attachHostProvider(provider: FrameEgressTee.FrameProvider?) {
-            hostProviderRef.set(provider)
-            sessionRef.get()?.attachFrameProvider(provider)
+        /**
+         * CarPlay-only Host GPU compositor (SurfaceTexture → GLES → encoder).
+         * Null detaches; session will fall back to [FrameEgressTee] Canvas pump.
+         */
+        fun attachGlCompositor(compositor: CarPlayGlCompositor?) {
+            glCompositorRef.set(compositor)
+            sessionRef.get()?.attachGlCompositor(compositor)
+        }
+
+        /** Ensures the [ShellFrameEgress] sink is registered (companion init). */
+        fun ensureShellSinkInstalled() {
+            // Touching the companion object runs init {}.
         }
 
         fun start(context: Context) {
+            ensureShellSinkInstalled()
             val i = Intent(context, CarPlayProjectionService::class.java).setAction(CarPlayConsts.ACTION_CONNECT)
             context.startForegroundService(i)
         }
@@ -43,7 +68,7 @@ class CarPlayProjectionService : Service() {
             context.startService(i)
         }
 
-        fun attachShell(view: View?) {
+        fun attachShell(view: android.view.View?) {
             sessionRef.get()?.attachShellView(view)
         }
 
@@ -123,8 +148,10 @@ class CarPlayProjectionService : Service() {
         val s = CarPlaySourceSession(applicationContext)
         session = s
         sessionRef.set(s)
-        hostProviderRef.get()?.let { s.attachFrameProvider(it) }
+        glCompositorRef.get()?.let { s.attachGlCompositor(it) }
         s.start()
+        // AA may have offered the shell before this session existed — replay it.
+        ShellFrameEgress.rebindSink()
         reportLive(true)
     }
 

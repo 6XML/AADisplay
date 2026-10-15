@@ -149,4 +149,27 @@ interface ICoreManager {
 
     /** True while a CarPlay Source session has reported live. */
     boolean isCarPlaySessionLive();
+
+    /**
+     * system_server AudioPlaybackCapture for the CarPlay main audio egress: captures all
+     * non-call app audio (16 kHz mono PCM16) and mutes the captured streams locally while
+     * enabled, so the car speaker is the only audible sink. App toggles this when its
+     * CarPlay audio stream opens / tears down. Appended at end for Stub ordinals.
+     */
+    void setCarPlayAudioEgressEnabled(boolean enabled);
+
+    /**
+     * Pulls up to [maxBytes] bytes of captured little-endian s16 mono 16 kHz PCM
+     * (empty when disabled or idle); caller byte-swaps to big-endian for the CarPlay wire.
+     * Returned as the result because AIDL `out byte[]` rebinds a fresh array in the
+     * generated proxy (the caller's buffer would never be filled).
+     * Appended at end for Stub ordinals.
+     */
+    byte[] pullCarPlayAudio(int maxBytes);
+
+    /**
+     * Injects a scroll at pane-space (x, y) — CarPlay knob wheel on the focused pane.
+     * Appended at end for Stub ordinals.
+     */
+    oneway void scrollPane(int pane, int x, int y, int vScroll, int hScroll);
 }

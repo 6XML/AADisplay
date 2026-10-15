@@ -381,6 +381,30 @@ object CoreManager : ICoreManager, DeathRecipient {
         }
     }
 
+    override fun setCarPlayAudioEgressEnabled(enabled: Boolean) {
+        try {
+            getService()?.setCarPlayAudioEgressEnabled(enabled)
+        } catch (e: Throwable) {
+            Log.e(TAG, "setCarPlayAudioEgressEnabled failed", e)
+        }
+    }
+
+    override fun pullCarPlayAudio(maxBytes: Int): ByteArray {
+        return try {
+            getService()?.pullCarPlayAudio(maxBytes) ?: ByteArray(0)
+        } catch (e: Throwable) {
+            ByteArray(0)
+        }
+    }
+
+    override fun scrollPane(pane: Int, x: Int, y: Int, vScroll: Int, hScroll: Int) {
+        try {
+            getService()?.scrollPane(pane, x, y, vScroll, hScroll)
+        } catch (e: Throwable) {
+            // oneway best-effort (CarPlay knob wheel)
+        }
+    }
+
     private fun getService(): ICoreManager? {
         if (service != null) return service
         val pm = ServiceManager.getService("package")

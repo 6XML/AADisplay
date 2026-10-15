@@ -528,6 +528,66 @@ flowchart TB
                     （Bonjour _carplay-ctrl._tcp. + BT iAP2 + RTSP）
 ```
 
+### 14.1 播放链路（速查）
+
+会话先就绪，再出画 / 出声 / 出元数据。协议栈在 **AADisplay 进程**；采集与 cgroup 两个能力在 **system_server**（经 `CoreApi` 门控）。
+
+```mermaid
+flowchart TB
+  subgraph bringup [会话就绪]
+    CH[CarPlayChannel 选 CP] --> FGS[CarPlayProjectionService]
+    FGS --> SS[CarPlaySourceSession]
+    SS --> BT[BT RFCOMM iAP2]
+    BT --> WIFI[WiFi handoff / StartSession]
+    WIFI --> RTSP[RTSP Pair-Setup → Verify → SETUP/RECORD]
+  end
+  RTSP --> VID[视频]
+  RTSP --> AUD[音频]
+  RTSP --> NP[NowPlaying]
+```
+
+**视频（屏）**
+
+```
+仅 CP Host（GPU 零拷贝）:
+  VD → SurfaceTexture(OES) → CarPlayGlCompositor（GLES 双窗+分隔条 @供给 fps）
+    → MediaCodec createInputSurface → ScreenStreamEgress → 车机
+
+AA 双轨 / 回退:
+  VD / 壳 View → FrameEgressTee（Canvas；Handler 定时）→ 同上编码器
+```
+
+- SETUP `type=110` 后连 `dataPort`；密钥 = HKDF(pairVerify.shared, `DataStream-Salt{id}`, …)。
+- 帧率状态机在 `CarPlaySourceSession`（60↔30）；**不重发 SETUP**。DiPlay 解码帧率自持，车机需设 60fps。
+- Host GL 与 Canvas tee **互斥**（同一 encoder Surface）；日志 `feed=gl-compositor` / `feed=tee-canvas`；`CarPlayGlCompositor rate ~XXfps`。
+
+**音频（主媒体流）**
+
+```
+手机可听流（MUSIC / 通知 / 导航 TTS / 系统 / 闹钟；通话除外）
+  → system_server CarPlayAudioCapture（AudioPlaybackCapture → 16k mono PCM16 ring；本地静音）
+  → CoreApi.pullCarPlayAudio（每 20ms 640B）
+  → CarPlayAudioEgress（LE→BE → RTP + ChaCha UDP）
+  → 车机扬声器
+```
+
+- RTSP SETUP `type=100`（`audioFormat=0x10`）后恒开；无内容发静音；`SEND_TEST_AUDIO` 仅调试。
+- 启停由 egress `setCarPlayAudioEgressEnabled` 驱动（非仅会话存活），避免空闲 CP 把手机静音。
+
+**NowPlaying（仪表卡 / 歌词行）**
+
+```
+ClusterLyricMirror（system_server）
+  → ClusterLyricStore / ClusterArtStore（Settings.Global）
+  → CarPlayNowPlaying（app 观察）
+  → iAP2 0x5001 增量（title=当前歌词行）
+  → 封面：会话 12 文件传输（SETUP→START→DATA+FLAG_LAST→SUCCESS）
+```
+
+- Host 发 `0x5000` 后才推流；与 AA 仪表横条**同源**，只是出口从 gearhead Title 换成 iAP2。
+
+**触控 / 方控（回传，非播放）**：event 通道 HID → `CarPlayInputBridge` / `CarPlayWheelController` → `CoreApi.touch*` / `pressKey` / `scrollPane`。
+
 | 组件 | 路径 |
 |------|------|
 | FGS / 启停 | `carplay/CarPlayProjectionService.kt`（Intent `CONNECT` / `STOP`；系统重启仅在选择 CarPlay 通道时重武装） |
@@ -535,16 +595,42 @@ flowchart TB
 | 会话编排 | `carplay/CarPlaySourceSession.kt` |
 | 发现 / 链路 | `CarPlayBonjour`、`CarPlayBluetoothLink`（RFCOMM dial+listen）、`CarPlayRtspSession` |
 | iAP2 | `protocol/Iap2Framing` + `Iap2Csm` + `Iap2Session`：detect → Link Sync → Ident → Auth(`AA00…05`) → WiFi/`4300`→`4301`；`CarPlayWifiHandoff` 尝试加热点 |
-| 编码 / tee | `CarPlayVideoEncoder`（Surface 输入优先 / buffer 旋转槽 + 后台 NV12 转换回退；`ENCODE_*`=1280×720 16 对齐）、`FrameEgressTee`（主 looper pump，壳 tee > Host 分屏 > 测试图） |
-| 音频出站 | `CarPlayAudioEgress.kt`（v1：16 kHz mono LPCM tone；真实应用音频采集待 system 侧） |
-| 仅 CP Host | `CarPlayHostActivity`（双 ImageReader 窗格 → 合成进 tee；`CoreApi.onCreateSplitDisplay`） |
-| 触控回传 | `CarPlayInputBridge` → AA 在线 `CoreApi.touchAaDisplay`；仅 CP 按 `primaryRatio` 切窗 → `CoreApi.touchPane`（窗内像素） |
-| 仲裁 | `ProjectionSessionGate`（app）+ `reportCarPlaySessionLive`（system_server） |
+| 编码 / tee | `CarPlayVideoEncoder`（60fps / 8–16 Mbit；Surface 优先；`ENCODE_*`=1280×720；`KEY_LOW_LATENCY`/`CAPTURE_RATE`/`REPEAT_PREVIOUS_FRAME_AFTER`；GOP：`FEATURE_IntraRefresh` 优先否则 I-frame=10s）、Host：`CarPlayGlCompositor`（VD→OES→GLES→encoder @60；`carplay/gles/*`）、回退/AA：`FrameEgressTee` Canvas Handler 泵（不用 Choreographer）；`ScreenStreamEgress` 同步 TCP + 每帧 flush（异步合并 flush 会灌爆 DiPlay） |
+| 帧率自适应 | `CarPlaySourceSession`：8×10s 劣化（<50% 或丢帧 >15%）60→30，6×10s 良好 30→60；不重发 SETUP（DiPlay 忽略 fps，**车机需 设置→显示→帧率=60**） |
+| 音频出站 | system_server `xposed/carplay/CarPlayAudioCapture.kt`（`AudioPlaybackCapture` 反射装配：MUSIC/NOTIFICATION/VOICE_ASSISTANCE/SYSTEM/ALARM，16k mono PCM16，SPSC ring；启用期间本地静音并还原音量；5min 无 pull 看门狗自卸）＋ `CarPlayAudioEgress.kt`（每 20ms `CoreApi.pullCarPlayAudio` 640B → LE→BE → ChaCha/RTP；无内容发静音；`SEND_TEST_AUDIO` 仅调试音） |
+| NowPlaying | `CarPlayNowPlaying.kt`（观察 `ClusterLyricStore`/`ClusterArtStore` Settings.Global → iAP2 `0x5001` 增量：title=当前歌词行（仪表 8s 字幕）、artist/album/source/duration/elapsed 1s tick；封面走 iAP2 v2 文件传输会话 12：SETUP→START→DATA(FLAG_LAST)→SUCCESS，≤2MiB，`CoreApi.getClusterArtJpeg` 取字节） |
+| iAP2 扩展 | `Iap2Session`：`0x5000` 订阅接收、`sendNowPlaying`、会话 12 路由 + 发送窗口流控（对端 maxOutgoing 累积 ACK，队列封顶）；`Iap2Framing` LSP 含 `(0x0C, kind 1, ver 2)` |
+| 方向盘 | event 通道 HID uuid `2a2a2a2b/c/d` → `CarPlayWheelController`：媒体键短按 `CoreApi.pressKey`、NEXT 长按 `swapSplitPanes`、PREV 长按 Recents、滚轮 `CoreApi.scrollPane`（焦点窗滚动） |
+| 仅 CP Host | `CarPlayHostActivity`（无 UI 壳：双 SurfaceTexture → `CarPlayGlCompositor` GLES 合成 + 分隔条/全屏 peel + Recents/Picker 纹理叠加；`LastSplitStore` 快照恢复 + 演示应用兜底） |
+| 触控回传 | `CarPlayInputBridge` → AA 在线 `CoreApi.touchAaDisplay`；仅 CP 按 `primaryRatio` 切窗 → `CoreApi.touchPane`（窗内像素）；分隔条对齐 AA：短按 `swapSplitPanes`、长按 Recents、拖动预览 + UP `setSplitRatio` settle、拖过边缘 `setSplitFullscreen`；空窗短按开 `CarPlayAppPickerOverlay` |
+| Recents | `CarPlayRecentsOverlay.kt`（画布三列对齐 AA：左 PRIMARY / 中 SECONDARY / 右 PHONE；`getRecentTask`；点卡 `moveTaskToFront` / `startActivityOnPaneForUser`；底栏「添加应用」→ Picker；空白 dismiss） |
+| 应用选择器 | `CarPlayAppPickerOverlay.kt`（画布网格；最近包 + launchable；`startActivityOnPaneForUser`） |
+| 会话仲裁 | `egress/ProjectionSessionGate`（app）+ `reportCarPlaySessionLive`（system_server → `DisplaySessionPolicy.onSecondaryEgressLiveChanged`：CP 存活期间 Delay Destroy 挂起，CP 结束且 AA 未附 → 重启 180s 倒计时）＋ `xposed/carplay/CarPlayProcessBoost.kt`（CP 存活期把 app pid 写入 `cpu`+`cpuset`+`freezer` 的 top-app，3s 重断言；仅写 cpu 时三星会进 `cpuset:/abnormal` 砍半核） |
+| AA 壳 tee 桥 | `egress/ShellFrameEgress`（AA UI 只调此桥；`CarPlayProjectionService` 注册 Sink） |
+| 状态页 CarPlay UI | `carplay/CarPlayStatusUi`（`MainActivity` 只 `bind` / `refresh` / `handleLaunchIntent`） |
+| 音频采集（system） | `xposed/carplay/CarPlayAudioCapture.kt`（原 `xposed/hook/`，已迁出以免与 AA 钩子混放） |
+
+### 14.2 包边界（AA 与 CarPlay 分离）
+
+目标：协议 / 编码 / Host 留在 `carplay/`；AA 车机 UI 与 gearhead 钩子**不** import carplay 包；共享的只有 `egress/` 桥与 `CoreApi`。
+
+```
+ui/aa/           → egress/ShellFrameEgress + CoreApi      （无 carplay import）
+carplay/         → CoreApi + egress/ + Cluster*（读）     （协议 / FGS / Host）
+xposed/carplay/  → 仅 system_server 能力，经 ICoreManager 门控
+xposed/hook/aa/  → 无 CarPlay 引用（保持）
+```
+
+| 允许共享 | 禁止 |
+|----------|------|
+| `CoreApi` / 双 VD / `SplitPane` / `LastSplitStore` / `ClusterLyricStore`（读） | `AaMainFragment` 直接引用 `CarPlayProjectionService` |
+| `egress/ProjectionSessionGate`、`ShellFrameEgress` | 把 iAP2/RTSP/加密搬进 system_server |
+| AIDL `reportCarPlaySessionLive` 等（名称冻结，ordinal 稳定） | 在 `AndroidAutoHook` / gearhead 钩子里加 CarPlay 逻辑 |
 
 **不变式补充**
 
-- CarPlay 协议栈 **只跑在 AADisplay 进程**；VD 仍只经 `CoreApi`。
-- AA 在线时 **禁止** 把 VD 唯一 sink 换成 encoder；用壳 tee。
+- CarPlay **协议栈**（iAP2 / RTSP / 加密 / 音频 RTP / 文件传输）只跑在 AADisplay 进程的 `carplay/`。两个 **系统能力**例外（与 VirtualDisplay 创建同性质，经 `ICoreManager` 由 app 门控，CP 会话存活才生效）：`xposed/carplay/CarPlayAudioCapture` 与 `CarPlayProcessBoost`。不要把协议逻辑搬进 system_server。
+- AA 在线时 **禁止** 把 VD 唯一 sink 换成 encoder；用壳 tee（经 `ShellFrameEgress`）。
 - 不 vendor CatPlay / 不开 CarLife 包名伪装；LSPosed scope 仍仅 `android` + gearhead。
 - Debug 下本机 RTSP loopback 可验证 RTP interleaved；Source dial（对 DiPlay）：persistent Pair-Setup M1–M6 → Pair-Verify → 加密 SETUP/RECORD → `eventPort`（Events-* ChaCha：forceKeyFrame / HID 触控）→ `dataPort` screen 流（DataStream ChaCha 密钥来自 pair-verify shared + avcC CONFIG + AVC）。FairPlay AES 路径仍需真机抓包对照。
 - screen 128B 头 **NTP 32.32 = little-endian**、event 通道 `Events-Input/Output` 密钥**互补交换**（对照 DiPlay 真机解密布局；方向写反即对端持续 `BAD_DECRYPT`）。
@@ -555,9 +641,9 @@ flowchart TB
 - [docs/CARPLAY_REFS.md](CARPLAY_REFS.md) — 以 [45clouds/WirelessCarPlay](https://github.com/45clouds/WirelessCarPlay)（MIT）的 iAP2 / CarPlay / BT 配件 / 认证 PDF 与 mDNS 为主；对照本模块 `Iap2Framing`、`CarPlayBonjour`、`CarPlayRtspSession`，并说明与「RPi USB 中继」角色差异。
 - [docs/CARPLAY_MAC_TEST.md](CARPLAY_MAC_TEST.md) — Mac CarPlay Simulator（Host）组网联调步骤 + `tools/carplay-test/carplay_probe.sh` 分层探测（Bonjour / RTSP / btsnoop）。
 
-**真机验证状态（对 DiPlay 0.2.19，双机）**：screen 解码出画（`first decrypted frame` → decoder render）、audio LPCM tone 播放（`authFailures=0`）、event 通道长活、触控往返（Host tap → Source `event touch` → 窗格）。画面帧率受 **Source 手机 app 前后台 cgroup** 影响（后台约 2–4fps、前台 11–15fps）——正常使用（用户从状态页发起）即前台，无需额外处理。
+**真机验证状态（对 DiPlay 0.2.19，双机）**：screen 解码出画（`first decrypted frame` → decoder render）、event 通道长活、触控往返（Host tap → Source `event touch` → 窗格）、audio 通道建立。画面供给帧率受 **Source 手机 app cgroup** 影响（后台 2–4fps / 前台 11–15fps）——CarPlay 会话存活期由 `CarPlayProcessBoost` 提权 top-app 缓解；**60fps 需要在车机 DiPlay 设置→显示→帧率=60**（DiPlay 解码帧率自持，忽略 Source SETUP fps）。
 
-状态页（`MainActivity`）「出口通道」单选 **Android Auto / CarPlay**（默认 AA，真车行为不变）：选 CarPlay 启 Source（AA 未附时自动开仅 Host 分屏），切回 AA 停 Source；也可单独打开仅 Host Activity。
+状态页（`MainActivity` → `CarPlayStatusUi`）「出口通道」单选 **Android Auto / CarPlay**（默认 AA，真车行为不变）：选 CarPlay 启 Source（AA 未附时自动开仅 Host 分屏），切回 AA 停 Source；也可单独打开仅 Host Activity。
 
 ---
 
@@ -579,7 +665,7 @@ flowchart TB
 14. 不要重新引入 `aadisplay_config` SharedPreferences。
 15. 不要在 App 进程申请 Magisk `su`。
 16. 新钩子：`object` + `BaseHook`/`AaHook`，`tagName` = `AAD_*`。
-17. CarPlay 不进 system_server；AA 在线时 VD sink 仍给 TextureView，CarPlay 只用 tee。
+17. CarPlay **协议**不进 system_server（系统侧仅 `xposed/carplay/CarPlayAudioCapture` / `CarPlayProcessBoost`，CP-live 门控）；AA 在线时 VD sink 仍给 TextureView，CarPlay 只用 `ShellFrameEgress` tee；`ui/aa/` 不 import carplay 包。
 
 ---
 
@@ -588,7 +674,7 @@ flowchart TB
 | 要改什么 | 从这些文件顺着读 |
 |----------|------------------|
 | 开机 / 作用域 / 进哪个进程 | `XposedInit.kt`、`AndroidHook.kt`、`AndroidAutoHook.kt` |
-| 无线 CarPlay 出口 | §14、[CARPLAY_REFS.md](CARPLAY_REFS.md)、`carplay/*`、`ICoreManager.reportCarPlaySessionLive` |
+| 无线 CarPlay 出口 / 播放链路 | §14 / §14.1 / §14.2、[CARPLAY_REFS.md](CARPLAY_REFS.md)、`carplay/`、`egress/ShellFrameEgress`、`xposed/carplay/`、`ICoreManager.reportCarPlaySessionLive` |
 | Binder 拿不到 / 未激活 | `BridgeService.kt`、`CoreManager.kt`、`CoreApi.kt`、`MainActivity.kt` |
 | 车机没自动打开本模块 | `AaUiHook` Auto Open、`AaActivityService`、`AaSignatureHook` |
 | 双窗创建 / 闪烁 / 尺寸 | `AaMainFragment.requestDisplay`、`CoreManagerService` profile lock、`DisplayProfileSettle`、`SplitVdLifecycle` |

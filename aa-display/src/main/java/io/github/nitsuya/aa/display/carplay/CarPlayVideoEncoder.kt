@@ -19,15 +19,12 @@ import kotlin.concurrent.thread
  * AVC encoder for the CarPlay screen stream.
  *
  * Two input modes:
- *  - Surface input (preferred): the frame pump draws straight into the encoder's
- *    `lockHardwareBuffer` canvas — C2 does the RGB→YUV conversion in hardware, so no
- *    per-pixel CPU work.
- *  - Buffer input (fallback): rotating ARGD8888 slots filled by `getPixels` on the pump
- *    thread, converted to NV12 on a worker thread (the ~100 ms color conversion never
- *    blocks the compositor feed).
+ *  - Surface input (preferred): [CarPlayGlCompositor] (or Canvas tee) feeds
+ *    [createInputSurface] — C2 does RGB→YUV in hardware.
+ *  - Buffer input (fallback): rotating ARGB8888 slots + worker NV12 conversion.
  *
- * Surface-input needs `createInputSurface` + `lockHardwareBuffer` (API 26); both exist
- * on minSdk 33, but a failure to configure degrades to buffer input.
+ * Host GPU path consumes [inputSurfaceOrNull] exclusively via EGL; Canvas tee must not
+ * [encodeCanvas] the same Surface concurrently.
  */
 class CarPlayVideoEncoder(
     /** bytes, ptsUs, isKey, isCodecConfig */
@@ -44,6 +41,8 @@ class CarPlayVideoEncoder(
     fun dropCount(): Long = droppedFrames.get()
     private var width = CarPlayConsts.DEFAULT_VIDEO_WIDTH
     private var height = CarPlayConsts.DEFAULT_VIDEO_HEIGHT
+    @Volatile
+    private var fps = CarPlayConsts.DEFAULT_VIDEO_FPS
     private var frameIndex = 0L
 
     // Buffer-input mode: rotating conversion slots; the pump fills the opposite slot the
@@ -56,10 +55,11 @@ class CarPlayVideoEncoder(
     private val converterQueue = LinkedBlockingQueue<Int>(1)
     private var converterThread: Thread? = null
 
-    fun start(width: Int, height: Int) {
+    fun start(width: Int, height: Int, fps: Int = CarPlayConsts.DEFAULT_VIDEO_FPS) {
         stop()
         this.width = align16(width.coerceAtLeast(16))
         this.height = align16(height.coerceAtLeast(16))
+        this.fps = fps.coerceIn(1, 120)
         val pixels = this.width * this.height
         argbSlots = arrayOf(IntArray(pixels), IntArray(pixels))
         nv12Slots = arrayOf(ByteArray(pixels + pixels / 2), ByteArray(pixels + pixels / 2))
@@ -67,43 +67,82 @@ class CarPlayVideoEncoder(
         converterBusy = false
         surfaceFrameFailLogged.set(false)
         drainFailLogged.set(false)
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, this.width, this.height).apply {
-            setInteger(
-                MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible,
-            )
-            setInteger(MediaFormat.KEY_BIT_RATE, CarPlayConsts.DEFAULT_VIDEO_BITRATE)
-            setInteger(MediaFormat.KEY_FRAME_RATE, CarPlayConsts.DEFAULT_VIDEO_FPS)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-        }
         val encoder = try {
             MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         } catch (e: Throwable) {
             Log.e(CarPlayConsts.TAG, "AVC encoder create failed", e)
             return
         }
-        val surface = try {
-            encoder.createInputSurface()
-        } catch (e: Throwable) {
-            Log.w(CarPlayConsts.TAG, "AVC createInputSurface failed; buffer mode", e)
+        // Surface input: configure(COLOR_FormatSurface) → createInputSurface → start.
+        // Calling createInputSurface before configure always throws IllegalStateException
+        // and forced the expensive ARGB→NV12 buffer path (~40–250ms/frame).
+        var surface: Surface? = null
+        val codecInfo = try {
+            encoder.codecInfo
+        } catch (_: Throwable) {
             null
         }
-        try {
-            encoder.configure(format, surface, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val surfaceOk = try {
+            val surfaceFormat = MediaFormat.createVideoFormat(
+                MediaFormat.MIMETYPE_VIDEO_AVC,
+                this.width,
+                this.height,
+            ).apply {
+                applyCommonVideoKeys(this, fps, codecInfo)
+                setInteger(
+                    MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
+                )
+            }
+            encoder.configure(surfaceFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            surface = encoder.createInputSurface()
             encoder.start()
+            true
         } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "AVC surface input unavailable; buffer mode", e)
             try {
                 surface?.release()
             } catch (_: Throwable) {
             }
-            Log.e(CarPlayConsts.TAG, "AVC encoder cannot support advertised dimensions", e)
+            surface = null
             try {
-                encoder.release()
+                encoder.reset()
             } catch (_: Throwable) {
+                try {
+                    encoder.release()
+                } catch (_: Throwable) {
+                }
+                codec = null
+                running.set(false)
+                return
             }
-            codec = null
-            running.set(false)
-            return
+            false
+        }
+        if (!surfaceOk) {
+            val bufferFormat = MediaFormat.createVideoFormat(
+                MediaFormat.MIMETYPE_VIDEO_AVC,
+                this.width,
+                this.height,
+            ).apply {
+                applyCommonVideoKeys(this, fps, codecInfo)
+                setInteger(
+                    MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible,
+                )
+            }
+            try {
+                encoder.configure(bufferFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                encoder.start()
+            } catch (e: Throwable) {
+                Log.e(CarPlayConsts.TAG, "AVC encoder cannot support advertised dimensions", e)
+                try {
+                    encoder.release()
+                } catch (_: Throwable) {
+                }
+                codec = null
+                running.set(false)
+                return
+            }
         }
         codec = encoder
         inputSurface = surface
@@ -112,17 +151,31 @@ class CarPlayVideoEncoder(
             converterThread = thread(name = "carplay-avc-convert", isDaemon = true) { converterLoop(encoder) }
         }
         thread(name = "carplay-avc-drain", isDaemon = true) { drainLoop(encoder) }
-        Log.i(CarPlayConsts.TAG, "AVC encoder ${this.width}x${this.height} input=${if (surface != null) "surface" else "buffer"}")
+        Log.i(
+            CarPlayConsts.TAG,
+            "AVC encoder ${this.width}x${this.height}@${this.fps}fps " +
+                "input=${if (surface != null) "surface" else "buffer"}",
+        )
     }
 
     /** Surface-input mode active? */
     fun hasSurfaceInput(): Boolean = inputSurface != null
 
-    /** True when already running at the given (unaligned) size — lets callers skip redundant restarts. */
-    fun isRunningAt(width: Int, height: Int): Boolean =
+    /** MediaCodec input Surface for GLES / Canvas producers; null in buffer mode. */
+    fun inputSurfaceOrNull(): Surface? = inputSurface
+
+    /** Current supply frame rate (0 when stopped). */
+    fun currentFps(): Int = if (running.get()) fps else 0
+
+    /**
+     * True when already running at the given (unaligned) size + rate — lets callers skip
+     * redundant restarts, including the 60→30 degrade re-arm.
+     */
+    fun isRunningAt(width: Int, height: Int, fps: Int = CarPlayConsts.DEFAULT_VIDEO_FPS): Boolean =
         running.get() &&
             this.width == align16(width.coerceAtLeast(16)) &&
-            this.height == align16(height.coerceAtLeast(16))
+            this.height == align16(height.coerceAtLeast(16)) &&
+            this.fps == fps.coerceIn(1, 120)
 
     /** DiPlay recovery / showUI asks for an IDR via event `forceKeyFrame`. */
     fun requestKeyFrame() {
@@ -148,14 +201,24 @@ class CarPlayVideoEncoder(
         if (!running.get()) return
         val surface = inputSurface ?: return
         try {
-            val canvas = surface.lockHardwareCanvas()
+            // Prefer software lockCanvas: lockHardwareCanvas floods FrameEvents
+            // "Did not find frame" on Samsung and contributes to DiPlay strobing even when
+            // the Handler pump hits 60 Hz. Software lock still feeds the C2 surface path.
+            val canvas = try {
+                surface.lockCanvas(null)
+            } catch (_: Throwable) {
+                surface.lockHardwareCanvas()
+            }
+            // Buffer rings are undefined until fully painted; letterbox / partial draws
+            // otherwise flash prior frames on the HU (seen as DiPlay flicker).
+            canvas.drawColor(android.graphics.Color.BLACK)
             draw(canvas)
             surface.unlockCanvasAndPost(canvas)
             frameIndex++
         } catch (e: Throwable) {
             droppedFrames.incrementAndGet()
             if (!surfaceFrameFailLogged.compareAndSet(false, true)) return
-            Log.w(CarPlayConsts.TAG, "AVC hardware canvas unusable — surface input will drop frames", e)
+            Log.w(CarPlayConsts.TAG, "AVC surface canvas unusable — surface input will drop frames", e)
         }
     }
 
@@ -355,7 +418,59 @@ class CarPlayVideoEncoder(
         converterThread?.interrupt()
         converterThread = null
         frameIndex = 0L
+        fps = CarPlayConsts.DEFAULT_VIDEO_FPS
     }
 
     private fun align16(v: Int): Int = (v + 15) and 15.inv()
+
+    private fun bitrateFor(fps: Int): Int =
+        if (fps >= CarPlayConsts.DEFAULT_VIDEO_FPS) CarPlayConsts.BITRATE_FPS60
+        else CarPlayConsts.BITRATE_FPS30
+
+    private fun applyCommonVideoKeys(format: MediaFormat, fps: Int, codecInfo: MediaCodecInfo?) {
+        val rate = fps.coerceIn(1, 120)
+        format.setInteger(MediaFormat.KEY_BIT_RATE, bitrateFor(rate))
+        format.setInteger(MediaFormat.KEY_FRAME_RATE, rate)
+        // Prefer gradual intra-refresh (no periodic ~200KB IDR bursts). Fallback: long GOP
+        // like scrcpy (10s). DiPlay recovery still uses event forceKeyFrame → requestKeyFrame.
+        if (supportsIntraRefresh(codecInfo)) {
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, -1)
+            format.setInteger(MediaFormat.KEY_INTRA_REFRESH_PERIOD, rate.coerceAtLeast(16))
+            Log.i(
+                CarPlayConsts.TAG,
+                "AVC gop=intra-refresh period=${rate}f (no periodic IDR; forceKeyFrame ok)",
+            )
+        } else {
+            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, CarPlayConsts.I_FRAME_INTERVAL_SEC)
+            Log.i(
+                CarPlayConsts.TAG,
+                "AVC gop=${CarPlayConsts.I_FRAME_INTERVAL_SEC}s (no FEATURE_IntraRefresh)",
+            )
+        }
+        format.setInteger(MediaFormat.KEY_CAPTURE_RATE, rate)
+        format.setInteger(MediaFormat.KEY_OPERATING_RATE, rate)
+        format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        format.setLong(
+            MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER,
+            1_000_000L / rate,
+        )
+        try {
+            format.setInteger(
+                MediaFormat.KEY_BITRATE_MODE,
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR,
+            )
+        } catch (_: Throwable) {
+            // Some OEM codecs reject CBR; VBR default is fine.
+        }
+    }
+
+    private fun supportsIntraRefresh(info: MediaCodecInfo?): Boolean {
+        if (info == null) return false
+        return try {
+            val caps = info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC) ?: return false
+            caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_IntraRefresh)
+        } catch (_: Throwable) {
+            false
+        }
+    }
 }

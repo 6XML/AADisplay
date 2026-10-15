@@ -21,8 +21,9 @@ object Iap2Framing {
     const val CONTROL_EAK = 0x20
     const val CONTROL_RST = 0x10
 
-    /** Session type 0 = control, 2 = external accessory. */
+    /** Session type 0 = control, 1 = file transfer, 2 = external accessory. */
     const val SESSION_TYPE_CONTROL = 0
+    const val SESSION_TYPE_FILE_TRANSFER = 1
     const val SESSION_TYPE_EA = 2
 
     fun checksum(bytes: ByteArray, offset: Int = 0, length: Int = bytes.size): Int {
@@ -115,13 +116,17 @@ object Iap2Framing {
                 )
             }
 
-            /** Prefer CarPlay-common sessions (id 1/3); also advertise 10/11 for lab stacks. */
+            /**
+             * Prefer CarPlay-common sessions (id 1/3); also advertise 10/11 for lab stacks.
+             * 12 = iAP2 v2 file transfer (NowPlaying artwork; matches DiPlay kind 1 / ver 2).
+             */
             fun defaultForSource(): LinkSyncPayload = LinkSyncPayload(
                 sessions = listOf(
                     Triple(0x01, SESSION_TYPE_CONTROL, 2),
                     Triple(0x03, SESSION_TYPE_EA, 1),
                     Triple(0x0A, SESSION_TYPE_CONTROL, 1),
                     Triple(0x0B, SESSION_TYPE_EA, 1),
+                    Triple(0x0C, SESSION_TYPE_FILE_TRANSFER, 2),
                 ),
             )
         }
@@ -262,6 +267,14 @@ object Iap2Framing {
 
     fun utf8Param(value: String): ByteArray =
         (value + "\u0000").toByteArray(Charsets.UTF_8)
+
+    fun u8Param(value: Int): ByteArray = byteArrayOf((value and 0xff).toByte())
+
+    fun u32Param(value: Long): ByteArray {
+        val out = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
+        out.putInt(value.toInt())
+        return out.array()
+    }
 
     fun u16ListParam(ids: IntArray): ByteArray {
         val out = ByteBuffer.allocate(ids.size * 2).order(ByteOrder.BIG_ENDIAN)

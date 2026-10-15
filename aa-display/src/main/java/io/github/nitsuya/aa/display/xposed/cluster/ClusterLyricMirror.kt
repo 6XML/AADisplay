@@ -614,6 +614,7 @@ object ClusterLyricMirror {
         if (ctx != null) {
             ClusterLyricStore.publish(ctx.contentResolver, title, panelArtist, album)
             ClusterLyricStore.publishTrackMediaId(ctx.contentResolver, mediaId)
+            ClusterLyricStore.publishSourcePkg(ctx.contentResolver, boundPackage.orEmpty())
             if (warmStartPending) {
                 ClusterLyricMediaService.warmStart(ctx)
                 warmStartPending = false

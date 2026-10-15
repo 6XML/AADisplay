@@ -118,9 +118,17 @@ class DisplaySessionPolicy(
          */
         private const val POWER_GROUP_RETRY_DELAY_MS = 250L
         private const val POWER_GROUP_RETRY_MAX = 8
+        /** Delay-Destroy recheck cadence while a secondary egress (CarPlay) is still live. */
+        private const val CP_LIVE_RECHECK_MS = 5_000L
     }
 
     private var mDestroyJob: Job? = null
+    /** Last destroy callback, kept so a secondary-egress stop can re-arm the countdown. */
+    @Volatile
+    private var mPendingDestroySucceed: (() -> Unit)? = null
+    /** AA UI currently attached (set on resume, cleared on destroy). */
+    @Volatile
+    private var mAaUiAttached = false
 
     /** True while AA UI is attached; false during Delay Destroy / after teardown. */
     val isAaSessionLive: Boolean
@@ -129,11 +137,31 @@ class DisplaySessionPolicy(
     @Volatile
     private var carPlaySessionLive = false
 
-    /** Mirrored from [ICoreManager.reportCarPlaySessionLive] for dual-egress logging. */
-    fun onCarPlaySessionLiveChanged(live: Boolean) {
+    /**
+     * Secondary video egress (today: CarPlay Source) is a first-class consumer of the
+     * split VDs (parity with AA): Delay Destroy must not fire while it is live, and when
+     * it ends the countdown restarts if no AA UI is attached.
+     *
+     * Wired from [ICoreManager.reportCarPlaySessionLive] (AIDL name kept for ordinal
+     * stability — do not rename the binder method).
+     */
+    fun onSecondaryEgressLiveChanged(live: Boolean) {
+        if (carPlaySessionLive == live) return
         carPlaySessionLive = live
-        log(TAG, "CarPlay session live=$live aaLive=$isAaSessionLive")
+        log(TAG, "secondary egress live=$live aaUiAttached=$mAaUiAttached aaLive=$isAaSessionLive")
+        if (live) {
+            // The car is rendering the VD content — never destroy under it.
+            mDestroyJob?.cancel()
+        } else {
+            val cb = mPendingDestroySucceed
+            if (!mAaUiAttached && mDestroyJob?.isActive != true && cb != null) {
+                startDelayDestroy(cb)
+            }
+        }
     }
+
+    /** @see onSecondaryEgressLiveChanged */
+    fun onCarPlaySessionLiveChanged(live: Boolean) = onSecondaryEgressLiveChanged(live)
 
     fun isCarPlaySessionLive(): Boolean = carPlaySessionLive
 
@@ -914,6 +942,7 @@ class DisplaySessionPolicy(
     suspend fun onResume() {
         // Cancel Delay Destroy first so completion cannot race-release keep-awake.
         mDestroyJob?.cancelAndJoin()
+        mAaUiAttached = true
         interactiveMonitor.init()
         // Soft reconnect: only recover panes that are already OFF/DOZE while phone is off.
         keepVirtualDisplayAwake("resume")
@@ -922,6 +951,7 @@ class DisplaySessionPolicy(
     }
 
     suspend fun onDestroyPromptly() {
+        mAaUiAttached = false
         runCatching { PhoneHidRedirect.onSessionLiveChanged(false) }
             .onFailure { log(TAG, "PhoneHidRedirect onDestroyPromptly failed", it) }
         resetPresentationRecoveryState()
@@ -933,6 +963,7 @@ class DisplaySessionPolicy(
     suspend fun onDestroy(onDestroySucceed: () -> Unit) {
         // Keep heartbeat through Delay Destroy so soft reconnect can recover OFF panes.
         // Monitor locks are acquired only when phone is off or a pane is OFF/DOZE.
+        mAaUiAttached = false
         runCatching { PhoneHidRedirect.onSessionLiveChanged(false) }
             .onFailure { log(TAG, "PhoneHidRedirect onDestroy failed", it) }
         resetPresentationRecoveryState()
@@ -940,10 +971,21 @@ class DisplaySessionPolicy(
         startDelayDestroy(onDestroySucceed)
     }
 
-    /** Headless Delay Destroy so [onDestroySucceed] fires and VDs are released. */
+    /**
+     * Headless Delay Destroy so [onDestroySucceed] fires and VDs are released. While a
+     * secondary egress (CarPlay) stays live the countdown waits for it to end first —
+     * the car is still consuming the VDs. [mPendingDestroySucceed] is retained across
+     * cancellations so a later egress stop re-arms the countdown.
+     */
     private fun startDelayDestroy(onDestroySucceed: () -> Unit) {
+        mPendingDestroySucceed = onDestroySucceed
+        mDestroyJob?.cancel()
         mDestroyJob = CoroutineScope(Dispatchers.Main).launch {
             delay(DELAY_DESTROY_SEC * 1000L)
+            while (carPlaySessionLive) {
+                delay(CP_LIVE_RECHECK_MS)
+            }
+            mPendingDestroySucceed = null
             resetPresentationRecoveryState()
             restorePhoneDisplayPower()
             interactiveMonitor.release()
