@@ -11,118 +11,174 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 import java.util.Arrays
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.concurrent.thread
 import kotlin.math.PI
 import kotlin.math.sin
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * CarPlay main audio (SETUP type 100) egress: carries real phone app audio to the car.
+ * CarPlay realtime audio egress (SETUP type 100).
  *
- * Content source: the system_server [io.github.nitsuya.aa.display.xposed.carplay.CarPlayAudioCapture]
- * tap ([AudioPlaybackCapture]) — every non-call stream the user would hear on the phone
- * (music / Douyin / nav TTS / notifications / alarms) at 16 kHz mono PCM16, pulled over
- * [CoreApi.pullCarPlayAudio] and byte-swapped little→big-endian per packet. While the
- * egress runs, [CoreApi.setCarPlayAudioEgressEnabled] mutes those streams locally so the
- * car speaker is the only audible sink. Gaps (nothing playing) send silence; with
- * [CarPlayConsts.SEND_TEST_AUDIO] the 440 Hz tone stands in for debugging.
+ * Two profiles against DiPlay:
+ * - **media** — `audioType=media`, bit **0x8000** = PCM/48000/16/2
+ * - **speech** — `audioType=speech`, bit **0x10** = PCM/16000/16/1 (nav / voice prompts)
  *
- * DiPlay host [com.shilapi.xcertplay.airplay.AudioStream] wire format: one UDP datagram
- * = 12-byte RTP header + ChaCha20-Poly1305 ciphertext + 16-byte tag + trailing 8-byte
- * little-endian nonce (four leading zero bytes); AAD = RTP bytes 4..12 (timestamp+SSRC).
- * Key = HKDF(pairVerify.shared, "DataStream-Salt$streamConnectionID",
- * "DataStream-Output-Encryption-Key") — same derivation as the screen DataStream.
+ * Wire: UDP datagram = 12-byte RTP + ChaCha20-Poly1305 ciphertext+tag + 8-byte LE nonce;
+ * AAD = RTP bytes 4..12 (timestamp+SSRC). LPCM samples are big-endian on the wire.
  *
- * audioFormat 0x10 = 16 kHz mono s16 LPCM; DiPlay renders LPCM straight to AudioTrack
- * (it byte-swaps, so samples are written big-endian here).
+ * Content from system_server [io.github.nitsuya.aa.display.xposed.carplay.CarPlayAudioCapture]
+ * via [CoreApi.pullCarPlayAudio] (media) / [CoreApi.pullCarPlaySpeechAudio] (nav/speech).
+ * Rings are exclusive — never feed the same PCM to both. Gaps send silence;
+ * [CarPlayConsts.SEND_TEST_AUDIO] injects a 440 Hz tone for pipeline debug.
  */
 class CarPlayAudioEgress(
     private val host: InetAddress,
     private val dataPort: Int,
     val controlPort: Int,
     private val key: ByteArray,
+    private val profile: Profile,
 ) {
     private val running = AtomicBoolean(false)
     @Volatile
     private var worker: Thread? = null
+    @Volatile
+    private var txSocket: DatagramSocket? = null
 
     val isRunning: Boolean
         get() = running.get()
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        // Re-assert capture arm (session live already arms; this recovers after
+        // MediaProjection onStop). Do not pair with disable on stop — DiPlay soft
+        // reconnect TEARDOWNs UDP briefly and must not unmute the phone speaker.
+        activeEgresses.incrementAndGet()
         try {
             CoreApi.setCarPlayAudioEgressEnabled(true)
         } catch (e: Throwable) {
             Log.w(CarPlayConsts.TAG, "setCarPlayAudioEgressEnabled(true) failed — silence expected", e)
         }
-        worker = thread(name = "carplay-audio-tx", isDaemon = true) { pump() }
-        Log.i(CarPlayConsts.TAG, "CarPlay audio TX started → $host:$dataPort (control=$controlPort)")
+        worker = thread(name = "carplay-audio-tx-${profile.label}", isDaemon = true) { pump() }
+        Log.i(
+            CarPlayConsts.TAG,
+            "CarPlay ${profile.label} audio TX started → $host:$dataPort (control=$controlPort)",
+        )
     }
 
     fun stop() {
         if (!running.compareAndSet(true, false)) return
+        // Close UDP so send() cannot block the TX thread after TEARDOWN; interrupt
+        // alone does not cancel an in-flight Binder pull.
+        try {
+            txSocket?.close()
+        } catch (_: Throwable) {
+        }
+        txSocket = null
         worker?.interrupt()
         worker = null
-        try {
-            CoreApi.setCarPlayAudioEgressEnabled(false)
-        } catch (e: Throwable) {
-            Log.w(CarPlayConsts.TAG, "setCarPlayAudioEgressEnabled(false) failed", e)
-        }
-        Log.i(CarPlayConsts.TAG, "CarPlay audio TX stopped")
+        activeEgresses.decrementAndGet()
+        // Capture stays armed while CarPlayProjectionService reports session live;
+        // reportCarPlaySessionLive(false) is the only disarm path for soft reconnect.
+        Log.i(CarPlayConsts.TAG, "CarPlay ${profile.label} audio TX stopped")
     }
 
     private fun pump() {
         val socket = DatagramSocket()
+        txSocket = socket
         val target = InetSocketAddress(host, dataPort)
         val rtp = ByteArray(12)
-        val ssrc = SSRC
+        val ssrc = profile.ssrc
         var sequence = 0
-        var timestamp = 0
         var nonceCounter = 0L
         var sampleTime = 0.0
-        val payload = ByteArray(SAMPLES_PER_PACKET * 2)
+        val framesPerPacket = (profile.sampleRate * PACKET_INTERVAL_MS / 1000L).toInt()
+        val bytesPerPacket = framesPerPacket * profile.channels * 2
+        val payload = ByteArray(bytesPerPacket)
         val cipher = Cipher.getInstance("ChaCha20-Poly1305")
         val aad = ByteArray(8)
         var packets = 0
         var pulledTotal = 0L
         var pullFailLogged = false
+        CarPlayMediaClock.ensureRunning()
+        // Seed RTP from the shared media clock (same epoch as screen NTP), then advance
+        // by exactly one packet of samples. Wall-clock RTP on every packet makes DiPlay
+        // insert silence whenever the TX thread runs late (resync / Binder stall).
+        var rtpTimestamp = CarPlayMediaClock.rtpTimestamp(profile.sampleRate)
+        // Session-live arms capture before RTSP audio SETUP; the ring fills to LIVE_*
+        // while phone mute is already on. Flush that pre-TX backlog so DiPlay does not
+        // start ~100–200ms behind the phone tap.
+        flushPreTxBacklog(profile)
+        // Absolute cadence: at most one packet per PACKET_INTERVAL. Mild "catch-up"
+        // bursts (sleepNs in (-60ms, 0]) used to fire several UDP packets in one wall
+        // slice and DiPlay's jitter buffer grew without bound — audio lag 积压越来越长.
+        var nextPacketAt = System.nanoTime()
         try {
             while (running.get()) {
-                // One 20 ms packet: 16 kHz mono s16le from the system-side capture tap;
-                // anything missing is sent as silence to keep the RTP cadence + clock.
+                val now = System.nanoTime()
+                val sleepNs = nextPacketAt - now
+                if (sleepNs > 0L) {
+                    val ms = sleepNs / 1_000_000L
+                    val ns = (sleepNs % 1_000_000L).toInt()
+                    Thread.sleep(ms, ns)
+                } else if (sleepNs < -PACKET_INTERVAL_NS) {
+                    // Late: never burst-send. Drop the missed duration of PCM so the
+                    // next packet is live, then realign the schedule to wall clock.
+                    val behindPackets =
+                        ((-sleepNs) / PACKET_INTERVAL_NS).toInt().coerceIn(1, MAX_DISCARD_PACKETS)
+                    Log.i(
+                        CarPlayConsts.TAG,
+                        "CarPlay ${profile.label} audio cadence drop-live " +
+                            "behindMs=${-sleepNs / 1_000_000L} discardPkts=$behindPackets " +
+                            "packet=$packets pulled=${pulledTotal / 1024}KB",
+                    )
+                    discardStalePackets(profile, bytesPerPacket, behindPackets)
+                    nextPacketAt = System.nanoTime()
+                }
+
+                val timestamp = rtpTimestamp
+                rtpTimestamp = (rtpTimestamp + framesPerPacket) and 0x7fffffff
                 Arrays.fill(payload, 0.toByte())
                 val got = try {
-                    CoreApi.pullCarPlayAudio(payload.size)
+                    profile.pull(payload.size)
                 } catch (e: Throwable) {
                     if (!pullFailLogged) {
                         pullFailLogged = true
-                        Log.w(CarPlayConsts.TAG, "pullCarPlayAudio failed — silence until bridge recovers", e)
+                        Log.w(
+                            CarPlayConsts.TAG,
+                            "pull ${profile.label} audio failed — silence until bridge recovers",
+                            e,
+                        )
                     }
                     ByteArray(0)
                 }
                 if (got.isNotEmpty()) {
                     val n = minOf(got.size, payload.size)
                     System.arraycopy(got, 0, payload, 0, n)
-                    // DiPlay byte-swaps before AudioTrack: the wire format is big-endian.
                     for (i in 0 until n / 2) {
-                        val v = (payload[i * 2].toInt() and 0xff) or (payload[i * 2 + 1].toInt() shl 8)
-                        payload[i * 2] = (v ushr 8).toByte()
-                        payload[i * 2 + 1] = v.toByte()
+                        val lo = payload[i * 2]
+                        payload[i * 2] = payload[i * 2 + 1]
+                        payload[i * 2 + 1] = lo
                     }
                     pulledTotal += n
                 } else if (CarPlayConsts.SEND_TEST_AUDIO) {
-                    // Debug tone only while nothing is actually playing.
-                    for (i in 0 until SAMPLES_PER_PACKET) {
-                        val value = (AMPLITUDE * sin(2.0 * PI * FREQUENCY_HZ * sampleTime / SAMPLE_RATE))
+                    for (i in 0 until framesPerPacket) {
+                        val value = (AMPLITUDE * sin(2.0 * PI * FREQUENCY_HZ * sampleTime / profile.sampleRate))
                             .toInt()
-                        val v = value.coerceIn(-32_768, 32_767)
-                        payload[i * 2] = (v ushr 8).toByte()
-                        payload[i * 2 + 1] = v.toByte()
-                        sampleTime += 1.0 / SAMPLE_RATE
+                            .coerceIn(-32_768, 32_767)
+                        val hi = (value ushr 8).toByte()
+                        val lo = value.toByte()
+                        val base = i * profile.channels * 2
+                        payload[base] = hi
+                        payload[base + 1] = lo
+                        if (profile.channels > 1) {
+                            payload[base + 2] = hi
+                            payload[base + 3] = lo
+                        }
+                        sampleTime += 1.0 / profile.sampleRate
                     }
                 }
                 rtp[0] = 0x80.toByte()
@@ -138,13 +194,14 @@ class CarPlayAudioEgress(
                 rtp[10] = ((ssrc ushr 8) and 0xff).toByte()
                 rtp[11] = (ssrc and 0xff).toByte()
 
-                // AAD = timestamp + SSRC; nonce = 4×0 + 8-byte LE counter.
                 System.arraycopy(rtp, 4, aad, 0, 8)
                 val nonce = ByteBuffer.allocate(12)
+                var nc = nonceCounter
                 for (i in 0 until 8) {
-                    nonce.put(4 + i, (nonceCounter and 0xff).toByte())
-                    nonceCounter = nonceCounter ushr 8
+                    nonce.put(4 + i, (nc and 0xff).toByte())
+                    nc = nc ushr 8
                 }
+                nonceCounter++
                 cipher.init(
                     Cipher.ENCRYPT_MODE,
                     SecretKeySpec(key, "ChaCha20"),
@@ -162,46 +219,122 @@ class CarPlayAudioEgress(
                 }
                 socket.send(DatagramPacket(datagram, datagram.size, target))
                 sequence = (sequence + 1) and 0xffff
-                timestamp = (timestamp + SAMPLES_PER_PACKET) and 0x7fffffff
                 packets++
                 if (packets <= 3 || packets % 500 == 0) {
                     Log.i(
                         CarPlayConsts.TAG,
-                        "CarPlay audio packet=$packets bytes=${datagram.size} ts=$timestamp " +
+                        "CarPlay ${profile.label} audio packet=$packets bytes=${datagram.size} " +
+                            "ts=$timestamp clockMs=${CarPlayMediaClock.videoTimestampNs() / 1_000_000L} " +
                             "pulled=${pulledTotal / 1024}KB",
                     )
                 }
-                Thread.sleep(PACKET_INTERVAL_MS)
+                nextPacketAt += PACKET_INTERVAL_NS
             }
         } catch (e: Throwable) {
-            if (running.get()) Log.w(CarPlayConsts.TAG, "CarPlay audio TX ended", e)
+            if (running.get()) Log.w(CarPlayConsts.TAG, "CarPlay ${profile.label} audio TX ended", e)
         } finally {
+            if (txSocket === socket) txSocket = null
             try {
                 socket.close()
             } catch (_: Throwable) {
             }
-            Log.i(CarPlayConsts.TAG, "CarPlay audio TX thread done packets=$packets")
+            Log.i(CarPlayConsts.TAG, "CarPlay ${profile.label} audio TX thread done packets=$packets")
         }
     }
+
+    /**
+     * Stream geometry + pull + SETUP bits for media vs speech.
+     */
+    class Profile(
+        val label: String,
+        val audioType: String,
+        val audioFormatBit: Long,
+        val sampleRate: Int,
+        val channels: Int,
+        val ssrc: Int,
+        val pull: (Int) -> ByteArray,
+    )
 
     companion object {
         private const val FREQUENCY_HZ = 440.0
         private const val AMPLITUDE = 0.25
-        private const val SAMPLE_RATE = 16_000
         private const val PACKET_INTERVAL_MS = 20L
-        private val SAMPLES_PER_PACKET = (SAMPLE_RATE * PACKET_INTERVAL_MS / 1000L).toInt()
+        private const val PACKET_INTERVAL_NS = PACKET_INTERVAL_MS * 1_000_000L
+        /** Cap discard work on a late tick (~1s) so Binder cannot stall the TX thread. */
+        private const val MAX_DISCARD_PACKETS = 50
         private const val PAYLOAD_TYPE = 96
-        private const val SSRC = 0xAAD15A01
+        private val activeEgresses = AtomicInteger(0)
 
         /**
-         * Derives the audio DataStream key and answers SETUP(type=100); null when the
-         * host declines or the exchange fails.
+         * One Binder pull-and-drop for missed cadence slots (FIFO). Prefer a short
+         * skip over shipping backlog that would inflate DiPlay's buffer.
          */
+        private fun discardStalePackets(profile: Profile, bytesPerPacket: Int, packets: Int) {
+            val want = bytesPerPacket * packets.coerceIn(1, MAX_DISCARD_PACKETS)
+            try {
+                profile.pull(want)
+            } catch (_: Throwable) {
+            }
+        }
+
+        /**
+         * Drain capture rings filled between [reportCarPlaySessionLive] and audio SETUP.
+         * A few large pulls cover the hard ring cap; concurrent writers may leave a
+         * packet or two which is fine for DiPlay's audioLatencyMs cushion.
+         */
+        private fun flushPreTxBacklog(profile: Profile) {
+            var dropped = 0
+            for (i in 0 until 8) {
+                val got = try {
+                    profile.pull(64 * 1024)
+                } catch (_: Throwable) {
+                    ByteArray(0)
+                }
+                if (got.isEmpty()) break
+                dropped += got.size
+            }
+            if (dropped > 0) {
+                Log.i(
+                    CarPlayConsts.TAG,
+                    "CarPlay ${profile.label} audio flushed pre-TX backlog=${dropped / 1024}KB",
+                )
+            }
+        }
+
+        val MEDIA = Profile(
+            label = "media",
+            audioType = "media",
+            audioFormatBit = AUDIO_FORMAT_PCM_48K_STEREO,
+            sampleRate = 48_000,
+            channels = 2,
+            ssrc = 0xAAD15A01.toInt(),
+            pull = { max -> CoreApi.pullCarPlayAudio(max) },
+        )
+
+        val SPEECH = Profile(
+            label = "speech",
+            audioType = "speech",
+            audioFormatBit = AUDIO_FORMAT_PCM_16K_MONO,
+            sampleRate = 16_000,
+            channels = 1,
+            ssrc = 0xAAD15A02.toInt(),
+            pull = { max -> CoreApi.pullCarPlaySpeechAudio(max) },
+        )
+
+        /**
+         * Told to DiPlay as stream buffer depth. Slightly above screen [latencyMs] so the
+         * HU holds audio until the AVC pipeline (compose→encode→TCP) catches up. Keep
+         * tight (near capture LIVE_LOW) — large values make the car permanently behind
+         * the phone tap even when TX is live.
+         */
+        const val AUDIO_LATENCY_MS = 80L
+
         fun open(
             host: InetAddress,
             setupResponse: RtspMessage,
             sharedSecret: ByteArray,
             streamConnectionId: Long,
+            profile: Profile,
         ): CarPlayAudioEgress? {
             val dict = BinaryPlist.asDict(BinaryPlist.decode(setupResponse.body))
             val streams = dict?.get("streams") as? List<*>
@@ -209,7 +342,7 @@ class CarPlayAudioEgress(
             val dataPort = BinaryPlist.intOf(first?.get("dataPort"))?.toInt()?.and(0xffff) ?: 0
             val controlPort = BinaryPlist.intOf(first?.get("controlPort"))?.toInt()?.and(0xffff) ?: 0
             if (dataPort <= 0) {
-                Log.w(CarPlayConsts.TAG, "CarPlay audio SETUP missing dataPort dict=$dict")
+                Log.w(CarPlayConsts.TAG, "CarPlay ${profile.label} audio SETUP missing dataPort dict=$dict")
                 return null
             }
             val key = HkdfSha512.derive(
@@ -218,15 +351,24 @@ class CarPlayAudioEgress(
                 "DataStream-Output-Encryption-Key",
                 32,
             )
-            val egress = CarPlayAudioEgress(host, dataPort, controlPort, key)
+            val egress = CarPlayAudioEgress(host, dataPort, controlPort, key, profile)
             Log.i(
                 CarPlayConsts.TAG,
-                "CarPlay audio SETUP ok dataPort=$dataPort controlPort=$controlPort key=${key.size}B",
+                "CarPlay ${profile.label} audio SETUP ok dataPort=$dataPort controlPort=$controlPort " +
+                    "format=0x${profile.audioFormatBit.toString(16)} key=${key.size}B",
             )
             return egress
         }
 
-        /** AudioFormat bit: 16 kHz mono s16 LPCM (DiPlay AudioStreamCodec PCM_FORMAT[0x10]). */
+        /**
+         * DiPlay [AudioStreamCodec.PCM_FORMAT] bit for media entertainment:
+         * `0x8000` → PCM 48 kHz stereo s16.
+         */
+        const val AUDIO_FORMAT_PCM_48K_STEREO = 0x8000L
+
+        /**
+         * DiPlay voice / speech bit: `0x10` → PCM 16 kHz mono s16 (nav prompts, telephony-adjacent).
+         */
         const val AUDIO_FORMAT_PCM_16K_MONO = 0x10L
     }
 }

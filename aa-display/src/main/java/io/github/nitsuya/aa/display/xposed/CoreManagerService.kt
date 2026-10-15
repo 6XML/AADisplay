@@ -1154,21 +1154,37 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
         mSessionPolicy?.onSecondaryEgressLiveChanged(live)
         runCatching { CarPlayProcessBoost.setBoost(live) }
             .onFailure { logDebug(TAG, "CarPlayProcessBoost.setBoost failed") }
-        if (!live) {
-            // Fail-safe: a torn-down session must never leave the capture armed + phone muted.
-            runCatching { CarPlayAudioCapture.setEnabled(false) }
-                .onFailure { logDebug(TAG, "CarPlayAudioCapture disable on session end failed") }
-        }
+        // Capture + phone mute follow the CarPlay FGS session, not individual RTSP
+        // audio SETUP/TEARDOWN. DiPlay soft-reconnect briefly drops UDP egresses; if we
+        // disarmed there, Z Flip speaker came back before the next SETUP remuted.
+        runCatching { CarPlayAudioCapture.setEnabled(live) }
+            .onFailure {
+                logDebug(
+                    TAG,
+                    "CarPlayAudioCapture setEnabled($live) on session live failed",
+                )
+            }
         logDebug(TAG, "reportCarPlaySessionLive live=$live")
     }
 
     override fun isCarPlaySessionLive(): Boolean = carPlaySessionLive
 
     override fun setCarPlayAudioEgressEnabled(enabled: Boolean) {
+        if (!enabled && carPlaySessionLive) {
+            // Soft reconnect / TEARDOWN: keep tap + local mute until FGS tearDown.
+            logDebug(TAG, "setCarPlayAudioEgressEnabled(false) ignored — session still live")
+            return
+        }
         CarPlayAudioCapture.setEnabled(enabled)
     }
 
     override fun pullCarPlayAudio(maxBytes: Int): ByteArray = CarPlayAudioCapture.pull(maxBytes)
+
+    override fun pullCarPlaySpeechAudio(maxBytes: Int): ByteArray =
+        CarPlayAudioCapture.pullSpeech(maxBytes)
+
+    override fun isCarPlaySpeechCaptureReady(): Boolean =
+        CarPlayAudioCapture.isSpeechCaptureReady()
 
     override fun scrollPane(pane: Int, x: Int, y: Int, vScroll: Int, hScroll: Int) {
         runIO {

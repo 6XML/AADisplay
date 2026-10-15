@@ -66,7 +66,7 @@
 
         <io.github.nitsuya.aa.display.ui.aa.split.SplitDividerView
             android:id="@+id/split_divider"
-            android:layout_width="8dp"
+            android:layout_width="2dp"
             android:layout_height="match_parent"
             android:background="@android:color/transparent" />
     </FrameLayout>
@@ -90,42 +90,10 @@
         android:textSize="15sp"
         android:visibility="gone" />
 
-    <FrameLayout
-        android:id="@+id/app_picker_host"
+    <include
+        android:id="@+id/app_picker"
+        layout="@layout/view_split_app_picker"
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:visibility="gone"
-        android:background="#CC000000">
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:layout_gravity="bottom"
-            android:orientation="vertical"
-            android:padding="12dp">
-
-            <TextView
-                android:id="@+id/tv_picker_title"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:paddingBottom="8dp"
-                android:text="选择应用"
-                android:textColor="#FFFFFF"
-                android:textSize="18sp"
-                android:textStyle="bold" />
-
-            <androidx.recyclerview.widget.RecyclerView
-                android:id="@+id/rv_app_picker"
-                android:layout_width="match_parent"
-                android:layout_height="0dp"
-                android:layout_weight="1" />
-
-            <Button
-                android:id="@+id/btn_picker_close"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:text="关闭" />
-        </LinearLayout>
-    </FrameLayout>
+        android:layout_height="match_parent" />
 
 </FrameLayout>

@@ -113,9 +113,10 @@ class Iap2Session(
 
     fun onTransportClosed() {
         synchronized(lock) {
+            // Full reset so the next RFCOMM accept starts Detect cleanly (not sticky Dead
+            // flags / half-finished Auth that make DiPlay drop mid-challenge).
+            resetLocked()
             state = State.Dead
-            pending.reset()
-            linkReady = false
         }
         Log.i(CarPlayConsts.TAG, "iAP transport closed")
     }

@@ -61,7 +61,7 @@ class SplitDisplayController(
         internal val FULLSCREEN_FOCUS_TOKEN = Any()
         /** Token for post-reconnect task fill / layout nudge kicks. */
         internal val RECONNECT_FILL_TOKEN = Any()
-        /** Token for debounced ratio-settle config refresh (no VD nudge). */
+        /** Token for debounced ratio-settle WM fill / 1px VD nudge. */
         internal val RATIO_SETTLE_FILL_TOKEN = Any()
         internal const val RATIO_SETTLE_FILL_DELAY_MS = 180L
     }
@@ -173,11 +173,11 @@ class SplitDisplayController(
     internal var mLastPrimaryH = 0
     internal var mLastSecondaryW = 0
     internal var mLastSecondaryH = 0
-    private var mPendingShrinkPrimary = false
-    private var mPendingShrinkSecondary = false
+    private var mPendingNudgePrimary = false
+    private var mPendingNudgeSecondary = false
     internal val mPendingResize = Runnable {
         vd.resizePanesInternal("ratio-throttled")
-        scheduleEnsureTasksFillAfterRatioSettle(mPendingShrinkPrimary, mPendingShrinkSecondary)
+        scheduleEnsureTasksFillAfterRatioSettle(mPendingNudgePrimary, mPendingNudgeSecondary)
         launch.persistRatioNow()
     }
 
@@ -270,6 +270,13 @@ class SplitDisplayController(
         launch.mPersistFirstScheduledAt = 0L
 
         val sizes = vd.computePaneSizes()
+        // Seed last sizes so the first ratio settle can detect real changes (and nudge
+        // grow/shrink). Leaving these at 0 made every first adjust look like "grow from 0"
+        // → shrink-only nudge skipped both panes → apps kept create-time Window Requested.
+        mLastPrimaryW = sizes.primaryW
+        mLastPrimaryH = sizes.primaryH
+        mLastSecondaryW = sizes.secondaryW
+        mLastSecondaryH = sizes.secondaryH
         val flags = vd.vdFlags()
         val identity = Binder.clearCallingIdentity()
         try {
@@ -395,7 +402,12 @@ class SplitDisplayController(
         }
     }
 
-    /** Ratio settle: push WM/task config; nudge only panes that shrank (OneUI letterbox). */
+    /**
+     * Ratio settle: push WM/task config and 1px-nudge every pane whose buffer size
+     * changed. OneUI often leaves Window Requested at the pre-resize size after
+     * [VirtualDisplay.resize]; shrink-only nudge fixed letterbox on the narrow side
+     * but left the growing side stuck at the old resolution.
+     */
     private fun scheduleEnsureTasksFillAfterRatioSettle(
         nudgePrimary: Boolean = false,
         nudgeSecondary: Boolean = false,
@@ -416,13 +428,14 @@ class SplitDisplayController(
         )
     }
 
-    private fun ratioShrinkFlags(): Pair<Boolean, Boolean> {
+    /** Which panes will change buffer size for the current [mRatio] vs last applied. */
+    private fun ratioSizeChangeFlags(): Pair<Boolean, Boolean> {
         val sizes = vd.computePaneSizes()
-        val shrinkPrimary =
-            sizes.primaryW < mLastPrimaryW || sizes.primaryH < mLastPrimaryH
-        val shrinkSecondary =
-            sizes.secondaryW < mLastSecondaryW || sizes.secondaryH < mLastSecondaryH
-        return shrinkPrimary to shrinkSecondary
+        val primaryChanged =
+            sizes.primaryW != mLastPrimaryW || sizes.primaryH != mLastPrimaryH
+        val secondaryChanged =
+            sizes.secondaryW != mLastSecondaryW || sizes.secondaryH != mLastSecondaryH
+        return primaryChanged to secondaryChanged
     }
 
     fun setPaneSurface(pane: Int, surface: Surface?) {
@@ -458,19 +471,20 @@ class SplitDisplayController(
         if (abs(clamped - mRatio) < 0.001f) return
         mRatio = clamped
         launch.persistRatioNow()
-        val (shrinkPrimary, shrinkSecondary) = ratioShrinkFlags()
+        // Capture before resizePanesInternal updates mLast* sizes.
+        val (nudgePrimary, nudgeSecondary) = ratioSizeChangeFlags()
         // Resizing VDs makes tasks churn; suppress reclaim + ATMS stack refresh until settle.
         mSuppressReclaimUntil = SystemClock.uptimeMillis() + SUPPRESS_RECLAIM_MS
         val now = SystemClock.uptimeMillis()
         if (now - mLastResizeAt < RESIZE_THROTTLE_MS) {
-            mPendingShrinkPrimary = shrinkPrimary
-            mPendingShrinkSecondary = shrinkSecondary
+            mPendingNudgePrimary = nudgePrimary
+            mPendingNudgeSecondary = nudgeSecondary
             mHandler.removeCallbacks(mPendingResize)
             mHandler.postDelayed(mPendingResize, RESIZE_THROTTLE_MS)
             return
         }
         vd.resizePanesInternal("ratio")
-        scheduleEnsureTasksFillAfterRatioSettle(shrinkPrimary, shrinkSecondary)
+        scheduleEnsureTasksFillAfterRatioSettle(nudgePrimary, nudgeSecondary)
         launch.schedulePersistSnapshot()
     }
 

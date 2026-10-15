@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.LayoutInflater
+import android.view.View
 import android.view.ViewGroup
 import androidx.core.view.isVisible
 import androidx.recyclerview.widget.GridLayoutManager
@@ -34,19 +35,43 @@ data class SplitAppEntry(
 )
 
 /**
- * Bottom overlay app picker embedded in the split shell.
+ * Bottom overlay app picker embedded in the split shell (AA) or Host overlay (CarPlay).
  * Lists recent VD packages first, then all launchable apps.
  *
  * Launchable metadata is cached and prefetched; icons load lazily on bind.
+ * UI is [R.layout.view_split_app_picker] — same layout for both hosts.
  */
 class SplitAppPickerController(
-    private val binding: FragmentAaMainBinding,
+    private val appPickerHost: ViewGroup,
+    private val rvAppPicker: RecyclerView,
+    private val btnPickerClose: View,
     private val recentPackagesProvider: () -> List<String> = { emptyList() },
+    /** AA disables the split divider while open; CarPlay Host has no View divider. */
+    private val onDividerEnabled: ((Boolean) -> Unit)? = null,
+    /** Coolwalk rail-steal broadcast — only meaningful while AA UI is attached. */
+    private val emitAaUiRailConsume: Boolean = true,
+    /** Override width for span count (CarPlay encode width); null → host/display width. */
+    private val layoutWidthPx: Int? = null,
 ) {
     companion object {
         private const val TAG = "AADisplay_AppPicker"
         private fun logPicker(msg: String) = Log.d(TAG, msg)
+
+        /** Convenience for [AaMainFragment] ViewBinding (`include` → `appPicker`). */
+        fun fromAaMain(
+            binding: FragmentAaMainBinding,
+            recentPackagesProvider: () -> List<String> = { emptyList() },
+        ) = SplitAppPickerController(
+            appPickerHost = binding.appPicker.appPickerHost,
+            rvAppPicker = binding.appPicker.rvAppPicker,
+            btnPickerClose = binding.appPicker.btnPickerClose,
+            recentPackagesProvider = recentPackagesProvider,
+            onDividerEnabled = { binding.splitDivider.isEnabled = it },
+            emitAaUiRailConsume = true,
+        )
     }
+
+    private val context: Context get() = appPickerHost.context
 
     private var targetPane: Int = SplitPane.PRIMARY
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -85,25 +110,37 @@ class SplitAppPickerController(
 
     var onAppPicked: ((pane: Int, packageName: String) -> Unit)? = null
     var onVisibilityChanged: ((Boolean) -> Unit)? = null
+    /** Fired after grid content / scroll should be re-blitted (CarPlay Host snapshot). */
+    var onContentInvalidated: (() -> Unit)? = null
+
+    val root: ViewGroup get() = appPickerHost
+    val isShowing: Boolean get() = appPickerHost.isVisible
 
     init {
-        val density = binding.root.resources.displayMetrics.density
-        val widthDp = binding.root.resources.displayMetrics.widthPixels / density
-        val spanCount = (widthDp / 80f).toInt().coerceIn(4, 8)
-        val glm = GridLayoutManager(binding.root.context, spanCount).apply {
+        val widthPx = layoutWidthPx
+            ?: appPickerHost.width.takeIf { it > 0 }
+            ?: context.resources.displayMetrics.widthPixels
+        val density = context.resources.displayMetrics.density.coerceAtLeast(0.5f)
+        val spanCount = ((widthPx / density) / 80f).toInt().coerceIn(4, 8)
+        val glm = GridLayoutManager(context, spanCount).apply {
             spanSizeLookup = object : GridLayoutManager.SpanSizeLookup() {
                 override fun getSpanSize(position: Int): Int =
                     if (adapter.getItemViewType(position) == Adapter.TYPE_HEADER) spanCount else 1
             }
         }
-        binding.rvAppPicker.layoutManager = glm
-        binding.rvAppPicker.adapter = adapter
-        binding.btnPickerClose.setOnClickListener { hide() }
+        rvAppPicker.layoutManager = glm
+        rvAppPicker.adapter = adapter
+        rvAppPicker.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+                onContentInvalidated?.invoke()
+            }
+        })
+        btnPickerClose.setOnClickListener { hide() }
         // Scrim dismiss only. Do NOT mark the sheet LinearLayout clickable — on Samsung
         // OneUI a clickable parent of RecyclerView often swallows item taps (seen as
         // "first app in the list does nothing" / Alook in 最近).
-        binding.appPickerHost.setOnClickListener { hide() }
-        val sheet = binding.appPickerHost.getChildAt(0) as? ViewGroup
+        appPickerHost.setOnClickListener { hide() }
+        val sheet = appPickerHost.getChildAt(0) as? ViewGroup
         sheet?.isClickable = false
         sheet?.isFocusable = false
         registerPackageReceiver()
@@ -122,12 +159,13 @@ class SplitAppPickerController(
     fun show(pane: Int) {
         targetPane = pane
         // Above split divider peel (elevation 8) so left-column icons stay tappable.
-        binding.appPickerHost.elevation = 32f
-        binding.appPickerHost.bringToFront()
-        binding.appPickerHost.isVisible = true
-        binding.splitDivider.isEnabled = false
+        appPickerHost.elevation = 32f
+        appPickerHost.bringToFront()
+        appPickerHost.isVisible = true
+        onDividerEnabled?.invoke(false)
         setAaUiRailConsume(true)
         onVisibilityChanged?.invoke(true)
+        onContentInvalidated?.invoke()
         val gen = loadGeneration.incrementAndGet()
         loadExecutor.execute {
             val rows = try {
@@ -136,19 +174,21 @@ class SplitAppPickerController(
                 emptyList()
             }
             mainHandler.post {
-                if (gen != loadGeneration.get() || !binding.appPickerHost.isVisible) return@post
+                if (gen != loadGeneration.get() || !appPickerHost.isVisible) return@post
                 adapter.submit(rows)
+                onContentInvalidated?.invoke()
             }
         }
     }
 
     fun hide() {
         loadGeneration.incrementAndGet()
-        binding.appPickerHost.isVisible = false
-        binding.appPickerHost.elevation = 0f
-        binding.splitDivider.isEnabled = true
+        appPickerHost.isVisible = false
+        appPickerHost.elevation = 0f
+        onDividerEnabled?.invoke(true)
         setAaUiRailConsume(false)
         onVisibilityChanged?.invoke(false)
+        onContentInvalidated?.invoke()
     }
 
     fun destroy() {
@@ -173,7 +213,7 @@ class SplitAppPickerController(
             addDataScheme("package")
         }
         try {
-            binding.root.context.registerReceiver(
+            context.registerReceiver(
                 packageReceiver,
                 filter,
                 Context.RECEIVER_NOT_EXPORTED,
@@ -186,7 +226,7 @@ class SplitAppPickerController(
     private fun unregisterPackageReceiver() {
         if (!packageReceiverRegistered) return
         try {
-            binding.root.context.unregisterReceiver(packageReceiver)
+            context.unregisterReceiver(packageReceiver)
         } catch (_: Throwable) {
         }
         packageReceiverRegistered = false
@@ -194,8 +234,9 @@ class SplitAppPickerController(
 
     /** Tell Coolwalk rail-steal to inject into AaDisplay UI while the picker is open. */
     private fun setAaUiRailConsume(consume: Boolean) {
+        if (!emitAaUiRailConsume) return
         try {
-            binding.root.context.sendBroadcast(
+            context.sendBroadcast(
                 Intent(AABroadcastConst.ACTION_AA_UI_RAIL_CONSUME).putExtra(
                     AABroadcastConst.EXTRA_AA_UI_RAIL_CONSUME,
                     consume,
@@ -234,7 +275,7 @@ class SplitAppPickerController(
             raw?.trim()?.takeIf { it.isNotEmpty() }?.let { ordered.add(it) }
         }
         try {
-            LastSplitStore.load(binding.root.context.contentResolver)?.let { snap ->
+            LastSplitStore.load(context.contentResolver)?.let { snap ->
                 // Stacks are bottom→top; picker "最近" wants front (top) first.
                 snap.primaryPackagesBottomToTop().asReversed().forEach(::addPkg)
                 snap.secondaryPackagesBottomToTop().asReversed().forEach(::addPkg)
@@ -256,7 +297,7 @@ class SplitAppPickerController(
     }
 
     private fun loadLaunchableApps(): List<SplitAppEntry> {
-        val pm = binding.root.context.packageManager
+        val pm = context.packageManager
         val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val resolved = pm.queryIntentActivities(
             intent,
@@ -283,7 +324,7 @@ class SplitAppPickerController(
         val gen = loadGeneration.get()
         loadExecutor.execute {
             val icon = PmIconCache.getOrLoadDrawable(
-                binding.root.context.packageManager,
+                context.packageManager,
                 pkg,
             )
             iconInFlight.remove(pkg)
@@ -292,8 +333,9 @@ class SplitAppPickerController(
             // Keep cache entry in sync when rows share the same SplitAppEntry instance.
             launchableCache?.firstOrNull { it.packageName == pkg }?.icon = icon
             mainHandler.post {
-                if (gen != loadGeneration.get() || !binding.appPickerHost.isVisible) return@post
+                if (gen != loadGeneration.get() || !appPickerHost.isVisible) return@post
                 adapter.notifyIconLoaded(position, pkg, icon)
+                onContentInvalidated?.invoke()
             }
         }
     }

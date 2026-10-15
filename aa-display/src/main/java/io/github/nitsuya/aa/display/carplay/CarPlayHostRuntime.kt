@@ -1,0 +1,337 @@
+package io.github.nitsuya.aa.display.carplay
+
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.view.Display
+import android.view.Surface
+import io.github.nitsuya.aa.display.CoreApi
+import io.github.nitsuya.aa.display.egress.ShellFrameEgress
+import io.github.nitsuya.aa.display.ui.aa.split.SplitPane
+import io.github.nitsuya.aa.display.util.LastSplitStore
+import io.github.nitsuya.aa.display.xposed.IVirtualDisplayCreatedListener
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * CarPlay-only Host runtime: dual GLES [SurfaceTexture] → [CarPlayGlCompositor] + split VDs.
+ *
+ * Owned by [CarPlayProjectionService], **not** [CarPlayHostActivity]. Activity is only an
+ * optional trampoline for BAL / process visibility. Video must not depend on Activity
+ * lifecycle — otherwise DiPlay stays on the FrameEgressTee test pattern.
+ */
+object CarPlayHostRuntime {
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val started = AtomicBoolean(false)
+    private val bootLock = Any()
+
+    @Volatile
+    private var compositor: CarPlayGlCompositor? = null
+
+    @Volatile
+    private var primarySurface: Surface? = null
+
+    @Volatile
+    private var secondarySurface: Surface? = null
+
+    @Volatile
+    private var displayId: Int = Display.INVALID_DISPLAY
+
+    @Volatile
+    private var appContext: Context? = null
+
+    @Volatile
+    private var pendingCreateW = 0
+
+    @Volatile
+    private var pendingCreateH = 0
+
+    @Volatile
+    private var pendingCreateDpi = 0
+
+    @Volatile
+    private var pendingCreateRatio = SplitPane.DEFAULT_RATIO
+
+    private var vdCreateRetries = 0
+
+    private val vdCreateRetryRunnable = Runnable { retryCreateSplitDisplayIfNeeded() }
+
+    private val listener = object : IVirtualDisplayCreatedListener.Stub() {
+        override fun onAvailableDisplay(displayId: Int, create: Boolean) {
+            this@CarPlayHostRuntime.displayId = displayId
+            vdCreateRetries = 0
+            mainHandler.removeCallbacks(vdCreateRetryRunnable)
+            Log.i(CarPlayConsts.TAG, "CarPlayHostRuntime onAvailableDisplay id=$displayId create=$create")
+            primarySurface?.let { CoreApi.setPaneSurface(SplitPane.PRIMARY, it) }
+            secondarySurface?.let { CoreApi.setPaneSurface(SplitPane.SECONDARY, it) }
+            if (create) maybeLaunchDefaultApps()
+        }
+    }
+
+    fun isRunning(): Boolean = compositor != null && started.get()
+
+    fun compositorOrNull(): CarPlayGlCompositor? = compositor
+
+    /** Fire-and-forget; prefer [ensureStartedSync] before arming the encoder. */
+    fun ensureStarted(context: Context) {
+        ensureStartedSync(context, timeoutMs = 0L)
+    }
+
+    /**
+     * Boots GL + split VDs and returns when ready (or [timeoutMs] elapses).
+     * [timeoutMs] <= 0 means: run sync on main, or post without waiting off-main.
+     */
+    fun ensureStartedSync(context: Context, timeoutMs: Long = 5_000L): Boolean {
+        if (isRunning()) {
+            compositor?.let { CarPlayProjectionService.attachGlCompositor(it) }
+            return true
+        }
+        val app = context.applicationContext
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            startMain(app)
+            return isRunning()
+        }
+        if (timeoutMs <= 0L) {
+            mainHandler.post { startMain(app) }
+            return isRunning()
+        }
+        val done = CountDownLatch(1)
+        mainHandler.post {
+            try {
+                startMain(app)
+            } finally {
+                done.countDown()
+            }
+        }
+        if (!done.await(timeoutMs, TimeUnit.MILLISECONDS)) {
+            Log.w(CarPlayConsts.TAG, "CarPlayHostRuntime ensureStartedSync timed out ${timeoutMs}ms")
+        }
+        return isRunning()
+    }
+
+    private fun startMain(app: Context) {
+        synchronized(bootLock) {
+            if (isRunning()) {
+                compositor?.let { CarPlayProjectionService.attachGlCompositor(it) }
+                return
+            }
+            // Another starter may be mid-boot (started=true, compositor still null).
+            if (started.get() && compositor == null) {
+                Log.w(CarPlayConsts.TAG, "CarPlayHostRuntime boot already in progress")
+                return
+            }
+            if (!started.compareAndSet(false, true)) {
+                compositor?.let { CarPlayProjectionService.attachGlCompositor(it) }
+                return
+            }
+            appContext = app
+            val w = CarPlayConsts.ENCODE_WIDTH
+            val h = CarPlayConsts.ENCODE_HEIGHT
+            // Encode canvas is fixed 1280×720 — use ENCODE_UI_DENSITY_DPI so 1dp≈1px.
+            // Phone displayMetrics.densityDpi (often 360–480) inflated dividerPx into a fat
+            // black gutter between panes on DiPlay.
+            val dpi = CarPlayConsts.ENCODE_UI_DENSITY_DPI
+            val paneW = (w / 2).coerceAtLeast(16)
+            val gl = CarPlayGlCompositor()
+            try {
+                gl.start(paneW, h, dpi)
+            } catch (e: Throwable) {
+                Log.e(CarPlayConsts.TAG, "CarPlayHostRuntime GL boot failed", e)
+                started.set(false)
+                return
+            }
+            val primary = gl.primarySurface()
+            val secondary = gl.secondarySurface()
+            if (primary == null || secondary == null) {
+                Log.e(CarPlayConsts.TAG, "CarPlayHostRuntime GL pane surfaces missing")
+                gl.stop()
+                started.set(false)
+                return
+            }
+            compositor = gl
+            primarySurface = primary
+            secondarySurface = secondary
+            ShellFrameEgress.setAaUiAttached(false)
+            CarPlayInputBridge.shellWidthPx = w
+            CarPlayInputBridge.shellHeightPx = h
+            // Soft reconnect keeps system_server VDs + live ratio; resetting GL to 0.5
+            // draws half-strips over 302/968 buffers → black gutters around the divider
+            // (seen on DiPlay after HostRuntime restart). Prefer live → snapshot → default.
+            val bootRatio = resolveBootRatio(app)
+            CarPlayInputBridge.primaryRatio = bootRatio
+            syncGlBuffersForRatio(gl, bootRatio, w, h, dpi)
+            CarPlayProjectionService.attachGlCompositor(gl)
+            ShellFrameEgress.onShellSize(w, h)
+            CarPlayAppPickerOverlay.bindContext(app)
+            CarPlayWheelController.onRecentsToggle = { CarPlayRecentsOverlay.toggle() }
+            pendingCreateW = w
+            pendingCreateH = h
+            pendingCreateDpi = dpi
+            pendingCreateRatio = bootRatio
+            vdCreateRetries = 0
+            requestCreateSplitDisplay("boot")
+            // Binder / system_server may still be cold right after reboot — CoreApi
+            // silently skips when the AADD bridge is null. Retry until panes exist.
+            mainHandler.removeCallbacks(vdCreateRetryRunnable)
+            mainHandler.postDelayed(vdCreateRetryRunnable, VD_CREATE_RETRY_MS)
+            Log.i(
+                CarPlayConsts.TAG,
+                "CarPlayHostRuntime started ${w}x$h dpi=$dpi ratio=$bootRatio gl=true",
+            )
+        }
+    }
+
+    private fun requestCreateSplitDisplay(reason: String) {
+        val primary = primarySurface
+        val secondary = secondarySurface
+        if (primary == null || secondary == null) return
+        try {
+            CoreApi.onCreateSplitDisplay(
+                pendingCreateW,
+                pendingCreateH,
+                pendingCreateDpi,
+                pendingCreateRatio,
+                primary,
+                secondary,
+                listener,
+            )
+            Log.i(CarPlayConsts.TAG, "CarPlayHostRuntime onCreateSplitDisplay ($reason)")
+        } catch (e: Throwable) {
+            Log.e(CarPlayConsts.TAG, "CarPlayHostRuntime onCreateSplitDisplay failed ($reason)", e)
+        }
+    }
+
+    private fun retryCreateSplitDisplayIfNeeded() {
+        if (!started.get() || compositor == null) return
+        if (displayId != Display.INVALID_DISPLAY) return
+        if (vdCreateRetries >= VD_CREATE_RETRY_MAX) {
+            Log.w(
+                CarPlayConsts.TAG,
+                "CarPlayHostRuntime VD create gave up after $VD_CREATE_RETRY_MAX tries",
+            )
+            return
+        }
+        vdCreateRetries++
+        Log.w(
+            CarPlayConsts.TAG,
+            "CarPlayHostRuntime VD create retry $vdCreateRetries/$VD_CREATE_RETRY_MAX " +
+                "(CoreApi bridge may have been cold)",
+        )
+        requestCreateSplitDisplay("retry-$vdCreateRetries")
+        mainHandler.postDelayed(vdCreateRetryRunnable, VD_CREATE_RETRY_MS)
+    }
+
+    private fun resolveBootRatio(app: Context): Float {
+        val live = runCatching { CoreApi.splitRatio }.getOrNull()?.takeIf { it > 0f }
+        if (live != null) return SplitPane.clampRatio(live)
+        val snap = runCatching {
+            LastSplitStore.invalidateCache()
+            LastSplitStore.load(app.contentResolver)?.primaryRatio
+        }.getOrNull()?.takeIf { it > 0f }
+        if (snap != null) return SplitPane.clampRatio(snap)
+        return SplitPane.DEFAULT_RATIO
+    }
+
+    private fun syncGlBuffersForRatio(
+        gl: CarPlayGlCompositor,
+        ratio: Float,
+        width: Int,
+        height: Int,
+        densityDpi: Int,
+    ) {
+        val gap = SplitPane.dividerPx(densityDpi)
+        val usable = (width - gap).coerceAtLeast(2)
+        val left = (usable * ratio).toInt().coerceAtLeast(1)
+        val right = (usable - left).coerceAtLeast(1)
+        gl.syncPaneBuffers(left, right, height)
+    }
+
+    fun stop(reason: String) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            stopMain(reason)
+        } else {
+            val done = CountDownLatch(1)
+            mainHandler.post {
+                try {
+                    stopMain(reason)
+                } finally {
+                    done.countDown()
+                }
+            }
+            done.await(3, TimeUnit.SECONDS)
+        }
+    }
+
+    private fun stopMain(reason: String) {
+        synchronized(bootLock) {
+            if (!started.get() && compositor == null) return
+            Log.i(
+                CarPlayConsts.TAG,
+                "CarPlayHostRuntime stop reason=$reason displayId=$displayId",
+            )
+            started.set(false)
+            mainHandler.removeCallbacks(vdCreateRetryRunnable)
+            vdCreateRetries = 0
+            CarPlayAppPickerOverlay.unbind()
+            CarPlayProjectionService.attachGlCompositor(null)
+            runCatching { CoreApi.setPaneSurface(SplitPane.PRIMARY, null) }
+            runCatching { CoreApi.setPaneSurface(SplitPane.SECONDARY, null) }
+            runCatching { CoreApi.onDestroyDisplay() }
+            try {
+                compositor?.stop()
+            } catch (_: Throwable) {
+            }
+            compositor = null
+            primarySurface = null
+            secondarySurface = null
+            displayId = Display.INVALID_DISPLAY
+            appContext = null
+        }
+    }
+
+    private fun maybeLaunchDefaultApps() {
+        // Short settle only — the old 2s delay left DiPlay on empty panes after audio.
+        mainHandler.postDelayed({
+            if (!isRunning()) return@postDelayed
+            val ctx = appContext ?: return@postDelayed
+            runCatching { LastSplitStore.invalidateCache() }
+            val snap = runCatching { LastSplitStore.load(ctx.contentResolver) }.getOrNull()
+            snap?.primaryRatio?.let { r ->
+                val clamped = r.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO)
+                if (Math.abs(clamped - CarPlayInputBridge.primaryRatio) > 0.02f) {
+                    CarPlayInputBridge.primaryRatio = clamped
+                    runCatching { CoreApi.setSplitRatio(clamped) }
+                }
+            }
+            snap?.fullscreenPane?.takeIf { SplitPane.isFullscreenPane(it) }?.let { fs ->
+                CarPlayInputBridge.fullscreenPane = fs
+                runCatching { CoreApi.setSplitFullscreen(fs) }
+            }
+            val defaults = arrayOf(
+                "com.google.android.apps.maps",
+                "com.android.chrome",
+            )
+            for (pane in intArrayOf(SplitPane.PRIMARY, SplitPane.SECONDARY)) {
+                val stored = if (pane == SplitPane.PRIMARY) snap?.primaryPackage else snap?.secondaryPackage
+                val candidate = stored?.takeIf { it.isNotBlank() } ?: defaults[pane]
+                try {
+                    val currentPkg = CoreApi.getPanePackage(pane)
+                    if (currentPkg.isNullOrEmpty()) {
+                        CoreApi.startActivityOnPane(candidate, 0, pane)
+                        Log.i(CarPlayConsts.TAG, "CarPlayHostRuntime launched $candidate into pane=$pane")
+                    } else {
+                        Log.i(CarPlayConsts.TAG, "CarPlayHostRuntime pane=$pane keeps $currentPkg")
+                    }
+                } catch (e: Throwable) {
+                    Log.w(CarPlayConsts.TAG, "CarPlayHostRuntime pane=$pane launch failed", e)
+                }
+            }
+        }, DEFAULT_APP_LAUNCH_DELAY_MS)
+    }
+
+    private const val VD_CREATE_RETRY_MS = 500L
+    private const val VD_CREATE_RETRY_MAX = 12
+    private const val DEFAULT_APP_LAUNCH_DELAY_MS = 400L
+}

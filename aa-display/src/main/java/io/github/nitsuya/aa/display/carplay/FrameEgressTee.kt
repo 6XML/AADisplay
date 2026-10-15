@@ -17,13 +17,13 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * Composites content into [CarPlayVideoEncoder] at a fixed supply cadence.
  *
- * Sources, in priority order:
- * 1. The AA shell view (dual-channel tee; [ProjectionSessionGate.shouldTeeFromAaShell]).
- * 2. A [FrameProvider] (legacy Canvas Host fallback).
- * 3. A test pattern (pipeline verification before any real content exists).
+ * Temporary Canvas fallback only. CarPlay video is exclusive to [CarPlayGlCompositor]
+ * (Host); AA shell is never teed. Until Host attaches, sources are:
+ * 1. A [FrameProvider] (legacy Canvas Host, unused on the GL path).
+ * 2. A test pattern (pipeline verification — should be brief).
  *
- * Host GPU path ([CarPlayGlCompositor]) owns the encoder Surface exclusively when
- * [setGlExclusive] is true — this tee must not [CarPlayVideoEncoder.encodeCanvas] then.
+ * Host GPU path owns the encoder Surface when [setGlExclusive] is true — this tee must
+ * not [CarPlayVideoEncoder.encodeCanvas] then.
  *
  * Scheduling: a dedicated pump thread with its own [Looper] posts one frame every
  * `1000/fps` ms via [Handler] — **not** [android.view.Choreographer]. Host-only /

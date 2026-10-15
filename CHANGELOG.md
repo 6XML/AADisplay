@@ -2,11 +2,47 @@
 
 ## Unreleased
 
+### Changed
+- **Recent 卡片图标美化：** 放大 × 居中盖在图标上（不再独占上方一行）；图标约 72dp（分屏列按槽高放大，`fitCenter` 不形变）；CarPlay Canvas Recents 同几何与命中对齐。
+
 ### Fixed
-- **CarPlay 手机仍发声：** `CarPlayAudioCapture` 本地静音 / 还原误写成 `setStreamVolume(0, stream, 0)`（实改 VOICE_CALL），MUSIC 从未静音；改为 `setStreamVolume(stream, index, 0)`。`CAPTURED_STREAMS` 改为 `(1 shl STREAM_*)` 位掩码以匹配 capture config builder。
+- **DiPlay 音频比手机端明显滞后：** session-live 已武装采集、RTSP 音频 SETUP 更晚才 TX，环先堆到 LIVE_LOW；再叠加 `audioLatencyMs=140` 与 120–240ms 粘滞水位，车机开播就固定落后。TX 启动前冲掉预缓冲；水位 100→40ms、环硬上限约 200ms；`audioLatencyMs` 80 / screen `latencyMs` 60。
+- **CarPlay 又突然没声音（手机也静音）：** `PcmRing.pull` 环绕拷贝误用 `available - off`，在 `available == 2*(capacity-tail)` 时 `chunk==0` 持锁死循环；Binder `pullCarPlayAudio` 全堵、采集写线程一起堵，egress 发不出 PCM 且 session-live 本地静音不解除。改为按 `min(take-off, available, capacity-tail)` 拷贝并 `chunk<=0` 退出；write 丢弃改为向上对齐，避免 `available > capacity`。
+- **DiPlay 连上后声音仍在 Z Flip 扬声器（adb 坐实）：** `MediaProjection` 获取失败 → `remote-submix` → `skip local mute`（`phoneMuted=false`），车机有 PCM 但本机 SPEAKER 仍响。根因：system_server 同进程调 `BinderService.createProjection` 时 `checkCallingPermission` 因 `callingPid==myPid` 恒拒绝；三星无 `createProjectionInternal`。改为直接构造 `MediaProjectionManagerService$MediaProjection`（绕过 Binder 门禁）走 playback-capture + 本地静音。顺带：采集启停跟 FGS `reportCarPlaySessionLive`，软重连 TEARDOWN 不再 disarm；mute 跳过三星不认的 `STREAM_VOICE_ASSISTANCE(13)`（曾 `Bad stream type` 把整次 arm 打回 idle）。
+- **Z Flip 重启后先有声、DiPlay 画面很久才上：** (1) 开机 BT/A2DP 常早于 `BOOT_COMPLETED`，DiPlay 先挂经典音频并对 `…cafe` SDP 失败退避 → AutoArm 增听 `BT STATE_ON` / `USER_UNLOCKED` + 0/3/12/30s 阶梯；(2) RTSP 线程 `onVideoSetup` 只 post 编码器、随即 SETUP 音频 → 改为 `ensureEncoder` 同步等待（≤8s）再开音频；(3) 开机 `CoreApi` 桥未就绪时 `onCreateSplitDisplay` 静默跳过 → HostRuntime 500ms×12 重试；默认应用启动 2s→400ms。
+- **CarPlay 音频积压越来越长：** TX 在落后 0–60ms 时会紧循环补发多包，DiPlay 抖动缓冲被越堆越厚（视频仍取最新帧）。改为严格每 20ms 至多一包；落后则丢本地 PCM 对齐 live、绝不 burst。顺带：media 环硬上限约 350ms、积压 >240ms 剪到约 120ms（write+pull）；AudioRecord minBuf×2；`audioLatencyMs` 140。
+- **分屏条变粗黑条 / CarPlay Recents 未对齐 AA：** `DIVIDER_DP` 8→2（`dividerPx` 下限 8→1），避免窗格间隙读成粗黑条；CarPlay Host 改用 `ENCODE_UI_DENSITY_DPI`（不再用手机 dpi 放大间隙）。`CarPlayRecentsOverlay` 去掉 LEFT/RIGHT/PHONE，补两道竖分割线、底栏「添加应用」、卡片 × close（`CoreApi.removeTask`）；× 对齐 AA `ib_close` 56dp 并加大命中区。
+- **CarPlay 音频落后画面数秒（抖音连刷）：** media PCM 环曾达 768KB（约 4s），TX/Binder 掉队后堆旧 PCM，而视频始终取最新帧；egress resync 只重置发包节拍、不剪环。改为 media/speech 环缩至约 1s/2s 硬上限；积压超过约 500ms 时剪到约 200ms（hysteresis drop-to-live）；resync 打诊断日志。
+- **CarPlay remotesubmix 路径无声：** 回退到 `REMOTE_SUBMIX` 时仍 `setStreamVolumeIndex(0)` 本地设备，三星上会把 submix 采成全零 PCM（pull 在涨但车机无声）。改为仅 playback-capture 路径本地静音；remotesubmix 跳过 mute。
+- **CarPlay 有包无声（RTP 墙钟跳变）：** 音频 RTP 每包取 `MediaClock` 墙钟；TX/Binder 一旦落后 resync，时间戳大跳，DiPlay 按间隙插静音。改为首包用 MediaClock 对齐后按 `framesPerPacket` 递增。
+- **DiPlay↔Z Flip 连上瞬间闪断循环：** 两处叠加——(1) DiPlay Bonjour `/ctrl-int` probe 打进我们 RTSP listen 后 `attachPeer` 覆盖 `peer/output` 并在 probe 关闭时 `releaseMediaStreams`，把正在播的 AirPlay source 拆掉；(2) 只 adopt 三星已存的 `Carplay`（带 INTERNET）无 specifier 回调，~2–3s 被 `CMD_UNWANTED_NETWORK score=0` 拆网 → control `Connection reset`。改为 probe 与 source 会话隔离；handoff 用 `removeCapability(INTERNET)` 的 specifier **全程 hold**，adopt 只作临时 dial 随后补 hold。
+- **DiPlay↔Z Flip 握手卡在「等待 iPhone」：** `WifiNetworkSpecifier` 收到 `onUnavailable` 后仍留着 zombie `callbackRef`，后续 `0x4301` 只打 `WiFi handoff already pending — queue dial` 却永不 dial（L2 已在 `Carplay`、有 `10.38.199.x`）。改为 unavailable 清回调、用 `ConnectivityManager` 认领已关联网络并 `bindProcessToNetwork`；pending 时若已 ready/已关联立即 flush；StartSession 仅有 `fe80` 时回退 DHCP 网关 IPv4。
+- **CarPlay 重音：** 手机扬声器/有线/A2DP 与 CarPlay WiFi 音频叠播；无独立导航 tap 时仍 SETUP speech 也可能被 DiPlay 混进媒体。武装时对本机 OUT 设备（含 A2DP，不含 REMOTE_SUBMIX）`setStreamVolumeIndex=0`；仅 `audio-policy-mix` 就绪才 SETUP speech。
+- **CarPlay 音画不同步：** 视频用 frameIndex PTS、音频 RTP 从 0 自增，且 audio SETUP 晚于编码器启动，两条时间轴错位。新增 `CarPlayMediaClock`（共用 elapsedRealtime 纪元）；GL/屏幕 NTP 与音频 RTP 同钟；`audioLatencyMs=180` / screen `latencyMs=120`。
+- **CarPlay 无画面只见测试图：** Host GL/VD 绑在半透明 Activity 上，BAL 起不来或 Activity 销毁会拆合成器；SETUP 与 Host 异步竞态会先 `feed=tee-canvas` 且不再切回。改为 FGS 拥有 `CarPlayHostRuntime`（Activity 仅 trampoline）；编码器武装前 **同步** `ensureStartedSync`；GL attach 失败重试 3 次并每秒回绑最多 15 次。
+- **CarPlay 声音卡顿/重音（仍保留 media⊕speech 双通道）：** 媒体与导航内容必须互斥。去掉 media→speech 镜像与 speech 第二路 remotesubmix（同 PCM 双发 = DiPlay 重音）；speech 仅 AudioPolicy nav/assistant，失败则 speech 静音。remotesubmix 改 speaker-device 静音。音频 RTP 绝对 20ms 节拍，落后过多 resync。
+- **CarPlay 有画面无声音（采集 vs 协议）：** REMOTE_SUBMIX 回退路径在武装时仍 `setStreamMute`，采到的是静音 mix，egress 却持续发静音 RTP。改为仅 playback-capture 媒体路径本地静音；remotesubmix 跳过 stream mute、改 speaker-device mute。排障看 `armed: media=… phoneMuted= speakerDeviceMuted=` 与 `pulled=`。
+- **CarPlay 采集武装失败（MANAGE_MEDIA_PROJECTION / REMOTE_SUBMIX 未初始化）：** `setCarPlayAudioEgressEnabled` 经 AIDL 时 calling uid 仍是 app，`createProjection` 抛 SecurityException，REMOTE_SUBMIX 同失败。`setEnabled` 武装窗口内 `Binder.clearCallingIdentity()`；MediaProjection 优先反射 `createProjectionInternal`（绕过 Binder `checkCallingPermission`），成功则走 playback-capture + 本地静音。
+- **DiPlay 反复「等待 iPhone / 连接中断」：** `CarPlayWifiHandoff` 在 `0x5703` 已连上后，`0x4301` 再 ensure 时因三星 `WifiInfo` 常为 `<unknown ssid>` 误走 `unregisterNetworkCallback`，把 ephemeral `Carplay` 热点拆掉（日志 `CMD_UNWANTED_NETWORK score=0` → AirPlay `Connection reset`）。改为记住 `boundSsid`/`boundNetwork`、同 SSID 合并不拆回调；`onLost` 400ms 内自动 rejoin。
+- **CarPlay 应用选择器无法点击/滚动：** Host 无 Window，AA View 截图 + `dispatchTouchEvent` 让 RecyclerView 触控失效。改回 **Canvas** 直绘 + 归一化命中（与 Recents 同路径），并补拖动滚动；观感对齐 AA（scrim、「选择应用」、「最近/全部应用」、BitmapShader 圆角图标、底栏「关闭」）；AA 仍用 `view_split_app_picker`。
+- **DiPlay 出画约数秒后自动重连：** FGS / session / 状态页同 tick 各 `startActivity(Host)`，250ms 内两个 `CarPlayHostActivity`；后者 `onDestroy` 拆掉前者的 GL/VD，控制通道被 DiPlay reset。改为 `CarPlayHostActivity.launch` 单飞 + `singleTask`，重复实例不拆直播会话。
+- **CarPlay Host 画面/选择器倒置：** OES 窗格只靠 `SurfaceTexture` 变换（不再额外 `flipV`）；Canvas 选择器/Recents/chrome 单独用翻转 UV，与正立应用对齐。
+- **DiPlay 老是「连接中断」：** 控制通道 / RFCOMM 断线后音频 UDP 与 screen 仍继续打（日志 `audio packet` 在 `transport closed` 之后还在涨），重连卡在 Auth。`releaseMediaStreams` 在 control/RFCOMM/TEARDOWN 时停音频+关 screen+event；iAP `onTransportClosed` 全量 reset；Host `startActivity` 节流；RFCOMM dial 不再抢已建立的 inbound 会话。
+- **DiPlay 主动回连 / 重启后连不上 Z Flip：** 开机与 `adb install -r` 后 `CarPlayProjectionService` 未自动拉起，`…cafe` RFCOMM 无 listen → DiPlay SDP `scn=0` 失败。新增 `CarPlayAutoArmReceiver`：通道为 CarPlay 时在 `BOOT_COMPLETED` / `MY_PACKAGE_REPLACED` 自动 start FGS（并尽量开 Host）。
+- **重启后 DiPlay 仍连不上（BT 晚就绪）：** AutoArm 已起 FGS，但开机瞬间 `BluetoothAdapter.isEnabled=false`，`CarPlayBluetoothLink` 只打 “deferred” 就永久放弃 listen。改为监听 `ACTION_STATE_CHANGED`，`STATE_ON` 后再武装 `…cafe`；listen 异常退出也会重新等待；AutoArm 额外 8s 补一次 FGS。
+- **重启/重装后 DiPlay 连不上（通道未持久化）：** Z Flip 上 `SharedPreferences` 从未写出 `shared_prefs/`，`CarPlayChannel` 一直回落默认 AA → AutoArm 跳过、无 `…cafe` listen。改为持久化到 `files/aadisplay_carplay_channel`；状态页打开时若通道为 CarPlay 自动 re-arm FGS。
+- **CarPlay Host 无把手/三点、选择器分辨率乱、应用倒置：** Host VD 误用 1920 而编码 1280 导致挤压；GL 未做 MediaCodec Y 翻转。改为 Host=`ENCODE` 1280×720 1:1；OES/Canvas chrome 统一 Y 翻转；`CarPlayChromePainter` 画分隔缝+三点与全屏 peel 短把手。
+- **CarPlay 断线重连后 DiPlay 画面卡死：** screen SETUP 重武装时 `ensureEncoder` 见编码器仍在跑就 `feed=gl-compositor (kept)`，GL 继续画但 MediaCodec `in=0` 不再出帧。`onVideoSetup` 改为 `forceSurfaceRefresh`：强制 `detachEncoder` + `encoder.start` 换新 Surface。
+- **CarPlay 主媒体声道对齐 DiPlay entertainment：** 对照 `DiPlay-CN` `AudioStreamCodec` / `AirPlayInfoPlist`（`entertainmentSampleRate=48000`，media 位 `0x8000`=PCM/48000/16/2）。SETUP 从误用语音位 `0x10`（16 kHz mono）改为 `0x8000`；采集/egress 同步 48 kHz stereo；本地静音加 `setStreamMute`。
+- **CarPlay 有画面无声音（Z Flip / API 33）：** `CarPlayAudioCapture` 误反射不存在的 `AudioPlaybackCapture` / `AudioPlaybackCaptureClient`，三星上 `apiResolved=false` 一直发静音。改为真实 API：`MediaProjection`（优先 `semGetMediaProjection`，否则 `IMediaProjectionManager.createProjection`）+ `AudioPlaybackCaptureConfiguration` + `AudioRecord`；失败回退 `REMOTE_SUBMIX`。采集 USAGE_MEDIA/GAME/UNKNOWN；武装期间仍本地静音 MUSIC 等流。
+- **CarPlay 手机仍发声：** `CarPlayAudioCapture` 本地静音 / 还原误写成 `setStreamVolume(0, stream, 0)`（实改 VOICE_CALL），MUSIC 从未静音；改为 `setStreamVolume(stream, index, 0)` + `setStreamMute`。
 - **CarPlay Host 分屏条 / Recents / 选择器未对齐 AA：** 分隔条改为短按交换、长按 Recents、拖动 UP settle、边缘进全屏 peel；`CarPlayRecentsOverlay` 列序/几何与 AA 一致并补「添加应用」；新增 `CarPlayAppPickerOverlay`；方向盘媒体键松手用上次 usage（release `extra=0` 不再丢事件）。
 
+### Added
+- **CarPlay media + speech 双音频通道：** RTSP 恒开 `audioType=media`（`0x8000` 48 kHz stereo）与 `audioType=speech`（`0x10` 16 kHz mono）。speech 采集优先 AudioPolicy loopback（NAVIGATION/ASSISTANT），失败再 remotesubmix；AIDL 追加 `pullCarPlaySpeechAudio`。
+
 ### Changed
+- **出画互斥（AA XOR CarPlay）：** 不再「AA 壳 tee 双通道」。通道单选：AA 停 Source+Host；CarPlay 只走 `CarPlayHostActivity` GL。`ProjectionSessionGate.shouldTeeFromAaShell` 恒 false；FGS/视频 SETUP 无 Host 时自动拉起，避免长期停在测试图。
 - **CarPlay / AA 包边界分离：** AA 车机 UI（`AaMainFragment`）经 `egress/ShellFrameEgress` + `egress/ProjectionSessionGate` 提供壳帧，不再 import carplay 包；状态页 CarPlay 控件抽到 `carplay/CarPlayStatusUi`；system_server 音频采集 / cgroup 提权迁至 `xposed/carplay/`；`DisplaySessionPolicy` 以 `onSecondaryEgressLiveChanged` 表达二次出口（AIDL 名保持不变）。见 [docs/EXECUTION.md](docs/EXECUTION.md) §14.2。
 
 ### Added

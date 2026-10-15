@@ -6,7 +6,10 @@ import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothServerSocket
 import android.bluetooth.BluetoothSocket
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.provider.Settings
 import android.util.Log
 import java.util.UUID
@@ -18,6 +21,10 @@ import kotlin.concurrent.thread
  *
  * - Listen on **phone** UUID (`…cafe`) — accessory dials this on reconnect (seen with DiPlay).
  * - Dial bonded peers on **accessory** UUID (`…caff`) — first-connect phone→HU path.
+ *
+ * After reboot, [CarPlayProjectionService] often starts before the adapter is ON. Previously
+ * that path logged "deferred" and permanently gave up — DiPlay SDP then returns `scn=0`.
+ * We now watch [BluetoothAdapter.ACTION_STATE_CHANGED] and arm listen when STATE_ON arrives.
  */
 class CarPlayBluetoothLink(
     context: Context,
@@ -29,10 +36,13 @@ class CarPlayBluetoothLink(
     private val adapter: BluetoothAdapter? =
         context.getSystemService(BluetoothManager::class.java)?.adapter
     private val running = AtomicBoolean(false)
+    private val rfcommArmed = AtomicBoolean(false)
     private var serverSocket: BluetoothServerSocket? = null
     @Volatile
     private var clientSocket: BluetoothSocket? = null
     private val writeLock = Any()
+    private val watchLock = Any()
+    private var btStateReceiver: BroadcastReceiver? = null
 
     private val phoneUuid: UUID = UUID.fromString(CarPlayConsts.IAP2_PHONE_RFCOMM_UUID)
     private val accessoryUuid: UUID = UUID.fromString(CarPlayConsts.IAP2_ACCESSORY_RFCOMM_UUID)
@@ -80,14 +90,35 @@ class CarPlayBluetoothLink(
     @SuppressLint("MissingPermission")
     fun start() {
         if (!running.compareAndSet(false, true)) return
+        rfcommArmed.set(false)
         val bt = adapter
-        if (bt == null || !bt.isEnabled) {
-            Log.w(CarPlayConsts.TAG, "Bluetooth unavailable; iAP RFCOMM deferred")
+        if (bt == null) {
+            Log.w(CarPlayConsts.TAG, "Bluetooth adapter missing; iAP RFCOMM unavailable")
             running.set(false)
             return
         }
+        if (!bt.isEnabled) {
+            Log.w(CarPlayConsts.TAG, "Bluetooth off; iAP RFCOMM waiting for STATE_ON")
+            armBtStateWatch()
+            return
+        }
+        beginRfcomm(bt)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun beginRfcomm(bt: BluetoothAdapter) {
+        if (!running.get()) return
+        if (!rfcommArmed.compareAndSet(false, true)) return
+        disarmBtStateWatch()
         thread(name = "carplay-rfcomm-listen", isDaemon = true) {
             listen(bt)
+            // Adapter dropped / listen died while session still wants RFCOMM — re-arm watch
+            // so a later STATE_ON (common after reboot flicker) restores …cafe SDP.
+            if (running.get()) {
+                rfcommArmed.set(false)
+                Log.w(CarPlayConsts.TAG, "RFCOMM listen ended; waiting for Bluetooth again")
+                armBtStateWatch()
+            }
         }
         thread(name = "carplay-rfcomm-dial", isDaemon = true) {
             // Give listen a moment to register SDP before dialing.
@@ -96,7 +127,59 @@ class CarPlayBluetoothLink(
             } catch (_: InterruptedException) {
                 return@thread
             }
+            if (!running.get() || !rfcommArmed.get()) return@thread
             dialBonded(bt)
+        }
+    }
+
+    private fun armBtStateWatch() {
+        synchronized(watchLock) {
+            if (btStateReceiver != null || !running.get()) return
+            val rx = object : BroadcastReceiver() {
+                @SuppressLint("MissingPermission")
+                override fun onReceive(context: Context, intent: Intent?) {
+                    if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+                    if (!running.get()) return
+                    val state = intent.getIntExtra(
+                        BluetoothAdapter.EXTRA_STATE,
+                        BluetoothAdapter.ERROR,
+                    )
+                    if (state != BluetoothAdapter.STATE_ON) return
+                    val bt = adapter ?: return
+                    if (!bt.isEnabled) return
+                    Log.i(CarPlayConsts.TAG, "Bluetooth STATE_ON → arm RFCOMM …cafe listen")
+                    beginRfcomm(bt)
+                }
+            }
+            btStateReceiver = rx
+            try {
+                appContext.registerReceiver(
+                    rx,
+                    IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+                    Context.RECEIVER_NOT_EXPORTED,
+                )
+            } catch (e: Throwable) {
+                Log.e(CarPlayConsts.TAG, "BT state watch register failed", e)
+                btStateReceiver = null
+                running.set(false)
+            }
+        }
+        // Race: adapter may have turned on between isEnabled check and registerReceiver.
+        val bt = adapter
+        if (bt != null && bt.isEnabled && running.get() && !rfcommArmed.get()) {
+            Log.i(CarPlayConsts.TAG, "Bluetooth already ON after watch arm → RFCOMM now")
+            beginRfcomm(bt)
+        }
+    }
+
+    private fun disarmBtStateWatch() {
+        synchronized(watchLock) {
+            val rx = btStateReceiver ?: return
+            btStateReceiver = null
+            try {
+                appContext.unregisterReceiver(rx)
+            } catch (_: Throwable) {
+            }
         }
     }
 
@@ -136,6 +219,16 @@ class CarPlayBluetoothLink(
             socket = device.createRfcommSocketToServiceRecord(accessoryUuid)
             socket.connect()
             if (!running.get()) {
+                socket.closeQuietly()
+                return
+            }
+            // Listen may have already accepted DiPlay on …cafe while this dial blocked —
+            // never steal / close an active inbound session.
+            if (clientSocket?.isConnected == true) {
+                Log.i(
+                    CarPlayConsts.TAG,
+                    "RFCOMM dial ${device.address} ignored; inbound session already active",
+                )
                 socket.closeQuietly()
                 return
             }
@@ -241,6 +334,8 @@ class CarPlayBluetoothLink(
 
     fun stop() {
         running.set(false)
+        rfcommArmed.set(false)
+        disarmBtStateWatch()
         synchronized(writeLock) {
             clientSocket?.closeQuietly()
             clientSocket = null

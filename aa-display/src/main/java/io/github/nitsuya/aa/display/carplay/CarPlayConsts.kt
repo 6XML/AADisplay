@@ -59,6 +59,12 @@ object CarPlayConsts {
     const val ENCODE_WIDTH = 1280
     const val ENCODE_HEIGHT = 720
 
+    /**
+     * Density for Host overlay Views measured in encode pixels.
+     * 160 → 1dp=1px on 1280×720 so AA picker dp/sp match the car canvas.
+     */
+    const val ENCODE_UI_DENSITY_DPI = 160
+
     /** iAP2 detect preamble only (`FF 55 02 00 EE 10`); link packets use `FF 5A`. */
     const val IAP2_DETECT_START = 0xFF55
     const val IAP2_LINK_START = 0xFF5A
@@ -81,10 +87,10 @@ object CarPlayConsts {
     const val ENABLE_LOCAL_RTSP_LOOPBACK = false
 
     /**
-     * Real app audio (system-side [AudioPlaybackCapture] tap → 16 kHz mono LPCM) is the
-     * default content of the CarPlay main audio stream (type 100). When no captured audio
-     * is flowing, a silent frame is sent — unless [SEND_TEST_AUDIO] is enabled, in which
-     * case the 440 Hz tone stands in (pipeline debugging only).
+     * Real app audio feeds type-100 media (48 kHz stereo, 0x8000) and speech/nav
+     * (16 kHz mono, 0x10). When no captured audio is flowing, silent frames are sent —
+     * unless [SEND_TEST_AUDIO] is enabled, in which case a 440 Hz tone stands in
+     * (pipeline debugging only: distinguishes protocol OK vs empty capture).
      */
     const val SEND_TEST_AUDIO = false
 }

@@ -111,43 +111,65 @@ class RecentTaskColumnAdapter(
                 holder.itemView.layoutParams = lp
             }
         }
-        if (holder.compactLayoutApplied) return
-        holder.compactLayoutApplied = true
         val density = holder.itemView.resources.displayMetrics.density
         val gapPx = (2f * density).toInt()
-        (holder.binding.clItem.layoutParams as? ViewGroup.MarginLayoutParams)?.let { mlp ->
-            if (mlp.topMargin != 0 || mlp.bottomMargin != 0 ||
-                mlp.height != ViewGroup.LayoutParams.MATCH_PARENT
-            ) {
-                mlp.topMargin = 0
-                mlp.bottomMargin = 0
-                mlp.height = ViewGroup.LayoutParams.MATCH_PARENT
-                holder.binding.clItem.layoutParams = mlp
+        if (!holder.compactLayoutApplied) {
+            holder.compactLayoutApplied = true
+            (holder.binding.clItem.layoutParams as? ViewGroup.MarginLayoutParams)?.let { mlp ->
+                if (mlp.topMargin != 0 || mlp.bottomMargin != 0 ||
+                    mlp.height != ViewGroup.LayoutParams.MATCH_PARENT
+                ) {
+                    mlp.topMargin = 0
+                    mlp.bottomMargin = 0
+                    mlp.height = ViewGroup.LayoutParams.MATCH_PARENT
+                    holder.binding.clItem.layoutParams = mlp
+                }
             }
-        }
-        holder.binding.clItem.setPadding(0, gapPx, 0, gapPx)
-        ConstraintSet().apply {
-            clone(holder.binding.clItem)
-            clear(R.id.v_card, ConstraintSet.TOP)
-            connect(
-                R.id.v_card,
-                ConstraintSet.TOP,
-                R.id.iv_icon,
-                ConstraintSet.BOTTOM,
-                gapPx,
+            holder.binding.clItem.setPadding(0, gapPx, 0, gapPx)
+            // Compact: fill slot, drop 9:16; × stays overlaid on icon (XML).
+            ConstraintSet().apply {
+                clone(holder.binding.clItem)
+                setDimensionRatio(R.id.v_card, "")
+                constrainHeight(R.id.v_card, ConstraintSet.MATCH_CONSTRAINT)
+                constrainPercentWidth(R.id.v_card, 0.78f)
+                connect(R.id.v_card, ConstraintSet.TOP, ConstraintSet.PARENT_ID, ConstraintSet.TOP)
+                connect(R.id.v_card, ConstraintSet.BOTTOM, ConstraintSet.PARENT_ID, ConstraintSet.BOTTOM)
+                connect(R.id.v_card, ConstraintSet.START, ConstraintSet.PARENT_ID, ConstraintSet.START)
+                connect(R.id.v_card, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END)
+                applyTo(holder.binding.clItem)
+            }
+            // Sized relative to icon below; keep centered overlay (XML constraints).
+            val closeSize = (36f * density).toInt()
+            holder.binding.ibClose.layoutParams = holder.binding.ibClose.layoutParams.apply {
+                width = closeSize
+                height = closeSize
+            }
+            holder.binding.ibClose.setPadding(
+                (8f * density).toInt(),
+                (8f * density).toInt(),
+                (8f * density).toInt(),
+                (8f * density).toInt(),
             )
-            connect(R.id.v_card, ConstraintSet.BOTTOM, ConstraintSet.PARENT_ID, ConstraintSet.BOTTOM)
-            connect(R.id.v_card, ConstraintSet.START, ConstraintSet.PARENT_ID, ConstraintSet.START)
-            connect(R.id.v_card, ConstraintSet.END, ConstraintSet.PARENT_ID, ConstraintSet.END)
-            constrainPercentWidth(R.id.v_card, 0.72f)
-            setDimensionRatio(R.id.v_card, "")
-            constrainHeight(R.id.v_card, ConstraintSet.MATCH_CONSTRAINT)
-            applyTo(holder.binding.clItem)
         }
-        val closeSize = (36f * density).toInt()
-        holder.binding.ibClose.layoutParams = holder.binding.ibClose.layoutParams.apply {
-            width = closeSize
-            height = closeSize
+        // Square icon from slot height (label reserved); fitCenter keeps aspect. Re-run when RV sized.
+        if (slotH <= 0) return
+        val labelReserve = (22f * density).toInt()
+        val available = (slotH - gapPx * 2 - labelReserve).coerceAtLeast((48f * density).toInt())
+        val iconSize = (available * 0.82f).toInt()
+            .coerceIn((52f * density).toInt(), (88f * density).toInt())
+        val iconLp = holder.binding.ivIcon.layoutParams
+        if (iconLp.width != iconSize || iconLp.height != iconSize) {
+            iconLp.width = iconSize
+            iconLp.height = iconSize
+            holder.binding.ivIcon.layoutParams = iconLp
+        }
+        // × ~55% of icon, centered on top.
+        val closeSize = (iconSize * 0.55f).toInt().coerceAtLeast((28f * density).toInt())
+        val closeLp = holder.binding.ibClose.layoutParams
+        if (closeLp.width != closeSize || closeLp.height != closeSize) {
+            closeLp.width = closeSize
+            closeLp.height = closeSize
+            holder.binding.ibClose.layoutParams = closeLp
         }
     }
 

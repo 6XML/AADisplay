@@ -397,6 +397,22 @@ object CoreManager : ICoreManager, DeathRecipient {
         }
     }
 
+    override fun pullCarPlaySpeechAudio(maxBytes: Int): ByteArray {
+        return try {
+            getService()?.pullCarPlaySpeechAudio(maxBytes) ?: ByteArray(0)
+        } catch (e: Throwable) {
+            ByteArray(0)
+        }
+    }
+
+    override fun isCarPlaySpeechCaptureReady(): Boolean {
+        return try {
+            getService()?.isCarPlaySpeechCaptureReady() == true
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
     override fun scrollPane(pane: Int, x: Int, y: Int, vScroll: Int, hScroll: Int) {
         try {
             getService()?.scrollPane(pane, x, y, vScroll, hScroll)

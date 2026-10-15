@@ -151,18 +151,19 @@ interface ICoreManager {
     boolean isCarPlaySessionLive();
 
     /**
-     * system_server AudioPlaybackCapture for the CarPlay main audio egress: captures all
-     * non-call app audio (16 kHz mono PCM16) and mutes the captured streams locally while
-     * enabled, so the car speaker is the only audible sink. App toggles this when its
-     * CarPlay audio stream opens / tears down. Appended at end for Stub ordinals.
+     * Armed system_server capture for CarPlay audio egress (media 48 kHz stereo + speech
+     * 16 kHz mono rings). Local phone/A2DP sinks are muted while enabled; REMOTE_SUBMIX
+     * never uses stream-mute (post-mute mix would be silent) — device-level mute instead.
+     * App toggles this when any CarPlay audio stream opens / tears down.
+     * Appended at end for Stub ordinals.
      */
     void setCarPlayAudioEgressEnabled(boolean enabled);
 
     /**
-     * Pulls up to [maxBytes] bytes of captured little-endian s16 mono 16 kHz PCM
-     * (empty when disabled or idle); caller byte-swaps to big-endian for the CarPlay wire.
-     * Returned as the result because AIDL `out byte[]` rebinds a fresh array in the
-     * generated proxy (the caller's buffer would never be filled).
+     * Pulls up to [maxBytes] bytes of captured little-endian s16 stereo 48 kHz PCM
+     * (CarPlay media / entertainment; empty when disabled or idle); caller byte-swaps
+     * to big-endian for the CarPlay wire. Returned as the result because AIDL `out byte[]`
+     * rebinds a fresh array in the generated proxy.
      * Appended at end for Stub ordinals.
      */
     byte[] pullCarPlayAudio(int maxBytes);
@@ -172,4 +173,18 @@ interface ICoreManager {
      * Appended at end for Stub ordinals.
      */
     oneway void scrollPane(int pane, int x, int y, int vScroll, int hScroll);
+
+    /**
+     * Pulls up to [maxBytes] bytes of captured little-endian s16 mono 16 kHz PCM for the
+     * CarPlay speech / navigation channel (empty when disabled or idle).
+     * Appended at end for Stub ordinals.
+     */
+    byte[] pullCarPlaySpeechAudio(int maxBytes);
+
+    /**
+     * True when an exclusive nav/assistant AudioPolicy tap is armed. Speech SETUP must
+     * not open otherwise — an empty/bleed speech stream mixed with media on DiPlay is
+     * heard as echo. Appended at end for Stub ordinals.
+     */
+    boolean isCarPlaySpeechCaptureReady();
 }

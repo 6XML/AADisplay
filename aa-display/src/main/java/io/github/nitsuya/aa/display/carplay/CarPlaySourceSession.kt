@@ -11,6 +11,8 @@ import io.github.nitsuya.aa.display.carplay.protocol.Iap2Csm
 import io.github.nitsuya.aa.display.carplay.protocol.Iap2Session
 import io.github.nitsuya.aa.display.egress.ProjectionSessionGate
 import java.net.InetAddress
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -71,7 +73,10 @@ class CarPlaySourceSession(
         glCompositor?.onRateReport = rateCb
 
         val rtspSession = CarPlayRtspSession(
-            onVideoSetup = { w, h -> ensureEncoder(w, h) },
+            // Screen SETUP (incl. DiPlay re-SETUP after TCP reset): always mint a fresh
+            // MediaCodec input Surface. Keeping a wedged GL→encoder Surface leaves the
+            // codec at in=0 while GlCompositor still reports ~60fps — DiPlay freezes.
+            onVideoSetup = { w, h -> ensureEncoder(w, h, forceSurfaceRefresh = true) },
             onSessionReady = {
                 ensureEncoder(CarPlayConsts.DEFAULT_VIDEO_WIDTH, CarPlayConsts.DEFAULT_VIDEO_HEIGHT)
                 // CarPlay session live on the car → drive NowPlaying (cluster card) from the
@@ -108,7 +113,12 @@ class CarPlaySourceSession(
         val link = CarPlayBluetoothLink(
             appContext,
             onConnected = { iap2?.onTransportConnected() },
-            onDisconnected = { iap2?.onTransportClosed() },
+            onDisconnected = {
+                iap2?.onTransportClosed()
+                // Stop zombie UDP audio / screen / NowPlaying so DiPlay can re-Auth.
+                rtsp?.releaseMediaStreams("iap-rfcomm-closed")
+                CarPlayNowPlaying.stop()
+            },
             onBytes = { bytes -> iap2?.onBytes(bytes) },
         )
         bluetooth = link
@@ -149,8 +159,11 @@ class CarPlaySourceSession(
     private fun dialCarPlayControl(start: Iap2Csm.CarPlayStart) {
         val port = start.port ?: return
         if (port <= 0 || port > 65535) return
-        // Prefer explicit IP from StartSession; else wait for Bonjour discovery.
-        val host = start.ipAddresses.firstOrNull { it.isNotBlank() && !it.startsWith("fe80:", ignoreCase = true) }
+        // Prefer explicit IPv4 from StartSession; DiPlay sometimes only puts fe80 in
+        // 0x4301 — fall back to the accessory AP DHCP/gateway on the joined Wi‑Fi.
+        val host = start.ipAddresses.firstOrNull {
+            it.isNotBlank() && !it.startsWith("fe80:", ignoreCase = true)
+        } ?: wifiHandoff?.accessoryIpv4Hint(start.ssid)
             ?: start.ipAddresses.firstOrNull()
         if (host.isNullOrBlank()) {
             Log.i(
@@ -158,6 +171,12 @@ class CarPlaySourceSession(
                 "CarPlayStartSession port=$port without IPv4 — rely on Bonjour / inbound TCP",
             )
             return
+        }
+        if (host.startsWith("fe80:", ignoreCase = true)) {
+            Log.w(
+                CarPlayConsts.TAG,
+                "CarPlayStartSession dial host is link-local $host — may fail without scope",
+            )
         }
         Thread({
             val addr = try {
@@ -200,16 +219,11 @@ class CarPlaySourceSession(
     }
 
     fun attachShellView(view: View?) {
-        tee.attachShell(view)
+        // Exclusive egress: AA shell is never teed into CarPlay. Keep the hook so
+        // ShellFrameEgress rebind stays harmless if AA UI still offers a shell.
+        tee.attachShell(null)
         if (view != null) {
-            CarPlayInputBridge.shellWidthPx = view.width.coerceAtLeast(1)
-            CarPlayInputBridge.shellHeightPx = view.height.coerceAtLeast(1)
-        }
-        // AA shell tee vs Host GL are mutually exclusive producers of the encoder Surface.
-        if (running.get() && encoder.currentFps() > 0) {
-            mainHandler.post {
-                if (running.get()) bindGlOrTee(supplyFps)
-            }
+            Log.d(CarPlayConsts.TAG, "attachShellView ignored (CarPlay Host exclusive)")
         }
     }
 
@@ -240,14 +254,15 @@ class CarPlaySourceSession(
         glCompositor = compositor
         compositor?.onRateReport = { target, actual -> onRateReport(target, actual) }
         if (!running.get()) return
-        // Re-bind if the encoder is already live (Host attached after SETUP).
-        val encW = CarPlayConsts.ENCODE_WIDTH
-        val encH = CarPlayConsts.ENCODE_HEIGHT
-        val fps = supplyFps
-        if (compositor != null && encoder.hasSurfaceInput() && encoder.isRunningAt(encW, encH, fps)) {
-            bindGlOrTee(fps)
-        } else if (compositor == null && encoder.currentFps() > 0) {
-            bindGlOrTee(fps)
+        // Host may attach after tee-armed SETUP — always rebind with a fresh Surface
+        // (Canvas lockCanvas contaminates the prior MediaCodec input on Samsung).
+        if (compositor != null) {
+            cancelGlRebindRetry()
+            if (encoder.currentFps() > 0) {
+                bindGlOrTee(supplyFps, forceFreshSurface = true)
+            }
+        } else if (encoder.currentFps() > 0) {
+            bindGlOrTee(supplyFps, forceFreshSurface = false)
         }
     }
 
@@ -272,38 +287,70 @@ class CarPlaySourceSession(
      * size in the SETUP record: the HU scales the decoded frame to its own display, while the
      * RGB→NV12 conversion cost scales with pixels, so a fixed lower resolution wins.
      */
-    private fun ensureEncoder(width: Int, height: Int) {
+    private fun ensureEncoder(width: Int, height: Int, forceSurfaceRefresh: Boolean = false) {
         // Serialized on the main looper: DiPlay re-SETUP drives this from worker threads and
         // a concurrent codec start/stop crashed the app (see EXECUTION.md §14).
-        if (Looper.myLooper() == Looper.getMainLooper()) ensureEncoderMain(width, height)
-        else mainHandler.post { ensureEncoderMain(width, height) }
+        // Must *wait* when called from the RTSP worker — otherwise audio SETUP starts while
+        // GL/encoder is still posting, and DiPlay plays PCM seconds before the first AVC.
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            ensureEncoderMain(width, height, forceSurfaceRefresh)
+            return
+        }
+        val done = CountDownLatch(1)
+        mainHandler.post {
+            try {
+                ensureEncoderMain(width, height, forceSurfaceRefresh)
+            } finally {
+                done.countDown()
+            }
+        }
+        if (!done.await(8, TimeUnit.SECONDS)) {
+            Log.w(CarPlayConsts.TAG, "ensureEncoder sync wait timed out 8s — audio may lead video")
+        }
     }
 
-    private fun ensureEncoderMain(width: Int, height: Int) {
+    private fun ensureEncoderMain(width: Int, height: Int, forceSurfaceRefresh: Boolean) {
         if (!running.get()) return
         val encW = CarPlayConsts.ENCODE_WIDTH
         val encH = CarPlayConsts.ENCODE_HEIGHT
         val fps = supplyFps
-        val wantGl = glCompositor != null && !ProjectionSessionGate.shouldTeeFromAaShell()
-        // onVideoSetup + onSessionReady both fire per SETUP; a second start() in the same
-        // tick races the first codec release and crashed the app — skip when already armed.
-        if (encoder.isRunningAt(encW, encH, fps)) {
-            // Re-bind GL if Host attached after an early tee-armed SETUP.
-            if (wantGl && !glCompositor!!.isEncoderAttached()) {
-                bindGlOrTee(fps)
+        // Block until Host GL is up — async ensure previously raced SETUP into test-pattern.
+        resolveGlCompositor(waitMs = 5_000L)
+        val wantGl = glCompositor != null
+        // onSessionReady often follows onVideoSetup in the same tick — skip a second
+        // codec recycle when already armed, unless screen SETUP asked for a fresh Surface.
+        if (!forceSurfaceRefresh && encoder.isRunningAt(encW, encH, fps)) {
+            if (wantGl && glCompositor!!.isEncoderAttached()) {
+                return
+            }
+            if (wantGl) {
+                bindGlOrTee(fps, forceFreshSurface = true)
             }
             return
         }
         Log.i(
             CarPlayConsts.TAG,
-            "ensureEncoder setup=${width}x$height → encode=${encW}x$encH@${fps}fps",
+            "ensureEncoder setup=${width}x$height → encode=${encW}x$encH@${fps}fps" +
+                " host=${wantGl}" +
+                if (forceSurfaceRefresh) " forceSurfaceRefresh" else "",
         )
-        bindGlOrTee(fps)
+        bindGlOrTee(fps, forceFreshSurface = forceSurfaceRefresh)
+    }
+
+    /** Pull [CarPlayHostRuntime] compositor into this session (sync boot when needed). */
+    private fun resolveGlCompositor(waitMs: Long): CarPlayGlCompositor? {
+        glCompositor?.let { return it }
+        CarPlayHostRuntime.ensureStartedSync(appContext, timeoutMs = waitMs)
+        val gl = CarPlayHostRuntime.compositorOrNull() ?: return null
+        // Assign locally — do not call ProjectionService.attachGlCompositor (re-enters bind).
+        glCompositor = gl
+        gl.onRateReport = { target, actual -> onRateReport(target, actual) }
+        return gl
     }
 
     /**
-     * Host GL path owns the encoder Surface exclusively. AA shell / Canvas Host / test
-     * pattern still go through [FrameEgressTee].
+     * Host GL owns the encoder Surface. Canvas [FrameEgressTee] is only a temporary
+     * fallback (test pattern) until Host attaches — AA shell is never teed.
      *
      * Important: a MediaCodec input [android.view.Surface] that was ever fed via
      * [android.view.Surface.lockCanvas] (tee path) stays connected as
@@ -311,49 +358,76 @@ class CarPlaySourceSession(
      * an EGL window then fails with `eglCreateWindowSurface` / EGL_BAD_ALLOC
      * ("already connected"). Always mint a fresh input Surface when (re)attaching GL.
      */
-    private fun bindGlOrTee(fps: Int) {
+    private fun bindGlOrTee(fps: Int, forceFreshSurface: Boolean = false) {
         val encW = CarPlayConsts.ENCODE_WIDTH
         val encH = CarPlayConsts.ENCODE_HEIGHT
-        val gl = glCompositor
-        val wantGl = gl != null && !ProjectionSessionGate.shouldTeeFromAaShell()
-        if (wantGl) {
+        val gl = resolveGlCompositor(waitMs = 5_000L)
+        if (gl != null) {
             tee.setGlExclusive(true)
-            if (gl!!.isEncoderAttached() &&
+            if (!forceFreshSurface &&
+                gl.isEncoderAttached() &&
                 encoder.hasSurfaceInput() &&
                 encoder.isRunningAt(encW, encH, fps)
             ) {
                 Log.i(CarPlayConsts.TAG, "CarPlaySourceSession feed=gl-compositor (kept)")
+                cancelGlRebindRetry()
                 return
             }
-            gl.detachEncoder()
-            encoder.start(encW, encH, fps)
-            val surface = encoder.inputSurfaceOrNull()
-            if (surface == null) {
-                Log.w(CarPlayConsts.TAG, "GL bind: no surface input — tee-canvas fallback")
-                tee.setGlExclusive(false)
-                tee.start(encoder, encW, encH, fps)
-                Log.i(CarPlayConsts.TAG, "CarPlaySourceSession feed=tee-canvas")
-                return
-            }
-            if (!gl.attachEncoder(surface, encW, encH, fps)) {
-                // Surface may still be contaminated; give Canvas a virgin one.
-                Log.w(CarPlayConsts.TAG, "GL attachEncoder failed — tee-canvas fallback")
+            for (attempt in 1..3) {
+                gl.detachEncoder()
                 encoder.start(encW, encH, fps)
-                tee.setGlExclusive(false)
-                tee.start(encoder, encW, encH, fps)
-                Log.i(CarPlayConsts.TAG, "CarPlaySourceSession feed=tee-canvas")
-                return
+                val surface = encoder.inputSurfaceOrNull()
+                if (surface == null) {
+                    Log.w(CarPlayConsts.TAG, "GL bind: no surface input attempt=$attempt")
+                    continue
+                }
+                if (gl.attachEncoder(surface, encW, encH, fps)) {
+                    Log.i(CarPlayConsts.TAG, "CarPlaySourceSession feed=gl-compositor attempt=$attempt")
+                    cancelGlRebindRetry()
+                    return
+                }
+                Log.w(CarPlayConsts.TAG, "GL attachEncoder failed attempt=$attempt")
             }
-            Log.i(CarPlayConsts.TAG, "CarPlaySourceSession feed=gl-compositor")
+            Log.w(CarPlayConsts.TAG, "GL attachEncoder exhausted — tee-canvas + retry")
         } else {
-            gl?.detachEncoder()
-            tee.setGlExclusive(false)
-            if (!encoder.isRunningAt(encW, encH, fps) || !encoder.hasSurfaceInput()) {
-                encoder.start(encW, encH, fps)
-            }
-            tee.start(encoder, encW, encH, fps)
-            Log.i(CarPlayConsts.TAG, "CarPlaySourceSession feed=tee-canvas")
+            Log.w(CarPlayConsts.TAG, "HostRuntime not ready — tee-canvas + retry")
         }
+        tee.setGlExclusive(false)
+        if (!encoder.isRunningAt(encW, encH, fps) || !encoder.hasSurfaceInput()) {
+            encoder.start(encW, encH, fps)
+        }
+        tee.start(encoder, encW, encH, fps)
+        Log.i(CarPlayConsts.TAG, "CarPlaySourceSession feed=tee-canvas")
+        scheduleGlRebindRetry()
+    }
+
+    private var glRebindRetries = 0
+    private val glRebindRunnable = object : Runnable {
+        override fun run() {
+            if (!running.get()) return
+            if (glCompositor?.isEncoderAttached() == true) {
+                glRebindRetries = 0
+                return
+            }
+            glRebindRetries++
+            if (glRebindRetries > GL_REBIND_MAX) {
+                Log.w(CarPlayConsts.TAG, "GL rebind gave up after $GL_REBIND_MAX tries — still tee-canvas")
+                return
+            }
+            Log.i(CarPlayConsts.TAG, "GL rebind retry $glRebindRetries/$GL_REBIND_MAX")
+            bindGlOrTee(supplyFps, forceFreshSurface = true)
+        }
+    }
+
+    private fun scheduleGlRebindRetry() {
+        mainHandler.removeCallbacks(glRebindRunnable)
+        if (!running.get()) return
+        mainHandler.postDelayed(glRebindRunnable, GL_REBIND_DELAY_MS)
+    }
+
+    private fun cancelGlRebindRetry() {
+        glRebindRetries = 0
+        mainHandler.removeCallbacks(glRebindRunnable)
     }
 
     /**
@@ -403,8 +477,7 @@ class CarPlaySourceSession(
             val encW = CarPlayConsts.ENCODE_WIDTH
             val encH = CarPlayConsts.ENCODE_HEIGHT
             if (encoder.isRunningAt(encW, encH, fps) &&
-                (glCompositor == null || glCompositor!!.isEncoderAttached() ||
-                    ProjectionSessionGate.shouldTeeFromAaShell())
+                (glCompositor == null || glCompositor!!.isEncoderAttached())
             ) {
                 return@post
             }
@@ -418,6 +491,7 @@ class CarPlaySourceSession(
         if (!running.compareAndSet(true, false)) return
         val (sent, bytes) = rtsp?.rtpStats() ?: (0L to 0L)
         Log.i(CarPlayConsts.TAG, "CarPlaySourceSession stop rtpSent=$sent rtpBytes=$bytes")
+        cancelGlRebindRetry()
         tee.onRateReport = null
         glCompositor?.onRateReport = null
         glCompositor?.detachEncoder()
@@ -450,5 +524,8 @@ class CarPlaySourceSession(
 
         /** 6 x 10 s of a healthy 30 fps supply before climbing back to 60. */
         private const val RECOVER_WINDOWS = 6
+
+        private const val GL_REBIND_DELAY_MS = 1_000L
+        private const val GL_REBIND_MAX = 15
     }
 }

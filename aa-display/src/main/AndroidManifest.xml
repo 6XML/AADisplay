@@ -22,6 +22,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <uses-feature
         android:name="android.hardware.bluetooth"
@@ -69,6 +70,7 @@
             android:name=".carplay.CarPlayHostActivity"
             android:exported="false"
             android:excludeFromRecents="true"
+            android:launchMode="singleTask"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <service
             android:name=".service.AaActivityService"
@@ -97,6 +99,19 @@
             android:name=".carplay.CarPlayProjectionService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+        <!-- Re-arm cafe RFCOMM after reboot / replace / unlock / BT ON (channel=CarPlay).
+             Z Flip often brings BT (A2DP sound) up before BOOT_COMPLETED; STATE_ON must
+             arm …cafe before DiPlay SDP backs off. -->
+        <receiver
+            android:name=".carplay.CarPlayAutoArmReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.USER_UNLOCKED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.bluetooth.adapter.action.STATE_CHANGED" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>

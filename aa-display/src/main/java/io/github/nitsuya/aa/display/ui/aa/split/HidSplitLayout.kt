@@ -78,7 +78,7 @@ data class HidSplitLayout(
     val dividerVisualPx: Int
         get() {
             val dpi = densityDpi.coerceAtLeast(160)
-            return (SplitPane.DIVIDER_DP * dpi / 160f).toInt().coerceAtLeast(4)
+            return (SplitPane.DIVIDER_DP * dpi / 160f).toInt().coerceAtLeast(1)
         }
 
     fun sizeOf(pane: Int): Pair<Int, Int>? = when (pane) {

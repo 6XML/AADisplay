@@ -225,7 +225,7 @@ class AaMainFragment : BaseFragment<FragmentAaMainBinding>(FragmentAaMainBinding
 
     override fun initViews() {
         Log.d(TAG, "initViews")
-        appPicker = SplitAppPickerController(baseBinding) {
+        appPicker = SplitAppPickerController.fromAaMain(baseBinding) {
             listOfNotNull(
                 panePackages[SplitPane.PRIMARY].takeIf { it.isNotEmpty() },
                 panePackages[SplitPane.SECONDARY].takeIf { it.isNotEmpty() },
@@ -1876,7 +1876,7 @@ class AaMainFragment : BaseFragment<FragmentAaMainBinding>(FragmentAaMainBinding
         imeChipVisible = visible
         if (SplitPane.isValid(pane)) imeChipPane = pane
         val pickerUp = try {
-            baseBinding.appPickerHost.isVisible
+            ::appPicker.isInitialized && appPicker.isShowing
         } catch (_: Throwable) {
             false
         }

@@ -307,7 +307,8 @@ class CarPlayVideoEncoder(
                 val nv12 = nv12Slots[slotIndex]
                 input.clear()
                 input.put(nv12)
-                val pts = frameIndex * (1_000_000L / CarPlayConsts.DEFAULT_VIDEO_FPS)
+                CarPlayMediaClock.ensureRunning()
+                val pts = CarPlayMediaClock.videoTimestampNs() / 1_000L
                 frameIndex++
                 encoder.queueInputBuffer(inIndex, 0, nv12.size, pts, 0)
             } catch (e: Throwable) {

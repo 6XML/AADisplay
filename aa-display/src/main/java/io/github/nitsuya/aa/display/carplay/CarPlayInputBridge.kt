@@ -21,10 +21,10 @@ import kotlin.math.abs
  */
 object CarPlayInputBridge {
     @Volatile
-    var shellWidthPx: Int = CarPlayConsts.DEFAULT_VIDEO_WIDTH
+    var shellWidthPx: Int = CarPlayConsts.ENCODE_WIDTH
 
     @Volatile
-    var shellHeightPx: Int = CarPlayConsts.DEFAULT_VIDEO_HEIGHT
+    var shellHeightPx: Int = CarPlayConsts.ENCODE_HEIGHT
 
     /** Primary pane share of the split display width (matches CoreApi.onCreateSplitDisplay). */
     @Volatile
@@ -72,6 +72,7 @@ object CarPlayInputBridge {
         val x = xNorm.coerceIn(0f, 1f)
         val y = yNorm.coerceIn(0f, 1f)
 
+        // Canvas picker (Host has no Window — View snapshot touch is broken).
         if (CarPlayAppPickerOverlay.isVisible()) {
             CarPlayAppPickerOverlay.onTouch(x, y, action)
             return
@@ -81,7 +82,7 @@ object CarPlayInputBridge {
             return
         }
 
-        // Host-only chrome: divider / peel (AA shell already owns chrome when tee'd).
+        // CarPlay exclusive: Host chrome (divider / peel / overlays).
         if (ProjectionSessionGate.shouldUseCarPlayHost()) {
             if (handleChrome(x, y, action)) return
         }
@@ -266,10 +267,25 @@ object CarPlayInputBridge {
         primaryRatio = ratio
         try {
             CoreApi.setSplitRatio(ratio)
+            // GL drawFrame also syncs ST buffers; hint immediately so the next
+            // producer frames match the new VD sizes before the first post-settle tick.
+            syncGlPaneBuffers(ratio)
             Log.i(CarPlayConsts.TAG, "CarPlay divider settle ratio=$ratio")
         } catch (e: Throwable) {
             Log.w(CarPlayConsts.TAG, "setSplitRatio($ratio) failed", e)
         }
+    }
+
+    private fun syncGlPaneBuffers(ratio: Float) {
+        val gl = CarPlayHostRuntime.compositorOrNull() ?: return
+        val w = shellWidthPx.coerceAtLeast(2)
+        val h = shellHeightPx.coerceAtLeast(1)
+        // Same dpi as HostRuntime / GlCompositor — not live phone/VD dpi (mismatch → black gutters).
+        val gap = SplitPane.dividerPx(CarPlayConsts.ENCODE_UI_DENSITY_DPI)
+        val usable = (w - gap).coerceAtLeast(2)
+        val left = (usable * ratio).toInt().coerceAtLeast(1)
+        val right = (usable - left).coerceAtLeast(1)
+        gl.syncPaneBuffers(left, right, h)
     }
 
     private fun enterFullscreen(pane: Int) {

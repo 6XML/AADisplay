@@ -1,6 +1,7 @@
 package io.github.nitsuya.aa.display.carplay
 
 import android.util.Log
+import io.github.nitsuya.aa.display.CoreApi
 import io.github.nitsuya.aa.display.carplay.protocol.AirPlayPairVerify
 import io.github.nitsuya.aa.display.carplay.protocol.AirPlayPairing
 import io.github.nitsuya.aa.display.carplay.protocol.BinaryPlist
@@ -34,6 +35,8 @@ class CarPlayRtspSession(
 ) {
     private val running = AtomicBoolean(false)
     private val streaming = AtomicBoolean(false)
+    /** True while [connectAsAirPlaySource] owns the live control/media session. */
+    private val airplaySourceActive = AtomicBoolean(false)
     private var serverSocket: ServerSocket? = null
     private var peer: Socket? = null
     private var output: BufferedOutputStream? = null
@@ -45,7 +48,8 @@ class CarPlayRtspSession(
     private val controlWriteKey = AtomicReference<ByteArray?>(null)
     private val controlReadKey = AtomicReference<ByteArray?>(null)
     private val screenEgress = AtomicReference<ScreenStreamEgress?>(null)
-    private val audioEgress = AtomicReference<CarPlayAudioEgress?>(null)
+    private val mediaAudioEgress = AtomicReference<CarPlayAudioEgress?>(null)
+    private val speechAudioEgress = AtomicReference<CarPlayAudioEgress?>(null)
     private val eventChannel = AtomicReference<CarPlayEventChannel?>(null)
     private val lastCodecConfig = AtomicReference<ByteArray?>(null)
     private val pairSessionKey = AtomicReference<ByteArray?>(null)
@@ -111,6 +115,7 @@ class CarPlayRtspSession(
     fun connectAsAirPlaySource(host: InetAddress, port: Int, deviceId: String?) {
         thread(name = "carplay-airplay-source", isDaemon = true) {
             if (!running.get()) running.set(true)
+            airplaySourceActive.set(true)
             try {
                 val socket = Socket(host, port)
                 socket.soTimeout = 15_000
@@ -252,8 +257,28 @@ class CarPlayRtspSession(
                 pumpEncryptedControl(crypto, input)
             } catch (e: Throwable) {
                 Log.e(CarPlayConsts.TAG, "AirPlay source dial failed", e)
+            } finally {
+                airplaySourceActive.set(false)
+                // DiPlay resets control → must stop UDP audio / screen TCP or reconnect
+                // Auth dies under zombie streams ("连接中断" loop).
+                releaseMediaStreams("airplay-control-ended")
             }
         }
+    }
+
+    /**
+     * Drop live media producers without tearing down the RTSP listen socket.
+     * Safe to call repeatedly from control death, TEARDOWN, or iAP RFCOMM close.
+     */
+    fun releaseMediaStreams(reason: String) {
+        streaming.set(false)
+        mediaAudioEgress.getAndSet(null)?.stop()
+        speechAudioEgress.getAndSet(null)?.stop()
+        screenEgress.getAndSet(null)?.close()
+        eventChannel.getAndSet(null)?.close()
+        CarPlayWheelController.setEnabled(false)
+        CarPlayMediaClock.clear()
+        Log.i(CarPlayConsts.TAG, "releaseMediaStreams reason=$reason")
     }
 
     /**
@@ -368,7 +393,8 @@ class CarPlayRtspSession(
         val screenStream = linkedMapOf<String, Any?>(
             "type" to 110L,
             "streamConnectionID" to streamConnectionId,
-            "latencyMs" to 90L,
+            // Slightly under audioLatencyMs so DiPlay holds PCM until AVC arrives.
+            "latencyMs" to 60L,
             "fps" to CarPlayConsts.DEFAULT_VIDEO_FPS.toLong(),
             "usingScreen" to true,
             "supportsHighAccuracyTimestamps" to true,
@@ -426,22 +452,43 @@ class CarPlayRtspSession(
             height = h,
         ) ?: return false
         screenEgress.getAndSet(egress)?.close()
+        // Shared A/V timeline — must start before encoder + audio pumps.
+        CarPlayMediaClock.reset()
         lastCodecConfig.get()?.let { cfg ->
-            egress.sendCodecConfig(cfg, System.nanoTime())
+            egress.sendCodecConfig(cfg, CarPlayMediaClock.videoTimestampNs())
         }
         streaming.set(true)
         onVideoSetup(w, h)
 
-        // Audio: DiPlay [CarPlayMediaEngine.onAudio] answers dataPort/controlPort; the
-        // 16 kHz mono LPCM stream then carries real app audio (system-side capture tap)
-        // — silence when nothing plays, so the SETUP always runs.
-        setupAudio(
+        // Audio: media always; speech only when system_server has an exclusive nav tap
+        // (otherwise DiPlay mixes a bleed/empty speech stream with media → 重音).
+        setupAudioStream(
             peerHost,
             sharedSecret,
             { extra -> headers(extra) },
             sessionUrl,
             { req -> exchangeEncrypted(req) },
+            CarPlayAudioEgress.MEDIA,
+            mediaAudioEgress,
         )
+        val speechReady = try {
+            CoreApi.isCarPlaySpeechCaptureReady()
+        } catch (_: Throwable) {
+            false
+        }
+        if (speechReady) {
+            setupAudioStream(
+                peerHost,
+                sharedSecret,
+                { extra -> headers(extra) },
+                sessionUrl,
+                { req -> exchangeEncrypted(req) },
+                CarPlayAudioEgress.SPEECH,
+                speechAudioEgress,
+            )
+        } else {
+            Log.i(CarPlayConsts.TAG, "skip speech SETUP — no exclusive AudioPolicy nav tap")
+        }
 
         onSessionReady()
         Log.i(CarPlayConsts.TAG, "screen egress armed — AVC frames → dataPort=$dataPort")
@@ -449,25 +496,26 @@ class CarPlayRtspSession(
     }
 
     /**
-     * SETUP(streams=[{type:100, audioType:"media", audioFormat:0x10(16k mono LPCM)}]) on the
-     * encrypted control channel, then starts the UDP audio pump against the answered ports.
-     * Non-fatal: a declined stream only costs the audio, not the screen.
+     * SETUP one type-100 audio stream ([profile]) on the encrypted control channel, then
+     * start the UDP pump. Non-fatal: a declined stream only costs that channel.
      */
-    private fun setupAudio(
+    private fun setupAudioStream(
         peerHost: InetAddress,
         sharedSecret: ByteArray,
         headers: (Map<String, String>) -> LinkedHashMap<String, String>,
         sessionUrl: String,
         exchangeEncrypted: (RtspMessage) -> RtspMessage?,
+        profile: CarPlayAudioEgress.Profile,
+        slot: AtomicReference<CarPlayAudioEgress?>,
     ) {
         try {
             val streamConnectionId = Random.nextLong() and Long.MAX_VALUE
             val audioStream = linkedMapOf<String, Any?>(
                 "type" to 100L,
                 "streamConnectionID" to streamConnectionId,
-                "audioType" to "media",
-                "audioFormat" to CarPlayAudioEgress.AUDIO_FORMAT_PCM_16K_MONO,
-                "audioLatencyMs" to 100L,
+                "audioType" to profile.audioType,
+                "audioFormat" to profile.audioFormatBit,
+                "audioLatencyMs" to CarPlayAudioEgress.AUDIO_LATENCY_MS,
             )
             val body = BinaryPlist.encode(mapOf("streams" to listOf(audioStream)))
             val resp = exchangeEncrypted(
@@ -483,14 +531,27 @@ class CarPlayRtspSession(
                 ),
             )
             if (resp == null || !resp.firstLine.contains("200")) {
-                Log.w(CarPlayConsts.TAG, "CarPlay audio SETUP rejected: ${resp?.firstLine}")
+                Log.w(
+                    CarPlayConsts.TAG,
+                    "CarPlay ${profile.label} audio SETUP rejected: ${resp?.firstLine}",
+                )
                 return
             }
-            val egress = CarPlayAudioEgress.open(peerHost, resp, sharedSecret, streamConnectionId)
-            audioEgress.getAndSet(egress)?.stop()
+            val egress = CarPlayAudioEgress.open(
+                peerHost,
+                resp,
+                sharedSecret,
+                streamConnectionId,
+                profile,
+            )
+            slot.getAndSet(egress)?.stop()
             egress?.start()
         } catch (e: Throwable) {
-            Log.w(CarPlayConsts.TAG, "CarPlay audio SETUP failed (screen continues)", e)
+            Log.w(
+                CarPlayConsts.TAG,
+                "CarPlay ${profile.label} audio SETUP failed (screen continues)",
+                e,
+            )
         }
     }
 
@@ -527,10 +588,18 @@ class CarPlayRtspSession(
     private fun attachPeer(socket: Socket) {
         val addr = socket.inetAddress
         val isLoopback = addr?.isLoopbackAddress == true
+        // DiPlay Bonjour /ctrl-int probes hit our listen port during an active
+        // AirPlay-source session. They must never clobber peer/output/streaming
+        // or releaseMediaStreams — that was causing connect→flash→reconnect loops.
+        val probeOnly = airplaySourceActive.get()
         Log.i(
             CarPlayConsts.TAG,
-            "RTSP peer ${addr?.hostAddress} loopback=$isLoopback",
+            "RTSP peer ${addr?.hostAddress} loopback=$isLoopback probeOnly=$probeOnly",
         )
+        if (probeOnly) {
+            handlePeer(socket, ownsSession = false)
+            return
+        }
         if (!isLoopback) {
             // Prefer real HU / simulator: drop loopback session if any.
             val old = peer
@@ -542,13 +611,15 @@ class CarPlayRtspSession(
         } else if (peer == null) {
             peer = socket
         }
-        handlePeer(socket)
+        handlePeer(socket, ownsSession = true)
     }
 
-    private fun handlePeer(socket: Socket) {
+    private fun handlePeer(socket: Socket, ownsSession: Boolean) {
         val input = BufferedInputStream(socket.getInputStream())
         val out = BufferedOutputStream(socket.getOutputStream())
-        output = out
+        if (ownsSession) {
+            output = out
+        }
         val headerBuf = ByteArrayOutputLimited(64 * 1024)
         while (running.get() && !socket.isClosed) {
             val b = try {
@@ -592,9 +663,16 @@ class CarPlayRtspSession(
                 dispatch(msg, out)
             }
         }
-        streaming.set(false)
-        output = null
-        Log.i(CarPlayConsts.TAG, "RTSP peer closed rtpSent=${rtpSent.get()} rtpBytes=${rtpBytes.get()}")
+        if (ownsSession) {
+            output = null
+            releaseMediaStreams("rtsp-peer-closed")
+            Log.i(
+                CarPlayConsts.TAG,
+                "RTSP peer closed rtpSent=${rtpSent.get()} rtpBytes=${rtpBytes.get()}",
+            )
+        } else {
+            Log.i(CarPlayConsts.TAG, "RTSP probe peer closed (AirPlay source kept)")
+        }
     }
 
     private fun skipInterleaved(input: BufferedInputStream) {
@@ -720,7 +798,7 @@ class CarPlayRtspSession(
                 onSessionReady()
             }
             "TEARDOWN" -> {
-                streaming.set(false)
+                releaseMediaStreams("rtsp-teardown")
                 reply(out, RtspMessage.ok(cSeq))
             }
             "SET_PARAMETER" -> {
@@ -832,11 +910,7 @@ class CarPlayRtspSession(
 
     fun stop() {
         running.set(false)
-        streaming.set(false)
-        audioEgress.getAndSet(null)?.stop()
-        CarPlayWheelController.setEnabled(false)
-        eventChannel.getAndSet(null)?.close()
-        screenEgress.getAndSet(null)?.close()
+        releaseMediaStreams("rtsp-stop")
         peer?.closeQuietly()
         peer = null
         output = null

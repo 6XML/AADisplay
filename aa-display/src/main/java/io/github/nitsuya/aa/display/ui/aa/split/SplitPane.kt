@@ -53,8 +53,11 @@ object SplitPane {
      */
     const val PEEL_TAB_HIT_EXPAND_DP = 12
 
-    /** Divider thickness in logical pixels (applied in display pixels via density). */
-    const val DIVIDER_DP = 8
+    /**
+     * Physical gap between panes (display px via [dividerPx]). Keep tiny — a wide gap
+     * reads as a solid black bar behind the thin seam/dots drawn by [SplitDividerView].
+     */
+    const val DIVIDER_DP = 2
 
     /** Grip dots on [SplitDividerView] — shared with BT mouse chrome hit-test. */
     const val DIVIDER_DOT_RADIUS_DP = 2.5f
@@ -159,7 +162,7 @@ object SplitPane {
     /** Divider gap in px — shared by shell layout and VD pane sizing ([SplitVdLifecycle]). */
     fun dividerPx(densityDpi: Int): Int {
         val dpi = densityDpi.coerceAtLeast(160)
-        return (DIVIDER_DP * dpi / 160f).toInt().coerceAtLeast(8)
+        return (DIVIDER_DP * dpi / 160f).toInt().coerceAtLeast(1)
     }
 
     fun isValid(pane: Int): Boolean = pane == PRIMARY || pane == SECONDARY

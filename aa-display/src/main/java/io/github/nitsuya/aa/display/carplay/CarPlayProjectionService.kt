@@ -20,7 +20,8 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * Foreground service owning [CarPlaySourceSession] for wireless CarPlay Source egress.
  *
- * Registers as the [ShellFrameEgress] sink so AA UI never imports this class.
+ * Still registers a [ShellFrameEgress] sink (AA must not import this class) but exclusive
+ * channel policy ignores AA shell frames — CarPlay paints only via Host GL.
  */
 class CarPlayProjectionService : Service() {
     companion object {
@@ -143,15 +144,24 @@ class CarPlayProjectionService : Service() {
     }
 
     private fun ensureSession() {
-        if (session != null) return
+        if (session != null) {
+            CarPlayHostRuntime.ensureStartedSync(this, timeoutMs = 5_000L)
+            glCompositorRef.get()?.let { session?.attachGlCompositor(it) }
+            return
+        }
         Log.i(CarPlayConsts.TAG, "CarPlayProjectionService CONNECT")
+        // Sync Host before session: SETUP must see glCompositor, not tee test-pattern.
+        val hostOk = CarPlayHostRuntime.ensureStartedSync(this, timeoutMs = 5_000L)
+        Log.i(CarPlayConsts.TAG, "CarPlayProjectionService hostRuntime=$hostOk")
         val s = CarPlaySourceSession(applicationContext)
         session = s
         sessionRef.set(s)
-        glCompositorRef.get()?.let { s.attachGlCompositor(it) }
+        (glCompositorRef.get() ?: CarPlayHostRuntime.compositorOrNull())?.let {
+            glCompositorRef.set(it)
+            s.attachGlCompositor(it)
+        }
         s.start()
-        // AA may have offered the shell before this session existed — replay it.
-        ShellFrameEgress.rebindSink()
+        CarPlayHostActivity.launch(this)
         reportLive(true)
     }
 
@@ -160,6 +170,7 @@ class CarPlayProjectionService : Service() {
         session?.stop()
         session = null
         sessionRef.set(null)
+        CarPlayHostRuntime.stop(reason)
         reportLive(false)
         stopForeground(STOP_FOREGROUND_REMOVE)
     }

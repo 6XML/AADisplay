@@ -5,24 +5,25 @@
     android:layout_height="wrap_content"
     android:gravity="center_horizontal"
     android:orientation="vertical"
-    android:paddingHorizontal="6dp"
-    android:paddingVertical="10dp">
+    android:paddingHorizontal="4dp"
+    android:paddingVertical="8dp">
 
     <ImageView
         android:id="@+id/iv_icon"
-        android:layout_width="48dp"
-        android:layout_height="48dp"
+        android:layout_width="52dp"
+        android:layout_height="52dp"
+        android:scaleType="fitCenter"
         tools:src="@mipmap/ic_launcher" />
 
     <TextView
         android:id="@+id/tv_label"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="6dp"
+        android:layout_marginTop="5dp"
         android:ellipsize="end"
         android:gravity="center_horizontal"
         android:maxLines="2"
-        android:textColor="#FFFFFF"
-        android:textSize="12sp"
+        android:textColor="#E6FFFFFF"
+        android:textSize="11sp"
         tools:text="Maps" />
 </LinearLayout>
