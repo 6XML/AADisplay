@@ -112,23 +112,36 @@ class CarPlayAudioEgress(
         // while phone mute is already on. Flush that pre-TX backlog so DiPlay does not
         // start ~100–200ms behind the phone tap.
         flushPreTxBacklog(profile)
-        // Absolute cadence: at most one packet per PACKET_INTERVAL. Mild "catch-up"
-        // bursts (sleepNs in (-60ms, 0]) used to fire several UDP packets in one wall
-        // slice and DiPlay's jitter buffer grew without bound — audio lag 积压越来越长.
+        // Absolute cadence: at most one packet per interval. Mild "catch-up" bursts used
+        // to fire several UDP packets in one wall slice and DiPlay's jitter FIFO grew
+        // without bound (queue=192 ≈ 3.8s, drop-newest keeps stale PCM).
         var nextPacketAt = System.nanoTime()
+        // Media only: DiPlay starts AudioTrack on the first RTP, then createTrack() runs
+        // on its worker while we would still be flooding — UDP+queue pin at 192 forever.
+        // Arm with one packet, pause so createTrack can finish, then under-send briefly
+        // to bleed any residue (we cannot change the HU).
+        val paceHuStartup = profile.audioType == "media"
+        var huSettlePending = paceHuStartup
+        var softPaceUntilNs = 0L
         try {
             while (running.get()) {
+                val intervalNs =
+                    if (softPaceUntilNs != 0L && System.nanoTime() < softPaceUntilNs) {
+                        SOFT_PACE_INTERVAL_NS
+                    } else {
+                        PACKET_INTERVAL_NS
+                    }
                 val now = System.nanoTime()
                 val sleepNs = nextPacketAt - now
                 if (sleepNs > 0L) {
                     val ms = sleepNs / 1_000_000L
                     val ns = (sleepNs % 1_000_000L).toInt()
                     Thread.sleep(ms, ns)
-                } else if (sleepNs < -PACKET_INTERVAL_NS) {
+                } else if (sleepNs < -intervalNs) {
                     // Late: never burst-send. Drop the missed duration of PCM so the
                     // next packet is live, then realign the schedule to wall clock.
                     val behindPackets =
-                        ((-sleepNs) / PACKET_INTERVAL_NS).toInt().coerceIn(1, MAX_DISCARD_PACKETS)
+                        ((-sleepNs) / intervalNs).toInt().coerceIn(1, MAX_DISCARD_PACKETS)
                     Log.i(
                         CarPlayConsts.TAG,
                         "CarPlay ${profile.label} audio cadence drop-live " +
@@ -228,7 +241,31 @@ class CarPlayAudioEgress(
                             "pulled=${pulledTotal / 1024}KB",
                     )
                 }
-                nextPacketAt += PACKET_INTERVAL_NS
+                nextPacketAt += intervalNs
+
+                if (huSettlePending && packets == 1) {
+                    huSettlePending = false
+                    Log.i(
+                        CarPlayConsts.TAG,
+                        "CarPlay ${profile.label} audio HU settle pause ${HU_SETTLE_MS}ms " +
+                            "(DiPlay createTrack window)",
+                    )
+                    val settleEnd = System.nanoTime() + HU_SETTLE_MS * 1_000_000L
+                    while (running.get() && System.nanoTime() < settleEnd) {
+                        try {
+                            profile.pull(bytesPerPacket)
+                        } catch (_: Throwable) {
+                        }
+                        Thread.sleep(PACKET_INTERVAL_MS)
+                    }
+                    softPaceUntilNs = System.nanoTime() + SOFT_PACE_MS * 1_000_000L
+                    nextPacketAt = System.nanoTime()
+                    Log.i(
+                        CarPlayConsts.TAG,
+                        "CarPlay ${profile.label} audio soft-pace ${SOFT_PACE_MS}ms " +
+                            "intervalMs=${SOFT_PACE_INTERVAL_NS / 1_000_000L}",
+                    )
+                }
             }
         } catch (e: Throwable) {
             if (running.get()) Log.w(CarPlayConsts.TAG, "CarPlay ${profile.label} audio TX ended", e)
@@ -260,6 +297,14 @@ class CarPlayAudioEgress(
         private const val AMPLITUDE = 0.25
         private const val PACKET_INTERVAL_MS = 20L
         private const val PACKET_INTERVAL_NS = PACKET_INTERVAL_MS * 1_000_000L
+        /**
+         * After the first media RTP, DiPlay's audio worker is still in createTrack().
+         * Pause so its queue does not fill to 192 (~3.8s) before the consumer runs.
+         */
+        private const val HU_SETTLE_MS = 1_200L
+        /** ~10% under realtime to bleed any residual HU FIFO after settle. */
+        private const val SOFT_PACE_INTERVAL_NS = PACKET_INTERVAL_NS * 11 / 10
+        private const val SOFT_PACE_MS = 8_000L
         /** Cap discard work on a late tick (~1s) so Binder cannot stall the TX thread. */
         private const val MAX_DISCARD_PACKETS = 50
         private const val PAYLOAD_TYPE = 96

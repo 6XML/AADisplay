@@ -101,10 +101,12 @@
             android:foregroundServiceType="connectedDevice" />
         <!-- Re-arm cafe RFCOMM after reboot / replace / unlock / BT ON (channel=CarPlay).
              Z Flip often brings BT (A2DP sound) up before BOOT_COMPLETED; STATE_ON must
-             arm …cafe before DiPlay SDP backs off. -->
+             arm …cafe before DiPlay SDP backs off.
+             Must be exported=true: targetSdk 36 + exported=false drops system
+             BOOT_COMPLETED / USER_UNLOCKED / BT STATE_CHANGED, so cafe never listens. -->
         <receiver
             android:name=".carplay.CarPlayAutoArmReceiver"
-            android:exported="false">
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.USER_UNLOCKED" />

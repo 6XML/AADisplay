@@ -6,7 +6,8 @@
 - **Recent 卡片图标美化：** 放大 × 居中盖在图标上（不再独占上方一行）；图标约 72dp（分屏列按槽高放大，`fitCenter` 不形变）；CarPlay Canvas Recents 同几何与命中对齐。
 
 ### Fixed
-- **DiPlay 音频比手机端明显滞后：** session-live 已武装采集、RTSP 音频 SETUP 更晚才 TX，环先堆到 LIVE_LOW；再叠加 `audioLatencyMs=140` 与 120–240ms 粘滞水位，车机开播就固定落后。TX 启动前冲掉预缓冲；水位 100→40ms、环硬上限约 200ms；`audioLatencyMs` 80 / screen `latencyMs` 60。
+- **重启后 CarPlay 连不上：** `CarPlayAutoArmReceiver` 在 targetSdk 36 下 `exported=false`，系统不投递 `BOOT_COMPLETED` / `USER_UNLOCKED` / BT `STATE_CHANGED`，`…cafe` 无 listen，DiPlay SDP 失败。改为 `exported=true`。
+- **DiPlay 音频落后好几秒（只改手机 Source）：** 真机 `DiPlay-AudioStats` 坐实 HU `queue=192`（≈3.8s）满时丢最新留最旧；首包触发 DiPlay `createTrack` 时我们仍在灌包，队列钉死。车机不动：media 首包后 settle 1.2s（丢采集），再 8s 按 22ms 软慢发泄残量；TX 前冲预缓冲；水位 100→40ms；`audioLatencyMs` 80 / screen `latencyMs` 60。
 - **CarPlay 又突然没声音（手机也静音）：** `PcmRing.pull` 环绕拷贝误用 `available - off`，在 `available == 2*(capacity-tail)` 时 `chunk==0` 持锁死循环；Binder `pullCarPlayAudio` 全堵、采集写线程一起堵，egress 发不出 PCM 且 session-live 本地静音不解除。改为按 `min(take-off, available, capacity-tail)` 拷贝并 `chunk<=0` 退出；write 丢弃改为向上对齐，避免 `available > capacity`。
 - **DiPlay 连上后声音仍在 Z Flip 扬声器（adb 坐实）：** `MediaProjection` 获取失败 → `remote-submix` → `skip local mute`（`phoneMuted=false`），车机有 PCM 但本机 SPEAKER 仍响。根因：system_server 同进程调 `BinderService.createProjection` 时 `checkCallingPermission` 因 `callingPid==myPid` 恒拒绝；三星无 `createProjectionInternal`。改为直接构造 `MediaProjectionManagerService$MediaProjection`（绕过 Binder 门禁）走 playback-capture + 本地静音。顺带：采集启停跟 FGS `reportCarPlaySessionLive`，软重连 TEARDOWN 不再 disarm；mute 跳过三星不认的 `STREAM_VOICE_ASSISTANCE(13)`（曾 `Bad stream type` 把整次 arm 打回 idle）。
 - **Z Flip 重启后先有声、DiPlay 画面很久才上：** (1) 开机 BT/A2DP 常早于 `BOOT_COMPLETED`，DiPlay 先挂经典音频并对 `…cafe` SDP 失败退避 → AutoArm 增听 `BT STATE_ON` / `USER_UNLOCKED` + 0/3/12/30s 阶梯；(2) RTSP 线程 `onVideoSetup` 只 post 编码器、随即 SETUP 音频 → 改为 `ensureEncoder` 同步等待（≤8s）再开音频；(3) 开机 `CoreApi` 桥未就绪时 `onCreateSplitDisplay` 静默跳过 → HostRuntime 500ms×12 重试；默认应用启动 2s→400ms。
