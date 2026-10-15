@@ -105,6 +105,29 @@ object CoolwalkRailMath {
     }
 
     /**
+     * Coolwalk has expanded / is expanding to full HU — safe to clear sub-rail horizontal
+     * insets (e.g. ~16px decoration) that [railPxRange] would leave behind. Gated so
+     * Bootstrapping / RailPresent never strip unrelated chrome.
+     */
+    fun isCoolwalkInsetReclaimActive(snapshot: RailSnapshot): Boolean {
+        if (snapshot.fullHuWidthPx <= 0) return false
+        return snapshot.phase == RailPhase.FullBleed ||
+            snapshot.phase == RailPhase.Reclaiming ||
+            snapshot.fullBleedStableCount > 0
+    }
+
+    /**
+     * Residual left/right content_insets below the absolute facet-rail floor (32px).
+     * At 144dpi ~16px ≈ 2–3mm — full-bleed pixels at HU origin while AA still applies
+     * this inset → uniform touch shift. Only when [isCoolwalkInsetReclaimActive].
+     */
+    fun shouldZeroResidualCoolwalkInset(edgePx: Int, snapshot: RailSnapshot): Boolean {
+        if (edgePx <= 0) return false
+        if (edgePx >= absoluteFacetRailBand().first) return false
+        return isCoolwalkInsetReclaimActive(snapshot)
+    }
+
+    /**
      * HU x offset: full head-unit origin → content-slot / presentation origin (compositor blX).
      * Derived from observed full vs content slot, not a per-resolution table.
      */
@@ -114,7 +137,17 @@ object CoolwalkRailMath {
         ) {
             return 0
         }
+        // Layout already promoted to full HU and effective rail starved — do not keep
+        // remapping with a stale contentSlot (visual blX is 0; subtracting shifts touches).
         val full = snapshot.fullHuWidthPx
+        if (full > 0 &&
+            snapshot.layoutWidthPx > 0 &&
+            abs(snapshot.layoutWidthPx - full) <= 2 &&
+            snapshot.effectiveRailWidthPx == 0 &&
+            (snapshot.phase == RailPhase.Reclaiming || snapshot.phase == RailPhase.FullBleed)
+        ) {
+            return 0
+        }
         val slot = snapshot.contentSlotWidthPx.takeIf { it > 0 }
             ?: snapshot.layoutWidthPx.takeIf { full > 0 && it in 1 until full }
             ?: 0

@@ -14,6 +14,7 @@ import io.github.nitsuya.aa.display.util.DisplayProfileSettle
 import io.github.nitsuya.aa.display.xposed.util.log
 import io.github.nitsuya.aa.display.xposed.util.logDebug
 import java.lang.reflect.Modifier
+import kotlin.math.abs
 
 object AaCoolwalkLayoutHook {
 
@@ -69,10 +70,11 @@ object AaCoolwalkLayoutHook {
     private fun forceVerticalRailOnLayoutInfoArgs(env: CoolwalkHookEnv, args: Array<Any?>) {
         if (args.size < 6) return
         if (isAuxiliaryLayoutType(args)) return
-        val densityDpi = resolveLayoutInfoDensityDpi()
         val rawW = args[1] as? Int ?: 0
         val rawH = args[2] as? Int ?: 0
         // Ctor args are dp; coordinator / content_bounds / DrawingSpec use px.
+        // Density must match AA's LayoutInfo basis — not a pinned VD that reports 160.
+        val densityDpi = resolveLayoutInfoDensityDpi(rawW)
         val widthPx = CoolwalkRailMath.layoutInfoDpToPx(rawW, densityDpi)
         val heightPx = CoolwalkRailMath.layoutInfoDpToPx(rawH, densityDpi)
         if (widthPx > 0) env.mLayoutWidthDp = widthPx
@@ -106,10 +108,23 @@ object AaCoolwalkLayoutHook {
     }
 
     /**
-     * HU / projection density for LayoutInfo dp↔px. Prefer live landscape VirtualDevice;
-     * fall back to manual override / last HU dpi (e.g. user-selected 144).
+     * Density AA used for LayoutInfo **dp** (not necessarily the pinned split-VD dpi).
+     *
+     * Blind [Display.getRealMetrics] `.densityDpi` on VirtualDevice often stays
+     * [DisplayMetrics.DENSITY_DEFAULT] (160) while LayoutInfo was authored at true HU
+     * density (e.g. 144). Using 160 turns 1422dp into 1422px instead of 1280 → profile /
+     * DrawingSpec larger than the physical surface → “large content on small screen”
+     * crop (left clipped, right peel gone). Prefer stored HU / manual density; only trust
+     * live dpi when it round-trips to that display's [DisplayMetrics.widthPixels].
      */
-    private fun resolveLayoutInfoDensityDpi(): Int {
+    private fun resolveLayoutInfoDensityDpi(rawWidthDp: Int): Int {
+        val range = DisplayDpiStore.MIN_DPI..DisplayDpiStore.MAX_DPI
+        val cr = runCatching { InitFields.appContext.contentResolver }.getOrNull()
+        val huLast = DisplayDpiStore.loadLastHuReported(cr)
+        val configured = DisplayDpiStore.loadConfigured(cr)
+
+        data class LiveHu(val widthPx: Int, val densityDpi: Int, val namedProjection: Boolean)
+        val live = ArrayList<LiveHu>(4)
         runCatching {
             val dm = InitFields.appContext.getSystemService(DisplayManager::class.java) ?: return@runCatching
             for (display in dm.displays) {
@@ -121,18 +136,44 @@ object AaCoolwalkLayoutHook {
                 val metrics = DisplayMetrics()
                 @Suppress("DEPRECATION")
                 display.getRealMetrics(metrics)
-                if (metrics.widthPixels >= metrics.heightPixels &&
-                    metrics.densityDpi in DisplayDpiStore.MIN_DPI..DisplayDpiStore.MAX_DPI
-                ) {
-                    return metrics.densityDpi
-                }
+                val dpi = metrics.densityDpi
+                if (metrics.widthPixels < metrics.heightPixels || dpi !in range) continue
+                val named = name.contains("VirtualDevice", ignoreCase = true) ||
+                    name.contains("gearhead", ignoreCase = true) ||
+                    name.contains("projection", ignoreCase = true)
+                live.add(LiveHu(metrics.widthPixels, dpi, named))
             }
         }
-        val cr = runCatching { InitFields.appContext.contentResolver }.getOrNull()
-        val configured = DisplayDpiStore.loadConfigured(cr)
-        if (configured in DisplayDpiStore.MIN_DPI..DisplayDpiStore.MAX_DPI) return configured
-        val huLast = DisplayDpiStore.loadLastHuReported(cr)
-        if (huLast in DisplayDpiStore.MIN_DPI..DisplayDpiStore.MAX_DPI) return huLast
+        val ordered = live.filter { it.namedProjection } + live.filter { !it.namedProjection }
+
+        fun matchesLiveGeometry(dpi: Int): Boolean {
+            if (rawWidthDp <= 0 || live.isEmpty()) return live.isEmpty()
+            val px = CoolwalkRailMath.layoutInfoDpToPx(rawWidthDp, dpi)
+            return live.any { row ->
+                abs(px - row.widthPx) <= 2 ||
+                    CoolwalkRailMath.isContentSlotVsFull(row.widthPx, px) ||
+                    CoolwalkRailMath.isContentSlotVsFull(px, row.widthPx)
+            }
+        }
+
+        fun exactWidthMatch(dpi: Int, widthPx: Int): Boolean {
+            if (rawWidthDp <= 0) return false
+            return abs(CoolwalkRailMath.layoutInfoDpToPx(rawWidthDp, dpi) - widthPx) <= 2
+        }
+
+        // Stored HU / manual first — LayoutInfo dp basis; reject when live width contradicts.
+        if (huLast in range && matchesLiveGeometry(huLast)) return huLast
+        if (configured in range && matchesLiveGeometry(configured)) return configured
+
+        // Live densityDpi only when self-consistent with widthPixels (rejects default-160 lies).
+        for (row in ordered) {
+            if (exactWidthMatch(row.densityDpi, row.widthPx)) return row.densityDpi
+        }
+
+        // Do not fall back to a live densityDpi that failed the width check — that is how
+        // 160-default VirtualDevice inflated 144dpi LayoutInfo (1422dp→1422px).
+        if (huLast in range) return huLast
+        if (configured in range) return configured
         return DisplayMetrics.DENSITY_DEFAULT
     }
 

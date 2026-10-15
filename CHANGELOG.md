@@ -21,6 +21,11 @@
 - **CarPlay 稳定性：** `drainLoop` 整次迭代隔离异常 — codec 被并发 `start()/stop()` 释放后 `getOutputFormat` 不再 FATAL 崩进程（真机 re-SETUP 触发）；`ensureEncoder` 去重（`onVideoSetup` + `onSessionReady` 同 tick 双 start 与释放竞态）；`FrameEgressTee` start/stop 串行化到主 looper（worker 线程 re-SETUP 不再与 pump 竞态回收 bitmap）。
 - **出口通道选择（AA / CarPlay）：** `CarPlayChannel` app 侧持久化选择（默认 **AA** — 真车行为不变）；状态页新增「出口通道」单选（Android Auto / CarPlay）：选 CarPlay 启 Source（AA 未附时自动开仅 CP Host 分屏），切回 AA 即停 Source；FGS 系统重启（null intent）仅在用户选 CarPlay 时重新武装，杜绝 zombie 重启乱拨。状态行显示通道 / 会话 / 内容源（AA 壳 tee 双通道、Host 分屏、测试图）。
 
+### Fixed
+- **低 DPI（144 类）车机 Coolwalk 布局放大裁切（左裁切 / 右 peel 消失）：** `AaCoolwalkLayoutHook` 重写 LayoutInfo dp↔px 密度结算 — 优先存储的 HU 上报 DPI（`aadisplay_vd_density_hu_last`，经活体显示宽度交叉验证：dp 折算须回中 widthPixels 或单轨 slot 缺口），再手动 pin，活体 `densityDpi` 仅在自洽时采信 — 杜绝 160-default VirtualDevice 把 1422dp 放大成 1422px（@144 应为 1280px）导致 profile / DrawingSpec 超物理表面。
+- **亚轨残余 `content_insets`（~16px @144dpi）造成触控整体平移：** 仅在 Reclaiming / FullBleed 相位清零（新增 `CoolwalkRailMath.shouldZeroResidualCoolwalkInset`，Bootstrapping / RailPresent 不动）；亚轨残余**不再**写入 touchRail（只有轨带内边沿更新），避免污染 HU 触控偷渡带。
+- **全幅后 compositor inset 陈旧重映射：** `compositorLeftInsetPx` 在 layout 已晋升 full HU 且有效轨已饿死（`effectiveRailWidthPx==0`，Reclaiming / FullBleed）时返回 0 — 视觉 blX 已 0，继续减 stale slot 会整体偏 touch inject；compositor `systemInsets` 清除仅限 Coolwalk 尺寸边沿（32–160px 带），不再误伤无关 chrome。
+
 
 ## 0.24#17.4-r14
 

@@ -67,10 +67,15 @@ object CoolwalkProjectionBoundsHook {
                 if (expandTrX) {
                     param.args[2] = fullHint
                 }
-                // systemInsets Rect (if present) often mirrors the left rail.
+                // systemInsets often mirrors the left rail / sub-rail residual (~16px).
+                // Only clear Coolwalk-sized edges — do not strip unrelated chrome.
                 (param.args.getOrNull(5) as? Rect)?.let { insets ->
-                    if (insets.left in 8..240) {
+                    val absBand = CoolwalkRailMath.absoluteFacetRailBand()
+                    if (insets.left in 1..absBand.last) {
                         insets.left = 0
+                    }
+                    if (insets.right in 1..absBand.last) {
+                        insets.right = 0
                     }
                 }
                 val slotAfter = (param.args[2] as Int) - 0

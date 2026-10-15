@@ -399,29 +399,35 @@ object AaCoolwalkProjectionHook {
 
     private fun applyZeroedContentInsets(env: CoolwalkHookEnv, rect: Rect): Rect? {
         val before = Rect(rect)
+        CoolwalkRailCoordinator.syncExternalTruth(InitFields.appContext.contentResolver)
+        val snap = CoolwalkRailCoordinator.current()
         val range = CoolwalkRailMath.railPxRange(
             env.layoutWidthPx().takeIf { it > 0 } ?: rect.left.coerceAtLeast(rect.right) * 10,
         )
         var changed = false
-        if (rect.left in range) {
-            val actions = CoolwalkRailCoordinator.onEvent(
-                RailEvent.RailWidthObserved(rect.left, "content_insets-left"),
-            ).second
-            CoolwalkRailCoordinator.dispatchActions(actions)
-            rect.left = 0
+        fun zeroHorizontalEdge(isLeft: Boolean) {
+            val edge = if (isLeft) rect.left else rect.right
+            if (edge <= 0) return
+            val inRailBand = edge in range
+            val residual = CoolwalkRailMath.shouldZeroResidualCoolwalkInset(edge, snap)
+            if (!inRailBand && !residual) return
+            // Only rail-sized edges update touchRail — sub-rail residuals must not poison it.
+            if (inRailBand) {
+                val reason = if (isLeft) "content_insets-left" else "content_insets-right"
+                val actions = CoolwalkRailCoordinator.onEvent(
+                    RailEvent.RailWidthObserved(edge, reason),
+                ).second
+                CoolwalkRailCoordinator.dispatchActions(actions)
+            }
+            if (isLeft) rect.left = 0 else rect.right = 0
             changed = true
         }
-        if (rect.right in range) {
-            val actions = CoolwalkRailCoordinator.onEvent(
-                RailEvent.RailWidthObserved(rect.right, "content_insets-right"),
-            ).second
-            CoolwalkRailCoordinator.dispatchActions(actions)
-            rect.right = 0
-            changed = true
-        }
+        zeroHorizontalEdge(isLeft = true)
+        zeroHorizontalEdge(isLeft = false)
         if (!changed) return null
         env.logProjectionConfigRewriteOnce(
-            "AaUiHook: content_insets zeroed $before→$rect layout=${env.layoutWidthPx()}x${env.layoutHeightPx()}",
+            "AaUiHook: content_insets zeroed $before→$rect layout=${env.layoutWidthPx()}x${env.layoutHeightPx()}" +
+                " phase=${snap.phase}",
         )
         return rect
     }
