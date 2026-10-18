@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.3#17.8-r1
+
+### Fixed
+- **Android Auto 17.8 AutoOpen 失效：** gearhead 删除 `CarSystemUiControllerService`；`CarUiEntry.startCarActivity` 又会 `Unsupported intent` 拒 OEM 壳。改为 DexKit 定位 GH.ProjectionContext 启动器（针 `startCarActivity(intent:%s, activityOptions:%s)` → `(Intent, Options)V` + 静态单例 getter）；勿选同班 lifetime 空操作 `(Intent)V`。≤17.4 仍走 SysUi。媒体白名单 DexKit 针补充 `allow_unknown_sources` 等 17.8 字符串。（自 `AADisplay-Split-Lite` 合入）
+
+### Changed
+- **Version bump to `0.3#17.8-r1`** (`versionCode` 3101)。CarPlay 分支基于 r17，目标 Android Auto **17.8**；主版本 `0.24` → `0.3`。
+
 ## 0.24#17.4-r17 — 奥迪无线 CarPlay 音频稳定
 
 versionCode **3077** / versionName **0.24#17.4-r17**。相对 r14：建连可靠、AAC 长播、方控语义、MainAudio 资源管理收口。
@@ -104,7 +112,6 @@ versionCode **3077** / versionName **0.24#17.4-r17**。相对 r14：建连可靠
 - **低 DPI（144 类）车机 Coolwalk 布局放大裁切（左裁切 / 右 peel 消失）：** `AaCoolwalkLayoutHook` 重写 LayoutInfo dp↔px 密度结算 — 优先存储的 HU 上报 DPI（`aadisplay_vd_density_hu_last`，经活体显示宽度交叉验证：dp 折算须回中 widthPixels 或单轨 slot 缺口），再手动 pin，活体 `densityDpi` 仅在自洽时采信 — 杜绝 160-default VirtualDevice 把 1422dp 放大成 1422px（@144 应为 1280px）导致 profile / DrawingSpec 超物理表面。
 - **亚轨残余 `content_insets`（~16px @144dpi）造成触控整体平移：** 仅在 Reclaiming / FullBleed 相位清零（新增 `CoolwalkRailMath.shouldZeroResidualCoolwalkInset`，Bootstrapping / RailPresent 不动）；亚轨残余**不再**写入 touchRail（只有轨带内边沿更新），避免污染 HU 触控偷渡带。
 - **全幅后 compositor inset 陈旧重映射：** `compositorLeftInsetPx` 在 layout 已晋升 full HU 且有效轨已饿死（`effectiveRailWidthPx==0`，Reclaiming / FullBleed）时返回 0 — 视觉 blX 已 0，继续减 stale slot 会整体偏 touch inject；compositor `systemInsets` 清除仅限 Coolwalk 尺寸边沿（32–160px 带），不再误伤无关 chrome。
-
 
 ## 0.24#17.4-r14
 

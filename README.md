@@ -12,7 +12,7 @@
 
 | 项 | 说明 |
 |----|------|
-| 当前版本 | `0.24#17.4-r14`（`versionCode` 3074） |
+| 当前版本 | `0.3#17.8-r1`（`versionCode` 3101） |
 | 变更记录 | [CHANGELOG.md](CHANGELOG.md) |
 | 历史版本说明 | [docs/archive/](docs/archive/) |
 | 开发者 / AI | [AGENTS.md](AGENTS.md)、运行时链路 [docs/EXECUTION.md](docs/EXECUTION.md) |
@@ -48,7 +48,7 @@
 
 - **仪表横条歌词**：QQ 音乐车载、QQ 音乐 HD、汽水——三源同时只能一个播放，谁在播仪表跟谁；AA 顶栏同步歌词。
 - **音视频单发声**：音乐 、 抖音（AvMedia）同时只留一个发声；地图 / 浏览器压顶不会自动抢掉正在播的音乐。
-- **Android Auto 17.4 兼容**：**初次连接**须先装 Google App、Google Maps、Google 语音服务（TTS）完成 AA 首次设置；**过后可卸载**，模块会绕过 FRX 安装检查。抑制空媒体卡；锁屏下全屏把手仍可用。
+- **Android Auto 17.8 兼容**（亦覆盖 17.4）：**初次连接**须先装 Google App、Google Maps、Google 语音服务（TTS）完成 AA 首次设置；**过后可卸载**，模块会绕过 FRX 安装检查。抑制空媒体卡；锁屏下全屏把手仍可用。
 - **虚拟屏后仍支持方向盘控制**（短按注入焦点窗；直播等场景 next/prev 可能改写为滑动）。
 
 ---

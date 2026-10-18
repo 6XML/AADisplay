@@ -22,7 +22,16 @@ import java.lang.reflect.Modifier
 class CoolwalkHookEnv {
 
     var layoutInfoConstructors: List<Constructor<*>> = emptyList()
+    /**
+     * CarActivity launch entry:
+     * - ≤17.4: static SysUi `a(Intent)`
+     * - 17.8+: instance ProjectionContext launcher `i(Intent)` (+ [startSingletonGetter])
+     */
     var startMethod: Method? = null
+    /** Static no-arg getter returning the ProjectionContext launcher singleton (17.8+). */
+    var startSingletonGetter: Method? = null
+    /** Fallback receiver when no singleton getter (legacy instance capture). */
+    @Volatile var startReceiver: Any? = null
     @Volatile var hasVerticalRailField: Field? = null
     @Volatile var layoutResourceIdField: Field? = null
     var contentBoundsMethods: List<Method> = emptyList()
@@ -177,19 +186,23 @@ class CoolwalkHookEnv {
         return matched
     }
 
-    fun resolveCarStartActivityMethod(): Method? {
+    /**
+     * Name-based fallback only (≤17.4 SysUi). 17.8 ProjectionContext launcher must be
+     * resolved via DexKit ([resolveProjectionLauncherStart]).
+     */
+    fun resolveLegacyCarStartActivityMethod(): Method? {
         val clazz = try {
-            loadClass("com.google.android.projection.gearhead.service.CarSystemUiControllerService")
-        } catch (e: Throwable) {
-            log(TAG, "AaUiHook: CarSystemUiControllerService missing", e)
+            loadClass(CAR_SYSTEM_UI_CONTROLLER_SERVICE)
+        } catch (_: Throwable) {
             return null
         }
         try {
             return clazz.staticMethod("a", null, argTypes(Intent::class.java)).also {
-                logDebug(TAG, "AaUiHook: startMethod=a(Intent)")
+                startSingletonGetter = null
+                logDebug(TAG, "AaUiHook: startMethod=SysUi.a(Intent)")
             }
-        } catch (e: Throwable) {
-            log(TAG, "AaUiHook: CarSystemUiControllerService.a missing, scanning static Intent methods", e)
+        } catch (_: Throwable) {
+            logDebug(TAG, "AaUiHook: SysUi.a missing, scanning static Intent methods")
         }
         val candidates = clazz.declaredMethods.filter { m ->
             Modifier.isStatic(m.modifiers) &&
@@ -200,18 +213,101 @@ class CoolwalkHookEnv {
         val picked = candidates.firstOrNull()
         if (picked != null) {
             picked.isAccessible = true
+            startSingletonGetter = null
             logDebug(
                 TAG,
-                "AaUiHook: startMethod fallback=${picked.name}(Intent) candidates=${candidates.map { it.name }}",
+                "AaUiHook: startMethod=SysUi.${picked.name}(Intent) " +
+                    "candidates=${candidates.map { it.name }}",
             )
-        } else {
-            log(TAG, "AaUiHook: no static Intent start method on CarSystemUiControllerService")
         }
         return picked
     }
 
+    /**
+     * AA 17.8+: GH.ProjectionContext launcher — use the DexKit needle method itself
+     * (`startCarActivity(intent:%s, activityOptions:%s)` → `(Intent, Options)V`).
+     * Do **not** pick a random `(Intent)V` on the class: sibling `e` is a lifetime no-op.
+     */
+    fun resolveProjectionLauncherStart(needleMethod: Method): Boolean {
+        val hostClass = needleMethod.declaringClass
+        val params = needleMethod.parameterTypes
+        if (params.size < 2 || params[0] != Intent::class.java) {
+            log(
+                TAG,
+                "AaUiHook: ProjectionContext needle expected (Intent, Options)V got $needleMethod",
+            )
+            return false
+        }
+        if (needleMethod.returnType != Void.TYPE && needleMethod.returnType != Void::class.java) {
+            log(TAG, "AaUiHook: ProjectionContext needle not void: $needleMethod")
+            return false
+        }
+        // Options type must be constructible (empty ActivityOptions holder).
+        val optionsCtor = runCatching {
+            params[1].getDeclaredConstructor().also { it.isAccessible = true }
+        }.getOrNull()
+        if (optionsCtor == null) {
+            log(TAG, "AaUiHook: ProjectionContext options type has no no-arg ctor: ${params[1].name}")
+            return false
+        }
+        needleMethod.isAccessible = true
+        val getter = hostClass.declaredMethods.firstOrNull { m ->
+            Modifier.isStatic(m.modifiers) &&
+                m.parameterCount == 0 &&
+                m.returnType == hostClass
+        }
+        if (getter == null) {
+            log(TAG, "AaUiHook: ProjectionContext singleton getter missing on ${hostClass.name}")
+            return false
+        }
+        getter.isAccessible = true
+        startMethod = needleMethod
+        startSingletonGetter = getter
+        logDebug(
+            TAG,
+            "AaUiHook: startMethod=ProjectionContext.${needleMethod.name}" +
+                "(Intent, ${params[1].simpleName}) getter=${getter.name} class=${hostClass.name}",
+        )
+        return true
+    }
+
+    /** Invoke startMethod: static / singleton getter / captured receiver. */
+    fun invokeStartCarActivity(intent: Intent) {
+        val method = startMethod ?: throw IllegalStateException("startMethod null")
+        if (Modifier.isStatic(method.modifiers)) {
+            method.invoke(null, intent)
+            return
+        }
+        val getter = startSingletonGetter
+        val receiver = if (getter != null) {
+            getter.invoke(null)
+                ?: throw NullPointerException("ProjectionContext singleton null (not connected)")
+        } else {
+            startReceiver
+                ?: throw NullPointerException("startReceiver null")
+        }
+        when (method.parameterTypes.size) {
+            1 -> method.invoke(receiver, intent)
+            2 -> {
+                val optionsType = method.parameterTypes[1]
+                val options = optionsType.getDeclaredConstructor().newInstance()
+                method.invoke(receiver, intent, options)
+            }
+            else -> throw IllegalStateException(
+                "startMethod unexpected arity ${method.parameterTypes.size}: $method",
+            )
+        }
+    }
+
     companion object {
         const val TAG = "AAD_AaUiHook"
+
+        const val CAR_SYSTEM_UI_CONTROLLER_SERVICE =
+            "com.google.android.projection.gearhead.service.CarSystemUiControllerService"
+
+        /** DexKit needle on GH.ProjectionContext launcher (17.8+ AutoOpen). */
+        const val PROJECTION_START_NEEDLE =
+            "startCarActivity(intent:%s, activityOptions:%s)"
 
         val RAIL_WIDTH_DIMEN_NAMES = arrayOf(
             "cielo_vertical_rail_width",
