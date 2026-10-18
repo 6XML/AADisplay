@@ -56,13 +56,16 @@ object AaMediaAllowlistHook : AaHook() {
 
     override fun loadDexClass(bridge: DexKitBridge, lpparam: XC_LoadPackage.LoadPackageParam) {
         val needles = listOf(
+            "allow_unknown_sources",
             "unknown_sources",
             "Unknown sources",
             "unknown sources",
             "ENABLE_UNKNOWN_SOURCES",
+            "UnknownSources",
             "not installed from the Play Store",
             "sideload",
             "third-party media",
+            "LIFETIME_IS_SIDELOADED",
         )
         val found = linkedMapOf<String, Method>()
         for (needle in needles) {

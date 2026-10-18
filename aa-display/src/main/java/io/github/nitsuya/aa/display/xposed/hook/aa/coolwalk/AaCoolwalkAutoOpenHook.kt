@@ -8,6 +8,8 @@ import android.os.SystemClock
 import com.github.kyuubiran.ezxhelper.init.InitFields
 import com.github.kyuubiran.ezxhelper.utils.hookAfter
 import com.github.kyuubiran.ezxhelper.utils.loadClass
+import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import io.github.nitsuya.aa.display.BuildConfig
 import io.github.nitsuya.aa.display.service.AaActivityService
@@ -26,10 +28,26 @@ object AaCoolwalkAutoOpenHook {
     private var lastFullBleedRelaunchScheduleUptimeMs = -1L
 
     fun install(env: CoolwalkHookEnv, lpparam: XC_LoadPackage.LoadPackageParam) {
-        logDebug(CoolwalkHookEnv.TAG, "AaUiHook: AutoOpen always-on startMethod=${env.startMethod?.name}")
+        val start = env.startMethod
+        logDebug(
+            CoolwalkHookEnv.TAG,
+            "AaUiHook: AutoOpen always-on startMethod=" +
+                (start?.let {
+                    val kind = if (Modifier.isStatic(it.modifiers)) "static" else "instance"
+                    "${it.declaringClass.name}#${it.name}($kind)"
+                } ?: "null"),
+        )
         registerAutoOpenShownReceiver(env)
         registerFullBleedRelaunchReceiver(env)
-        hookCarSystemUiConnectedKick(env)
+        // 17.8 ProjectionContext uses a static singleton getter — no instance capture needed.
+        // ≤17.4 SysUi is static. Only arm capture when we have a bare instance method.
+        if (env.startMethod != null &&
+            !Modifier.isStatic(env.startMethod!!.modifiers) &&
+            env.startSingletonGetter == null
+        ) {
+            installStartReceiverCapture(env)
+        }
+        hookCarConnectedKick(env)
     }
 
     fun scheduleAutoOpenIfNeeded(
@@ -174,14 +192,14 @@ object AaCoolwalkAutoOpenHook {
             return
         }
         if (!env.mAutoOpenArmed) return
-        val method = env.startMethod ?: return
+        if (env.startMethod == null) return
         val label = when {
             delayMs == -2L -> "full-bleed-relaunch"
             delayMs < 0L -> "connected"
             else -> "${delayMs}ms"
         }
         try {
-            method.invoke(null, aaDisplayLaunchIntent())
+            env.invokeStartCarActivity(aaDisplayLaunchIntent())
             logDebug(CoolwalkHookEnv.TAG, "AaUiHook: AutoOpen invoke at $label")
         } catch (e: InvocationTargetException) {
             val cause = e.cause ?: e
@@ -262,30 +280,107 @@ object AaCoolwalkAutoOpenHook {
         }
     }
 
-    private fun hookCarSystemUiConnectedKick(env: CoolwalkHookEnv) {
-        if (env.mCarConnectedKickHooked) return
-        val svcClass = try {
-            loadClass("com.google.android.projection.gearhead.service.CarSystemUiControllerService")
+    /**
+     * AA 17.8+ CarUiEntry.startCarActivity needs a live instance. Capture from ctor / onStart /
+     * the start method itself; kick AutoOpen once the receiver appears.
+     */
+    private fun installStartReceiverCapture(env: CoolwalkHookEnv) {
+        val method = env.startMethod ?: return
+        if (Modifier.isStatic(method.modifiers)) return
+        val clazz = method.declaringClass
+        try {
+            method.hookAfter { param ->
+                rememberStartReceiver(env, param.thisObject, "startMethod")
+            }
         } catch (e: Throwable) {
-            log(CoolwalkHookEnv.TAG, "AaUiHook: AutoOpen connected-kick: SysUi service missing", e)
+            log(CoolwalkHookEnv.TAG, "AaUiHook: AutoOpen startMethod capture hook failed", e)
+        }
+        for (ctor in clazz.declaredConstructors) {
+            try {
+                ctor.isAccessible = true
+                XposedBridge.hookMethod(ctor, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        rememberStartReceiver(env, param.thisObject, "ctor")
+                    }
+                })
+            } catch (_: Throwable) {
+            }
+        }
+        val onStart = clazz.declaredMethods.firstOrNull {
+            it.name == "onStart" && it.parameterCount == 0
+        }
+        if (onStart != null) {
+            try {
+                onStart.isAccessible = true
+                onStart.hookAfter { param ->
+                    rememberStartReceiver(env, param.thisObject, "onStart")
+                }
+            } catch (e: Throwable) {
+                log(CoolwalkHookEnv.TAG, "AaUiHook: AutoOpen onStart capture failed", e)
+            }
+        }
+        logDebug(
+            CoolwalkHookEnv.TAG,
+            "AaUiHook: AutoOpen startReceiver capture armed on ${clazz.name}",
+        )
+    }
+
+    private fun rememberStartReceiver(env: CoolwalkHookEnv, receiver: Any?, reason: String) {
+        if (receiver == null) return
+        val first = env.startReceiver == null
+        env.startReceiver = receiver
+        if (first) {
+            logDebug(CoolwalkHookEnv.TAG, "AaUiHook: AutoOpen startReceiver captured ($reason)")
+            onCarClientConnectedSignal(env, "startReceiver:$reason")
+        }
+    }
+
+    /**
+     * Connected kick: ≤17.4 hooks CarSystemUiControllerService.onCreate + client listener;
+     * 17.8+ ProjectionContext singleton is polled by the existing AutoOpen delay chain.
+     */
+    private fun hookCarConnectedKick(env: CoolwalkHookEnv) {
+        if (env.mCarConnectedKickHooked) return
+        if (hookLegacySysUiConnectedKick(env)) {
+            env.mCarConnectedKickHooked = true
             return
+        }
+        if (env.startSingletonGetter != null) {
+            env.mCarConnectedKickHooked = true
+            logDebug(
+                CoolwalkHookEnv.TAG,
+                "AaUiHook: AutoOpen connected-kick via ProjectionContext singleton retries",
+            )
+            return
+        }
+        if (env.startMethod != null && !Modifier.isStatic(env.startMethod!!.modifiers)) {
+            env.mCarConnectedKickHooked = true
+            logDebug(CoolwalkHookEnv.TAG, "AaUiHook: AutoOpen connected-kick via startReceiver capture")
+            return
+        }
+        log(CoolwalkHookEnv.TAG, "AaUiHook: AutoOpen connected-kick: no SysUi / ProjectionContext path")
+    }
+
+    private fun hookLegacySysUiConnectedKick(env: CoolwalkHookEnv): Boolean {
+        val svcClass = try {
+            loadClass(CoolwalkHookEnv.CAR_SYSTEM_UI_CONTROLLER_SERVICE)
+        } catch (_: Throwable) {
+            return false
         }
         try {
             val onCreate = svcClass.declaredMethods.firstOrNull {
                 it.name == "onCreate" && it.parameterCount == 0
-            } ?: run {
-                log(CoolwalkHookEnv.TAG, "AaUiHook: AutoOpen connected-kick: onCreate missing")
-                return
-            }
+            } ?: return false
             onCreate.isAccessible = true
             onCreate.hookAfter { param ->
                 val service = param.thisObject ?: return@hookAfter
                 installCarConnectedKickOnService(env, service, svcClass)
             }
-            env.mCarConnectedKickHooked = true
             logDebug(CoolwalkHookEnv.TAG, "AaUiHook: AutoOpen connected-kick hooked SysUi onCreate")
+            return true
         } catch (e: Throwable) {
-            log(CoolwalkHookEnv.TAG, "AaUiHook: AutoOpen connected-kick hook failed", e)
+            log(CoolwalkHookEnv.TAG, "AaUiHook: AutoOpen connected-kick SysUi hook failed", e)
+            return false
         }
     }
 

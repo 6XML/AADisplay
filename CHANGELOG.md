@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.24#17.8-r1
+
+### Fixed
+- **Android Auto 17.8 AutoOpen 失效：** gearhead 删除 `CarSystemUiControllerService`；`CarUiEntry.startCarActivity` 又会 `Unsupported intent` 拒 OEM 壳。改为 DexKit 定位 GH.ProjectionContext 启动器（针 `startCarActivity(intent:%s, activityOptions:%s)` → `(Intent, Options)V` + 静态单例 getter）；勿选同班 lifetime 空操作 `(Intent)V`。≤17.4 仍走 SysUi。媒体白名单 DexKit 针补充 `allow_unknown_sources` 等 17.8 字符串。
+
+### Changed
+- **Version bump to `0.24#17.8-r1`** (`versionCode` 3075)。目标 Android Auto **17.8**（真机验证 `17.8.663874-release`）。
+
 ## 0.24#17.4-r14
 
 ### Added

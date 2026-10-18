@@ -27,6 +27,8 @@ object AaUiHook : AaHook() {
     private const val CACHE_HU_TOUCH = "hook.AaUiHook.hu_touch"
     private const val CACHE_LAYOUT_INFO = "hook.AaUiHook.layout_info_class"
     private const val CACHE_PROJECTION_BOUNDS = "hook.AaUiHook.projection_bounds_class"
+    private const val CACHE_START_METHOD = "hook.AaUiHook.start_car_activity"
+    private const val CACHE_START_GETTER = "hook.AaUiHook.start_car_activity_getter"
 
     private val env = CoolwalkHookEnv()
 
@@ -59,7 +61,7 @@ object AaUiHook : AaHook() {
                 (env.huTouchDispatchMethod?.let { "${it.declaringClass.name}#${it.name}" } ?: "null") +
                 " (cache)",
         )
-        env.startMethod = env.resolveCarStartActivityMethod()
+        if (!applyStartMethodCache(cache, lpparam)) return false
         env.projectionBoundsClassName = cache.getString(CACHE_PROJECTION_BOUNDS)
         // New key: miss once so DexKit finds `{blX=` compositor bounds class.
         if (env.projectionBoundsClassName.isNullOrEmpty()) return false
@@ -93,6 +95,8 @@ object AaUiHook : AaHook() {
             cache.putString(CACHE_LAYOUT_INFO, env.layoutInfoConstructors[0].declaringClass.name)
         }
         env.projectionBoundsClassName?.let { cache.putString(CACHE_PROJECTION_BOUNDS, it) }
+        cache.putRef(CACHE_START_METHOD, env.startMethod)
+        cache.putRef(CACHE_START_GETTER, env.startSingletonGetter)
     }
 
     override fun loadDexClass(bridge: DexKitBridge, lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -180,7 +184,7 @@ object AaUiHook : AaHook() {
         }
         CoolwalkProjectionBoundsHook.rememberClassName(env.projectionBoundsClassName)
 
-        env.startMethod = env.resolveCarStartActivityMethod()
+        resolveStartMethodLive(bridge, lpparam)
 
         if (lpparam.processName == processCar) {
             env.loadProjectionResources()
@@ -204,6 +208,78 @@ object AaUiHook : AaHook() {
                 env.layoutInfoConstructors.joinToString { "p${it.parameterCount}" },
         )
         env.loadProjectionResources()
+    }
+
+    private fun applyStartMethodCache(
+        cache: DexKitMethodCache.Session,
+        lpparam: XC_LoadPackage.LoadPackageParam,
+    ): Boolean {
+        // Cached ProjectionContext launcher (17.8+) or SysUi static (≤17.4).
+        val startRef = cache.getRef(CACHE_START_METHOD)
+        if (startRef != null) {
+            val start = cache.resolve(lpparam.classLoader, startRef) ?: return false
+            env.startMethod = start
+            env.startSingletonGetter = cache.getRef(CACHE_START_GETTER)?.let { ref ->
+                cache.resolve(lpparam.classLoader, ref) ?: return false
+            }
+            logDebug(
+                tagName,
+                "AaUiHook: startMethod=${start.declaringClass.name}#${start.name} (cache) " +
+                    "getter=${env.startSingletonGetter?.name}",
+            )
+            return true
+        }
+        // Pre-17.8 cache without start keys: accept SysUi name resolve only.
+        val legacy = env.resolveLegacyCarStartActivityMethod()
+        if (legacy != null) {
+            env.startMethod = legacy
+            return true
+        }
+        // 17.8+ must cold-scan for ProjectionContext needle.
+        return false
+    }
+
+    private fun resolveStartMethodLive(
+        bridge: DexKitBridge,
+        lpparam: XC_LoadPackage.LoadPackageParam,
+    ) {
+        env.resolveLegacyCarStartActivityMethod()?.let {
+            env.startMethod = it
+            return
+        }
+        try {
+            val hits = bridge.findMethod {
+                matcher {
+                    usingStrings {
+                        add(CoolwalkHookEnv.PROJECTION_START_NEEDLE, StringMatchType.Equals, false)
+                    }
+                }
+            }.mapNotNull { md ->
+                runCatching { md.getMethodInstance(lpparam.classLoader) }.getOrNull()
+            }.filter { m ->
+                m.parameterTypes.size >= 2 &&
+                    m.parameterTypes[0] == android.content.Intent::class.java &&
+                    (m.returnType == Void.TYPE || m.returnType == Void::class.java)
+            }
+            val needle = hits.singleOrNull()
+            if (needle == null) {
+                log(
+                    tagName,
+                    "AaUiHook: ProjectionContext launcher DexKit hits=${hits.size} " +
+                        hits.map { "${it.declaringClass.name}#${it.name}" },
+                )
+                return
+            }
+            if (!env.resolveProjectionLauncherStart(needle)) {
+                log(
+                    tagName,
+                    "AaUiHook: ProjectionContext resolve failed " +
+                        "${needle.declaringClass.name}#${needle.name}",
+                )
+            }
+        } catch (e: Throwable) {
+            log(tagName, "AaUiHook: ProjectionContext DexKit failed", e)
+        }
     }
 
     override fun hook(lpparam: XC_LoadPackage.LoadPackageParam) {
