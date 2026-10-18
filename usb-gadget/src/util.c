@@ -211,6 +211,57 @@ int aad_udc_driver(const char *udc, char *buf, size_t len)
     return 0;
 }
 
+/* Which configfs gadget (if any) currently holds this UDC?
+ * (configfs-bound UDCs have NO driver symlink — the holder lives in
+ * /config/usb_gadget/<g>/UDC; e.g. the AOSP USB Gadget HAL's "g1") */
+int aad_udc_configfs_holder(const char *udc, char *buf, size_t len)
+{
+    buf[0] = 0;
+    DIR *d = opendir("/config/usb_gadget");
+    if (!d) return 0; /* configfs not mounted / not the vendor mechanism */
+    struct dirent *de;
+    int found = 0;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char upath[256], val[64] = {0};
+        snprintf(upath, sizeof(upath), "/config/usb_gadget/%s/UDC", de->d_name);
+        if (aad_sysfs_read_str(upath, val, sizeof(val)) == 0 &&
+            val[0] && !strcmp(val, udc)) {
+            snprintf(buf, len, "%s", de->d_name);
+            found = 1;
+            break;
+        }
+    }
+    closedir(d);
+    return found;
+}
+
+/* configfs-aware recursive removal: RMDIR object dirs only, bottom-up.
+ * configfs attribute files (serialnumber/MaxPower/...) are NOT unlinkable
+ * (EPERM) — the kernel drops them when their object dir is rmdir'd. */
+int aad_rmrfdirs(const char *path)
+{
+    struct stat st;
+    if (lstat(path, &st) != 0)
+        return (errno == ENOENT) ? 0 : -1;
+    if (!S_ISDIR(st.st_mode))
+        return 0; /* attribute file: leave it; the object rmdir covers it */
+    DIR *d = opendir(path);
+    if (!d) return -1;
+    int fail = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        char child[512];
+        snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+        if (aad_rmrfdirs(child) != 0) fail = 1;
+    }
+    closedir(d);
+    if (rmdir(path) != 0 && errno != ENOENT)
+        fail = 1;
+    return fail ? -1 : 0;
+}
+
 int aad_cable_attached(const char *udc)
 {
     char path[256], state[64] = {0};

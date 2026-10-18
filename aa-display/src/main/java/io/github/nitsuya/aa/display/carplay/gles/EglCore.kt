@@ -99,18 +99,6 @@ class EglCore(
         }
     }
 
-    fun makeNothingCurrent() {
-        if (!EGL14.eglMakeCurrent(
-                eglDisplay,
-                EGL14.EGL_NO_SURFACE,
-                EGL14.EGL_NO_SURFACE,
-                EGL14.EGL_NO_CONTEXT,
-            )
-        ) {
-            throw RuntimeException("eglMakeCurrent(nothing) failed")
-        }
-    }
-
     fun swapBuffers(eglSurface: EGLSurface): Boolean =
         EGL14.eglSwapBuffers(eglDisplay, eglSurface)
 

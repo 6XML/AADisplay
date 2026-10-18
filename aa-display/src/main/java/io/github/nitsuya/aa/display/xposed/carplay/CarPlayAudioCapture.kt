@@ -1,6 +1,9 @@
 package io.github.nitsuya.aa.display.xposed.carplay
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -10,6 +13,7 @@ import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Binder
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
@@ -17,7 +21,6 @@ import android.os.Process
 import android.os.UserHandle
 import io.github.nitsuya.aa.display.xposed.util.log
 import io.github.nitsuya.aa.display.xposed.util.logDebug
-import java.lang.reflect.Method
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -97,13 +100,18 @@ object CarPlayAudioCapture {
     private const val SPEECH_HIGH_WATERMARK_BYTES = SPEECH_BYTES_PER_MS * LIVE_HIGH_MS
     private const val SPEECH_LOW_WATERMARK_BYTES = SPEECH_BYTES_PER_MS * LIVE_LOW_MS
     private const val WATCHDOG_PERIOD_MS = 30_000L
+    /** CSM re-enforces local mute every 250ms — Samsung restores MUSIC when apps start. */
+    private const val MUTE_ENFORCE_MS = 250L
     private const val PULL_TIMEOUT_MS = 5 * 60_000L
     private const val MEDIA_READ_BYTES = 3_840 // 20 ms @ 48 kHz stereo s16
     private const val SPEECH_READ_BYTES = 640 // 20 ms @ 16 kHz mono s16
+    private const val VOLUME_CHANGED_ACTION = "android.media.VOLUME_CHANGED_ACTION"
+    private const val EXTRA_VOLUME_STREAM_TYPE = "android.media.EXTRA_VOLUME_STREAM_TYPE"
 
     private val opLock = Any()
     private val armed = AtomicBoolean(false)
     private val lastPullMs = AtomicLong(0L)
+    private val muteEnforceActive = AtomicBoolean(false)
 
     private val mediaRing = PcmRing(
         MEDIA_RING_BYTES,
@@ -143,6 +151,8 @@ object CarPlayAudioCapture {
     private var totalSpeechPulled = 0L
     /** Peak |s16| seen by media reader since arm (0 ⇒ likely muted tap). */
     private val mediaPcmPeak = AtomicInteger(0)
+    private var volumeReceiver: BroadcastReceiver? = null
+    @Volatile private var muteMonitorThread: Thread? = null
 
     fun install(context: Context) {
         synchronized(opLock) {
@@ -156,14 +166,38 @@ object CarPlayAudioCapture {
     fun isEnabled(): Boolean = armed.get()
 
     fun setEnabled(enabled: Boolean) {
+        var reassertMute = false
         synchronized(opLock) {
-            if (enabled == armed.get()) return
-            // AIDL arrives with the app uid; MediaProjection / REMOTE_SUBMIX / AudioPolicy
-            // all check Binder.getCallingUid() for CAPTURE_AUDIO_OUTPUT /
-            // MANAGE_MEDIA_PROJECTION. Drop to system identity for the arm window.
+            // Already armed: still re-assert phone mute (Samsung restores MUSIC on playback).
+            if (enabled && armed.get()) {
+                if (mediaMode == "playback-capture") {
+                    // Mute thread can die while capture stays armed (uncaught OEM
+                    // AudioManager throw / interrupt). Restart before one-shot enforce.
+                    ensureMuteEnforceLocked()
+                    reassertMute = true
+                }
+                // Fall through: enforce outside opLock (see below).
+            } else if (enabled == armed.get()) {
+                return
+            } else {
+                // AIDL arrives with the app uid; MediaProjection / REMOTE_SUBMIX / AudioPolicy
+                // all check Binder.getCallingUid() for CAPTURE_AUDIO_OUTPUT /
+                // MANAGE_MEDIA_PROJECTION. Drop to system identity for the arm window.
+                val identity = Binder.clearCallingIdentity()
+                try {
+                    if (enabled) enableLocked() else disableLocked()
+                } finally {
+                    Binder.restoreCallingIdentity(identity)
+                }
+                return
+            }
+        }
+        if (reassertMute) {
             val identity = Binder.clearCallingIdentity()
             try {
-                if (enabled) enableLocked() else disableLocked()
+                // Do not hold opLock across setStreamVolume — VOLUME_CHANGED receiver
+                // used to re-enter opLock and deadlock / kill the mute thread.
+                enforcePhoneMute(audioManager)
             } finally {
                 Binder.restoreCallingIdentity(identity)
             }
@@ -287,6 +321,7 @@ object CarPlayAudioCapture {
                 // after playback-capture was already live (phone unmuted again).
                 phoneMuted = mutePhoneStreams(am)
                 speakerDeviceMuted = muteLocalPlaybackDevices()
+                ensureMuteEnforceLocked()
             } else {
                 log(TAG, "media=$mMode — skip local mute so remotesubmix tap stays live")
             }
@@ -358,6 +393,7 @@ object CarPlayAudioCapture {
         captureThread = null
         captureHandler = null
         armed.set(false)
+        stopMuteEnforceLocked()
         if (phoneMuted) {
             restorePhoneStreams(audioManager)
         }
@@ -463,6 +499,7 @@ object CarPlayAudioCapture {
      * Returns true if at least MUSIC (or any listed stream) was muted.
      */
     private fun mutePhoneStreams(am: AudioManager): Boolean {
+        val firstArm = mutedStreamTypes == null || savedVolumes == null
         val vols = ArrayList<Int>(MUTED_STREAMS.size)
         val types = ArrayList<Int>(MUTED_STREAMS.size)
         for (stream in MUTED_STREAMS) {
@@ -474,15 +511,18 @@ object CarPlayAudioCapture {
                 continue
             }
             types.add(stream)
-            vols.add(cur)
+            if (firstArm) vols.add(cur)
         }
         if (types.isEmpty()) {
             log(TAG, "phone stream mute: no usable streams")
             return false
         }
-        mutedStreamTypes = types.toIntArray()
-        savedVolumes = vols.toIntArray()
-        log(TAG, "phone stream mute ok streams=${types} saved=${vols}")
+        // First arm wins for saved volumes; sticky enforce must not clobber them with 0.
+        if (firstArm) {
+            mutedStreamTypes = types.toIntArray()
+            savedVolumes = vols.toIntArray()
+            log(TAG, "phone stream mute ok streams=${types} saved=${vols}")
+        }
         return true
     }
 
@@ -496,6 +536,209 @@ object CarPlayAudioCapture {
             val vol = vols[i]
             runCatching { am.setStreamMute(stream, false) }
             runCatching { am.setStreamVolume(stream, vol, 0) }
+        }
+    }
+
+    /**
+     * CSM-style sticky mute: One UI restores STREAM_MUSIC when media apps start,
+     * so a one-shot mute leaves the Z Flip speaker live while AAC still flows.
+     *
+     * Must NOT be called while holding [opLock]: [AudioManager.setStreamVolume] can
+     * dispatch [VOLUME_CHANGED_ACTION] synchronously; the receiver used to take
+     * [opLock] again → deadlock, mute thread dies, phone speaker comes back.
+     */
+    private fun enforcePhoneMute(am: AudioManager?) {
+        if (am == null || mediaMode != "playback-capture" || !armed.get()) return
+        val streams = mutedStreamTypes?.toList() ?: MUTED_STREAMS
+        var touched = false
+        var restoredVol: Int? = null
+        for (stream in streams) {
+            val muted = runCatching { am.isStreamMute(stream) }.getOrNull()
+            if (muted == false) {
+                runCatching { am.setStreamMute(stream, true) }
+                touched = true
+            }
+            val vol = runCatching { am.getStreamVolume(stream) }.getOrNull()
+            if (vol != null && vol != 0) {
+                if (stream == AudioManager.STREAM_MUSIC) restoredVol = vol
+                runCatching { am.setStreamVolume(stream, 0, 0) }
+                // One UI fine-volume can leave speaker audible after stream index 0.
+                zeroSamsungFineVolume(am, stream)
+                touched = true
+            }
+        }
+        if (speakerDeviceMuted || phoneMuted) {
+            // Re-zero local OUT devices without rewriting savedSpeakerVolumes.
+            rezeroLocalPlaybackDevices()
+        }
+        if (touched) {
+            log(
+                TAG,
+                "phone mute re-enforced streams=$streams" +
+                    (restoredVol?.let { " musicWas=$it" } ?: ""),
+            )
+        }
+    }
+
+    /** Best-effort One UI fine / sem volume → 0 (no-op on AOSP). */
+    private fun zeroSamsungFineVolume(am: AudioManager, stream: Int) {
+        val names = listOf("semSetFineVolume", "setFineVolume", "setFineVolumeIndex")
+        for (name in names) {
+            val ok = runCatching {
+                val methods = am.javaClass.methods.filter { it.name == name }
+                for (m in methods) {
+                    val pts = m.parameterTypes
+                    when (pts.size) {
+                        2 -> if (pts[0] == Int::class.javaPrimitiveType &&
+                            pts[1] == Int::class.javaPrimitiveType
+                        ) {
+                            m.invoke(am, stream, 0)
+                            return@runCatching true
+                        }
+                        3 -> if (pts.all { it == Int::class.javaPrimitiveType }) {
+                            m.invoke(am, stream, 0, 0)
+                            return@runCatching true
+                        }
+                        4 -> if (pts.all { it == Int::class.javaPrimitiveType }) {
+                            m.invoke(am, stream, 0, 0, 2 /* SPEAKER */)
+                            return@runCatching true
+                        }
+                    }
+                }
+                false
+            }.getOrNull() == true
+            if (ok) return
+        }
+    }
+
+    /**
+     * Start or revive the sticky-mute thread. Safe to call while already armed —
+     * a dead thread with [muteEnforceActive]=true previously left the phone unmuted.
+     */
+    private fun ensureMuteEnforceLocked() {
+        val living = muteMonitorThread?.isAlive == true
+        if (living && muteEnforceActive.get()) return
+        if (!living) {
+            muteEnforceActive.set(false)
+            muteMonitorThread = null
+        }
+        startMuteEnforceLocked()
+    }
+
+    private fun startMuteEnforceLocked() {
+        if (!muteEnforceActive.compareAndSet(false, true)) {
+            // Flag stuck true with a dead thread — force restart.
+            if (muteMonitorThread?.isAlive != true) {
+                muteEnforceActive.set(false)
+                if (!muteEnforceActive.compareAndSet(false, true)) return
+            } else {
+                return
+            }
+        }
+        registerVolumeReceiverLocked()
+        val thread = Thread(
+            {
+                val self = Thread.currentThread()
+                try {
+                    while (muteEnforceActive.get() &&
+                        !self.isInterrupted &&
+                        muteMonitorThread === self
+                    ) {
+                        try {
+                            if (armed.get() && mediaMode == "playback-capture") {
+                                enforcePhoneMute(audioManager)
+                            }
+                        } catch (e: Throwable) {
+                            log(TAG, "phone mute enforce tick failed", e)
+                        }
+                        try {
+                            Thread.sleep(MUTE_ENFORCE_MS)
+                        } catch (_: InterruptedException) {
+                            break
+                        }
+                    }
+                } finally {
+                    // Only the *current* monitor may clear the flag — a replaced
+                    // thread's finally must not disarm a newly started successor.
+                    if (muteMonitorThread === self) {
+                        muteEnforceActive.set(false)
+                        log(TAG, "phone mute enforce thread exited")
+                    }
+                }
+            },
+            "aad-cp-audio-mute",
+        )
+        thread.isDaemon = true
+        thread.uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { t, e ->
+            log(TAG, "phone mute enforce crashed", e)
+            if (muteMonitorThread === t) muteEnforceActive.set(false)
+        }
+        muteMonitorThread = thread
+        thread.start()
+        log(TAG, "phone mute enforce thread started")
+    }
+
+    private fun stopMuteEnforceLocked() {
+        muteEnforceActive.set(false)
+        muteMonitorThread?.interrupt()
+        muteMonitorThread = null
+        unregisterVolumeReceiverLocked()
+    }
+
+    private fun registerVolumeReceiverLocked() {
+        val ctx = appContext ?: return
+        if (volumeReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (!muteEnforceActive.get() || intent == null) return
+                val stream = intent.getIntExtra(EXTRA_VOLUME_STREAM_TYPE, Int.MIN_VALUE)
+                if (stream != Int.MIN_VALUE && stream != AudioManager.STREAM_MUSIC) return
+                // No opLock here — see enforcePhoneMute. Snapshot gates only.
+                if (armed.get() && mediaMode == "playback-capture") {
+                    enforcePhoneMute(audioManager)
+                }
+            }
+        }
+        val filter = IntentFilter(VOLUME_CHANGED_ACTION)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 33) {
+                ctx.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                ctx.registerReceiver(receiver, filter)
+            }
+            volumeReceiver = receiver
+        }.onFailure {
+            logDebug(TAG, "volume receiver register failed: ${it.message}")
+        }
+    }
+
+    private fun unregisterVolumeReceiverLocked() {
+        val ctx = appContext
+        val receiver = volumeReceiver ?: return
+        volumeReceiver = null
+        if (ctx != null) {
+            runCatching { ctx.unregisterReceiver(receiver) }
+        }
+    }
+
+    /** Re-apply device-index 0 without changing the first-arm saved restore snapshot. */
+    private fun rezeroLocalPlaybackDevices() {
+        val streams = savedSpeakerStreamTypes?.toList()
+            ?: mutedStreamTypes?.toList()
+            ?: MUTED_STREAMS
+        try {
+            val audioSystem = Class.forName("android.media.AudioSystem")
+            val setIndex = audioSystem.methods.first { m ->
+                m.name == "setStreamVolumeIndex" && m.parameterTypes.size == 3
+            }
+            val devices = localPlaybackDeviceMasks(audioSystem)
+            for (stream in streams) {
+                for (device in devices) {
+                    runCatching { setIndex.invoke(null, stream, 0, device) }
+                }
+            }
+        } catch (_: Throwable) {
         }
     }
 
@@ -1077,11 +1320,19 @@ object CarPlayAudioCapture {
                     setEnabled(false)
                     return@postDelayed
                 }
+                // Revive sticky-mute if One UI killed / deadlocked the enforce thread.
+                if (mediaMode == "playback-capture") {
+                    synchronized(opLock) {
+                        if (armed.get()) ensureMuteEnforceLocked()
+                    }
+                }
+                val muteAlive = muteMonitorThread?.isAlive == true
                 log(
                     TAG,
                     "watchdog media=$mediaMode speech=$speechMode " +
                         "pulledMedia=${totalMediaPulled / 1024}KB pulledSpeech=${totalSpeechPulled / 1024}KB " +
-                        "pcmPeak=${mediaPcmPeak.get()} dropMedia=${mediaRing.dropped / 1024}KB",
+                        "pcmPeak=${mediaPcmPeak.get()} dropMedia=${mediaRing.dropped / 1024}KB " +
+                        "muteThread=$muteAlive",
                 )
                 scheduleWatchdog(handler)
             },

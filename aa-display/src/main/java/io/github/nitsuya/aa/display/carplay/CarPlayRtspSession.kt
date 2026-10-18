@@ -6,16 +6,25 @@ import io.github.nitsuya.aa.display.carplay.protocol.AirPlayPairVerify
 import io.github.nitsuya.aa.display.carplay.protocol.AirPlayPairing
 import io.github.nitsuya.aa.display.carplay.protocol.BinaryPlist
 import io.github.nitsuya.aa.display.carplay.protocol.CarPlayEventChannel
+import io.github.nitsuya.aa.display.carplay.protocol.CarPlayTiming
 import io.github.nitsuya.aa.display.carplay.protocol.ControlChannelCrypto
 import io.github.nitsuya.aa.display.carplay.protocol.RtpH264Packetizer
 import io.github.nitsuya.aa.display.carplay.protocol.RtspMessage
 import io.github.nitsuya.aa.display.carplay.protocol.ScreenStreamEgress
+import io.github.nitsuya.aa.display.carplay.protocol.WifiIap2Link
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.ArrayDeque
 import java.util.UUID
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -32,6 +41,8 @@ class CarPlayRtspSession(
     private val onSessionReady: () -> Unit,
     private val onTouchEvent: (x: Float, y: Float, action: Int) -> Unit,
     private val onForceKeyFrame: () -> Unit = {},
+    /** Bluetooth-negotiated LSP. Null until iAP link sync has finished. */
+    private val linkSyncBytes: () -> ByteArray? = { null },
 ) {
     private val running = AtomicBoolean(false)
     private val streaming = AtomicBoolean(false)
@@ -49,13 +60,35 @@ class CarPlayRtspSession(
     private val controlReadKey = AtomicReference<ByteArray?>(null)
     private val screenEgress = AtomicReference<ScreenStreamEgress?>(null)
     private val mediaAudioEgress = AtomicReference<CarPlayAudioEgress?>(null)
+    /** MIB3 / Audi: type-102 AAC-LC (PCM type-100 stays silent on this HU). */
+    private val mediaAacEgress = AtomicReference<CarPlayAacAudioEgress?>(null)
+    /** Negotiated from /info audioFormats; default 48 kHz AAC-LC stereo. */
+    @Volatile private var accessoryAacSampleRate: Int = 48_000
+    @Volatile private var accessoryAacFormatBit: Long =
+        CarPlayAacAudioEgress.AUDIO_FORMAT_AAC_LC_48000_STEREO
     private val speechAudioEgress = AtomicReference<CarPlayAudioEgress?>(null)
     private val eventChannel = AtomicReference<CarPlayEventChannel?>(null)
+    private val wifiIap = AtomicReference<WifiIap2Link?>(null)
+    /** Phone iAP frames waiting to go out on the RTSP control socket. */
+    private val iapTx = ArrayDeque<ByteArray>()
+    private val iapTxLock = Any()
+    private val controlIapFlush = AtomicReference<(() -> Unit)?>(null)
+    /** Sole control-socket reader after screen arm; demux responses by CSeq. */
+    private val controlPumpLive = AtomicBoolean(false)
+    private val controlPending =
+        ConcurrentHashMap<Int, ArrayBlockingQueue<RtspMessage>>()
+    private val controlOnMessage = AtomicReference<((RtspMessage) -> Boolean)?>(null)
+    /** CSeq for pump-thread POST /feedback (high band — avoids handshake cseq clash). */
+    private val feedbackCseq = AtomicInteger(900_000)
+    private val controlPumpThread = AtomicReference<Thread?>(null)
+    private val timing = AtomicReference<CarPlayTiming?>(null)
+    private val keepAlive = AtomicReference<DatagramSocket?>(null)
     private val lastCodecConfig = AtomicReference<ByteArray?>(null)
     private val pairSessionKey = AtomicReference<ByteArray?>(null)
     /** Accessory main display from GET /info — HID touch report pixel space (DiPlay). */
     @Volatile private var accessoryTouchMaxX = CarPlayConsts.DEFAULT_VIDEO_WIDTH
     @Volatile private var accessoryTouchMaxY = CarPlayConsts.DEFAULT_VIDEO_HEIGHT
+    @Volatile private var accessoryDisplayUuid: String? = null
 
     val localPort: Int
         get() = serverSocket?.localPort ?: 0
@@ -66,10 +99,6 @@ class CarPlayRtspSession(
         val screen = screenEgress.get()
         return if (screen != null) screen.stats() else rtpSent.get() to rtpBytes.get()
     }
-
-    fun hasControlKeys(): Boolean = controlWriteKey.get() != null
-
-    fun hasScreenEgress(): Boolean = screenEgress.get() != null
 
     fun startServer() {
         if (!running.compareAndSet(false, true)) return
@@ -99,7 +128,8 @@ class CarPlayRtspSession(
         thread(name = "carplay-rtsp-client", isDaemon = true) {
             if (!running.get()) running.set(true)
             try {
-                val socket = Socket(host, port)
+                val socket = CarPlayAccessoryNet.openTcp()
+                socket.connect(InetSocketAddress(host, port), 15_000)
                 Log.i(CarPlayConsts.TAG, "RTSP connected to $host:$port")
                 attachPeer(socket)
             } catch (e: Throwable) {
@@ -112,12 +142,20 @@ class CarPlayRtspSession(
      * Source→receiver: after iAP2 CarPlayStartSession, dial HU AirPlay port,
      * GET /info, then HomeKit Pair-Setup (transient preferred).
      */
-    fun connectAsAirPlaySource(host: InetAddress, port: Int, deviceId: String?) {
+    fun connectAsAirPlaySource(
+        host: InetAddress,
+        port: Int,
+        deviceId: String?,
+        mib3: Boolean = false,
+        phoneMac: String? = null,
+        wifiMac: String? = null,
+    ) {
         thread(name = "carplay-airplay-source", isDaemon = true) {
             if (!running.get()) running.set(true)
             airplaySourceActive.set(true)
             try {
-                val socket = Socket(host, port)
+                val socket = CarPlayAccessoryNet.openTcp()
+                socket.connect(InetSocketAddress(host, port), 15_000)
                 socket.soTimeout = 15_000
                 Log.i(CarPlayConsts.TAG, "AirPlay source dial $host:$port deviceId=$deviceId")
                 peer = socket
@@ -157,13 +195,15 @@ class CarPlayRtspSession(
                         return provisional.copy(body = body)
                     }
                 }
+                val userAgent = if (mib3) "AirPlay/980.77.1" else "AirPlay/950.7.1"
+                val hkp = if (mib3) "2" else "3"
                 fun post(path: String, body: ByteArray, contentType: String): ByteArray? {
                     val req = RtspMessage(
                         "POST $path RTSP/1.0",
                         linkedMapOf(
                             "CSeq" to (cseq++).toString(),
-                            "User-Agent" to "AirPlay/950.7.1",
-                            "X-Apple-HKP" to "3",
+                            "User-Agent" to userAgent,
+                            "X-Apple-HKP" to hkp,
                             "Content-Type" to contentType,
                             "Content-Length" to body.size.toString(),
                         ),
@@ -177,31 +217,43 @@ class CarPlayRtspSession(
                     return resp.body
                 }
 
-                val info = exchange(
-                    RtspMessage(
-                        "GET /info RTSP/1.0",
-                        linkedMapOf(
-                            "CSeq" to (cseq++).toString(),
-                            "User-Agent" to "AirPlay/950.7.1",
-                            "DACP-ID" to (deviceId ?: "AADISPLAY"),
-                            "Active-Remote" to "AADisplay",
-                            "X-Apple-HKP" to "3",
+                fun fetchInfo() {
+                    val info = exchange(
+                        RtspMessage(
+                            "GET /info RTSP/1.0",
+                            linkedMapOf(
+                                "CSeq" to (cseq++).toString(),
+                                "User-Agent" to userAgent,
+                                "DACP-ID" to (deviceId ?: "AADISPLAY"),
+                                "Active-Remote" to "AADisplay",
+                                "X-Apple-HKP" to hkp,
+                            ),
                         ),
-                    ),
-                )
-                logAirPlayResponse("info", info)
-                info?.body?.let { parseAccessoryInfo(it) }
-                val options = exchange(
-                    RtspMessage(
-                        "OPTIONS * RTSP/1.0",
-                        linkedMapOf(
-                            "CSeq" to (cseq++).toString(),
-                            "User-Agent" to "AirPlay/950.7.1",
-                            "X-Apple-HKP" to "3",
+                    )
+                    logAirPlayResponse("info", info)
+                    info?.body?.let { parseAccessoryInfo(it) }
+                }
+                fun fetchOptions() {
+                    val options = exchange(
+                        RtspMessage(
+                            "OPTIONS * RTSP/1.0",
+                            linkedMapOf(
+                                "CSeq" to (cseq++).toString(),
+                                "User-Agent" to userAgent,
+                                "X-Apple-HKP" to hkp,
+                            ),
                         ),
-                    ),
-                )
-                logAirPlayResponse("options", options)
+                    )
+                    logAirPlayResponse("options", options)
+                }
+                // MIB3 returns 455 for GET /info until OPTIONS has completed.
+                if (mib3) {
+                    fetchOptions()
+                    fetchInfo()
+                } else {
+                    fetchInfo()
+                    fetchOptions()
+                }
 
                 // DiPlay: persistent pair-setup M1–M6 (saves our LTPK), then pair-verify
                 // (X25519 → Control-Salt keys); ControlCipher only after verify M4.
@@ -241,29 +293,71 @@ class CarPlayRtspSession(
                 val crypto = ControlChannelCrypto(verify.writeKey, verify.readKey)
                 val ok = runEncryptedSetupRecord(
                     peerHost = host,
+                    localAddress = socket.localAddress,
                     deviceId = deviceId,
                     cseqStart = cseq,
                     sharedSecret = verify.sharedSecret,
                     crypto = crypto,
                     input = input,
                     out = out,
+                    socket = socket,
+                    mib3 = mib3,
+                    phoneMac = phoneMac,
+                    wifiMac = wifiMac,
                 )
                 if (!ok) {
                     Log.e(CarPlayConsts.TAG, "encrypted SETUP/RECORD / screen open failed")
                     return@thread
                 }
                 // Keep encrypted control alive (feedback); video is on dataPort.
-                socket.soTimeout = 0
-                pumpEncryptedControl(crypto, input)
+                // Short timeout so queued control-socket iAP can be written between reads.
+                socket.soTimeout = 250
+                controlPumpThread.set(Thread.currentThread())
+                controlPumpLive.set(true)
+                pumpEncryptedControl(crypto, input, out)
             } catch (e: Throwable) {
                 Log.e(CarPlayConsts.TAG, "AirPlay source dial failed", e)
             } finally {
+                controlPumpLive.set(false)
+                controlPumpThread.set(null)
+                controlOnMessage.set(null)
+                controlPending.clear()
+                controlIapFlush.set(null)
+                synchronized(iapTxLock) { iapTx.clear() }
                 airplaySourceActive.set(false)
                 // DiPlay resets control → must stop UDP audio / screen TCP or reconnect
                 // Auth dies under zombie streams ("连接中断" loop).
                 releaseMediaStreams("airplay-control-ended")
             }
         }
+    }
+
+    /** 4-byte UDP ping every 10s. Delphi advertises the port after session SETUP. */
+    private fun startKeepAlive(peer: InetAddress, port: Int) {
+        val socket = try {
+            CarPlayAccessoryNet.openUdp()
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "keepAlive bind failed", e)
+            return
+        }
+        keepAlive.getAndSet(socket)?.close()
+        thread(name = "carplay-keepalive", isDaemon = true) {
+            val buf = ByteArray(4)
+            while (!socket.isClosed) {
+                Random.nextBytes(buf)
+                try {
+                    socket.send(DatagramPacket(buf, buf.size, peer, port))
+                } catch (_: Throwable) {
+                    break
+                }
+                try {
+                    Thread.sleep(10_000)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }
+        Log.i(CarPlayConsts.TAG, "keepAlive → $peer:$port")
     }
 
     /**
@@ -273,9 +367,13 @@ class CarPlayRtspSession(
     fun releaseMediaStreams(reason: String) {
         streaming.set(false)
         mediaAudioEgress.getAndSet(null)?.stop()
+        mediaAacEgress.getAndSet(null)?.stop()
         speechAudioEgress.getAndSet(null)?.stop()
         screenEgress.getAndSet(null)?.close()
+        wifiIap.getAndSet(null)?.close()
         eventChannel.getAndSet(null)?.close()
+        timing.getAndSet(null)?.close()
+        keepAlive.getAndSet(null)?.close()
         CarPlayWheelController.setEnabled(false)
         CarPlayMediaClock.clear()
         Log.i(CarPlayConsts.TAG, "releaseMediaStreams reason=$reason")
@@ -288,31 +386,235 @@ class CarPlayRtspSession(
      */
     private fun runEncryptedSetupRecord(
         peerHost: InetAddress,
+        localAddress: InetAddress?,
         deviceId: String?,
         cseqStart: Int,
         sharedSecret: ByteArray,
         crypto: ControlChannelCrypto,
         input: BufferedInputStream,
         out: BufferedOutputStream,
+        socket: java.net.Socket,
+        mib3: Boolean = false,
+        phoneMac: String? = null,
+        wifiMac: String? = null,
     ): Boolean {
         var cseq = cseqStart
         val host = peerHost.hostAddress ?: peerHost.hostName
         val sessionId = (Random.nextLong() and Long.MAX_VALUE).toString()
         val sessionUrl = "rtsp://$host/$sessionId"
         val dacp = (deviceId ?: "AADISPLAY").replace(":", "").uppercase()
+        val userAgent = if (mib3) "AirPlay/980.77.1" else "AirPlay/950.7.1"
+        val hkp = if (mib3) "2" else "3"
         fun headers(extra: Map<String, String> = emptyMap()): LinkedHashMap<String, String> {
             val h = linkedMapOf(
                 "CSeq" to (cseq++).toString(),
-                "User-Agent" to "AirPlay/950.7.1",
+                "User-Agent" to userAgent,
                 "DACP-ID" to dacp,
                 "Active-Remote" to "AADisplay",
-                "X-Apple-HKP" to "3",
+                "X-Apple-HKP" to hkp,
             )
             h.putAll(extra)
             return h
         }
+        fun postControlIap(frame: ByteArray): Boolean {
+            if (frame.isEmpty()) return false
+            synchronized(iapTxLock) { iapTx.addLast(frame) }
+            return true
+        }
+        fun controlReply200(request: RtspMessage) {
+            // CSM / iPhone: echo CSeq, no Content-Length on empty body.
+            val headers = linkedMapOf<String, String>()
+            if (request.cSeq >= 0) headers["CSeq"] = request.cSeq.toString()
+            headers["Server"] = userAgent
+            val resp = RtspMessage("RTSP/1.0 200 OK", headers)
+            synchronized(writeLock) {
+                crypto.writeMessage(out, resp.toBytes())
+            }
+        }
+        /** @return true when [msg] was a request (already 200'd). */
+        fun handleControlRequest(msg: RtspMessage): Boolean {
+            if (!msg.isRequest) return false
+            if (msg.method == "POST") {
+                val dict = BinaryPlist.asDict(BinaryPlist.decode(msg.body))
+                val params = BinaryPlist.asDict(dict?.get("params"))
+                val data = params?.get("data") as? ByteArray
+                if (dict?.get("type")?.toString() == "iAPSendMessage" && data != null) {
+                    val head = data.take(12).joinToString(" ") { "%02x".format(it) }
+                    Log.i(CarPlayConsts.TAG, "control iAP ← frame ${data.size}B head=$head")
+                    wifiIap.get()?.onInbound(data)
+                } else {
+                    Log.i(
+                        CarPlayConsts.TAG,
+                        "control ← ${msg.firstLine} body=${msg.body.size}B " +
+                            "type=${dict?.get("type")}",
+                    )
+                }
+            } else {
+                Log.i(
+                    CarPlayConsts.TAG,
+                    "control ← ${msg.firstLine} body=${msg.body.size}B",
+                )
+            }
+            controlReply200(msg)
+            return true
+        }
+        fun deliverControlResponse(msg: RtspMessage): Boolean {
+            val seq = msg.cSeq
+            if (seq < 0) return false
+            val q = controlPending[seq] ?: return false
+            return q.offer(msg)
+        }
+        fun awaitControlResponse(seq: Int, timeoutMs: Long): RtspMessage? {
+            val q = controlPending[seq] ?: return null
+            return try {
+                q.poll(timeoutMs, TimeUnit.MILLISECONDS)
+            } finally {
+                controlPending.remove(seq, q)
+            }
+        }
+        fun registerControlPending(seq: Int): ArrayBlockingQueue<RtspMessage> {
+            val q = ArrayBlockingQueue<RtspMessage>(1)
+            controlPending[seq] = q
+            return q
+        }
+        /**
+         * Drain inbound until a response, handling interleaved HU POSTs.
+         * Only safe when [controlPumpLive] is false (sole reader).
+         */
+        fun readControlUntilResponse(timeoutMs: Long): RtspMessage? {
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (running.get() && System.currentTimeMillis() < deadline) {
+                val raw = try {
+                    crypto.readMessage(input)
+                } catch (_: java.net.SocketTimeoutException) {
+                    continue
+                } ?: return null
+                val msg = RtspMessage.parse(raw) ?: continue
+                if (handleControlRequest(msg)) {
+                    if (msg.method.equals("TEARDOWN", ignoreCase = true)) return null
+                    continue
+                }
+                return msg
+            }
+            return null
+        }
+        // Header and plist are two ChaCha frames, same as the phone's control POST.
+        fun flushControlIap() {
+            while (running.get()) {
+                val frame = synchronized(iapTxLock) {
+                    if (iapTx.isEmpty()) return
+                    iapTx.removeFirst()
+                }
+                val body = BinaryPlist.encode(
+                    mapOf(
+                        "type" to "iAPSendMessage",
+                        "params" to mapOf("data" to frame),
+                    ),
+                    groupKeys = true,
+                )
+                val seq = cseq++
+                val head = RtspMessage(
+                    "POST /command RTSP/1.0",
+                    linkedMapOf(
+                        "Content-Length" to body.size.toString(),
+                        "Content-Type" to "application/x-apple-binary-plist",
+                        "CSeq" to seq.toString(),
+                        "User-Agent" to userAgent,
+                    ),
+                ).toBytes()
+                // Pump thread must never await a reply (it is the sole reader).
+                val awaitReply = !controlPumpLive.get() ||
+                    Thread.currentThread() !== controlPumpThread.get()
+                if (controlPumpLive.get() && awaitReply) {
+                    registerControlPending(seq)
+                }
+                synchronized(writeLock) {
+                    crypto.writeFrames(out, head, body)
+                }
+                Log.i(CarPlayConsts.TAG, "control iAP → POST ${frame.size}B")
+                when {
+                    !awaitReply -> Unit // 200 arrives as demux orphan on next read
+                    controlPumpLive.get() -> {
+                        val reply = awaitControlResponse(seq, 2_000L)
+                        if (reply == null) {
+                            Log.w(CarPlayConsts.TAG, "control iAP POST no 200 cseq=$seq")
+                        } else {
+                            Log.i(
+                                CarPlayConsts.TAG,
+                                "control iAP ← ${reply.firstLine} body=${reply.body.size}B",
+                            )
+                        }
+                    }
+                    else -> {
+                        val reply = readControlUntilResponse(2_000L)
+                        if (reply == null) {
+                            Log.w(CarPlayConsts.TAG, "control iAP POST no 200")
+                        } else {
+                            Log.i(
+                                CarPlayConsts.TAG,
+                                "control iAP ← ${reply.firstLine} body=${reply.body.size}B",
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        /**
+         * iPhone: screen SETUP → phone detect on control → HU SYN on control.
+         * Poll control for the SYN while flushing our detect / SYN|ACK queue.
+         */
+        fun awaitWifiSyn(timeoutMs: Long) {
+            val link = wifiIap.get() ?: return
+            link.announce()
+            val deadline = System.currentTimeMillis() + timeoutMs
+            val prevTimeout = socket.soTimeout
+            socket.soTimeout = 100
+            try {
+                while (running.get() && System.currentTimeMillis() < deadline) {
+                    flushControlIap()
+                    if (link.hasSyn()) {
+                        flushControlIap()
+                        Log.i(CarPlayConsts.TAG, "Wi-Fi iAP2 SYN seen on control")
+                        return
+                    }
+                    try {
+                        val raw = crypto.readMessage(input) ?: continue
+                        val msg = RtspMessage.parse(raw) ?: continue
+                        if (handleControlRequest(msg)) {
+                            flushControlIap()
+                            continue
+                        }
+                        Log.i(
+                            CarPlayConsts.TAG,
+                            "control iAP ← ${msg.firstLine} body=${msg.body.size}B",
+                        )
+                    } catch (_: java.net.SocketTimeoutException) {
+                        // keep polling
+                    } catch (e: Throwable) {
+                        Log.w(CarPlayConsts.TAG, "control poll during Wi-Fi iAP2 failed", e)
+                        return
+                    }
+                }
+                flushControlIap()
+                if (!link.hasSyn()) {
+                    Log.w(CarPlayConsts.TAG, "Wi-Fi iAP2 no SYN within ${timeoutMs}ms")
+                }
+            } finally {
+                socket.soTimeout = prevTimeout
+            }
+        }
+        controlIapFlush.set { flushControlIap() }
         fun exchangeEncrypted(req: RtspMessage): RtspMessage? {
+            flushControlIap()
+            val seq = req.cSeq
             val plain = req.toBytes()
+            val awaitReply = seq >= 0 && (
+                !controlPumpLive.get() ||
+                    Thread.currentThread() !== controlPumpThread.get()
+                )
+            if (controlPumpLive.get() && awaitReply) {
+                registerControlPending(seq)
+            }
             synchronized(writeLock) {
                 crypto.writeMessage(out, plain)
             }
@@ -320,27 +622,77 @@ class CarPlayRtspSession(
                 CarPlayConsts.TAG,
                 "AirPlay enc → ${req.firstLine} body=${req.body.size}B plain=${plain.size}B",
             )
-            val raw = crypto.readMessage(input) ?: return null
-            val msg = RtspMessage.parse(raw) ?: return null
+            val msg = when {
+                !awaitReply -> null // caller on pump thread: 200 is next demux hit
+                controlPumpLive.get() -> awaitControlResponse(seq, 5_000L)
+                else -> readControlUntilResponse(5_000L)
+            } ?: return null
             logAirPlayResponse("enc", msg)
             return msg
         }
+        controlOnMessage.set { msg ->
+            if (handleControlRequest(msg)) {
+                return@set !msg.method.equals("TEARDOWN", ignoreCase = true)
+            }
+            if (!deliverControlResponse(msg)) {
+                Log.i(
+                    CarPlayConsts.TAG,
+                    "AirPlay enc ← ${msg.firstLine} body=${msg.body.size}B (orphan cseq=${msg.cSeq})",
+                )
+            }
+            true
+        }
 
         val sessionUuid = UUID.randomUUID().toString().uppercase()
-        val setupSessionBody = BinaryPlist.encode(
-            linkedMapOf(
-                "deviceID" to (deviceId ?: "AA:DI:SP:LA:Y0:01"),
-                "macAddress" to (deviceId ?: "AA:DI:SP:LA:Y0:01"),
-                "model" to "iPhone14,2",
-                "name" to "AADisplay",
-                "osBuildVersion" to "20A392",
-                "osName" to "iPhone OS",
-                "osVersion" to "16.0",
-                "sessionUUID" to sessionUuid,
-                "sourceVersion" to "950.7.1",
-                "timingProtocol" to "NTP",
-            ),
+        val btMac = phoneMac?.takeIf { it.isNotBlank() }
+        val staMac = wifiMac?.takeIf { it.isNotBlank() } ?: btMac
+        val setupDeviceId = (if (mib3) btMac ?: deviceId else deviceId ?: btMac)
+            ?: "00:00:00:00:00:00"
+        val setupMac = (if (mib3) staMac ?: deviceId else deviceId ?: staMac)
+            ?: "00:00:00:00:00:00"
+        val timingIpv4 = if (mib3) CarPlayTiming.ipv4Beside(localAddress, peerHost) else null
+        if (mib3 && timingIpv4 == null) {
+            Log.e(
+                CarPlayConsts.TAG,
+                "timing no IPv4 beside $peerHost local=${localAddress?.hostAddress}",
+            )
+        }
+        val timingSocket = timingIpv4?.let { ip ->
+            CarPlayTiming.bind(ip)?.also { timing.getAndSet(it)?.close() }
+        }
+        val localIp = timingSocket?.localAddress?.hostAddress
+        val setupFields = linkedMapOf<String, Any?>(
+            "deviceID" to setupDeviceId,
+            "macAddress" to setupMac,
+            "model" to "iPhone14,2",
+            "name" to "AADisplay",
+            "osBuildVersion" to if (mib3) "17.5.1" else "20A392",
+            "osName" to "iPhone OS",
+            "osVersion" to if (mib3) "17.5.1" else "16.0",
+            "sessionUUID" to sessionUuid,
+            "sourceVersion" to if (mib3) "980.77.1" else "950.7.1",
+            "timingProtocol" to "NTP",
         )
+        if (mib3) {
+            // rvictl: iPhone UA is AirPlay/980.77.1, HKP 2, session body 747B.
+            // Delphi answers with a keep-alive UDP port (pcap :5020, 4-byte pings).
+            setupFields["sessionCorrelationUUID"] = UUID.randomUUID().toString().uppercase()
+            setupFields["keepAliveLowPower"] = true
+            setupFields["keepAliveSendStatsAsBody"] = true
+            setupFields["internalBuild"] = false
+            setupFields["diagnosticsAndUsage"] = false
+            setupFields["statsCollectionEnabled"] = false
+        }
+        if (timingSocket != null && localIp != null) {
+            // Audi sends NTP to this port (TCP source IP). timingPeerInfo made
+            // Delphi aim at the wrong place; audi.11 only advertises timingPort.
+            setupFields["timingPort"] = timingSocket.localPort
+            Log.i(
+                CarPlayConsts.TAG,
+                "timing port $localIp:${timingSocket.localPort}",
+            )
+        }
+        val setupSessionBody = BinaryPlist.encode(setupFields)
         val setup1 = exchangeEncrypted(
             RtspMessage(
                 "SETUP $sessionUrl RTSP/1.0",
@@ -359,9 +711,47 @@ class CarPlayRtspSession(
         }
         val setup1Dict = BinaryPlist.asDict(BinaryPlist.decode(setup1.body))
         val eventPort = BinaryPlist.intOf(setup1Dict?.get("eventPort"))?.toInt()?.and(0xffff)
-        Log.i(CarPlayConsts.TAG, "SETUP session ok eventPort=$eventPort")
+        val timingPort = BinaryPlist.intOf(setup1Dict?.get("timingPort"))?.toInt()?.and(0xffff)
+        val keepAlivePort = BinaryPlist.intOf(setup1Dict?.get("keepAlivePort"))?.toInt()?.and(0xffff)
+        Log.i(
+            CarPlayConsts.TAG,
+            "SETUP session ok eventPort=$eventPort timingPort=$timingPort " +
+                "keepAlivePort=$keepAlivePort body=${setupSessionBody.size}B keys=${setup1Dict?.keys}",
+        )
+        if (keepAlivePort != null && keepAlivePort > 0) {
+            startKeepAlive(peerHost, keepAlivePort)
+        }
+        if (mib3) {
+            if (timingPort != null && timingPort > 0) {
+                timingSocket?.notePeer(peerHost, timingPort)
+            }
+            // Plain GET /info is 455 before pair-verify. The display uuid lives on the
+            // encrypted channel, after the session exists. iPhone fetches it after the
+            // timing peer is named and before RECORD.
+            val info = exchangeEncrypted(
+                RtspMessage("GET /info RTSP/1.0", headers()),
+            )
+            if (info != null && info.firstLine.contains("200")) {
+                parseAccessoryInfo(info.body)
+            } else {
+                Log.w(CarPlayConsts.TAG, "encrypted /info ${info?.firstLine ?: "no response"}")
+            }
+        }
         if (eventPort != null && eventPort > 0) {
             // DiPlay acceptEvent arms Events-* cipher on connect — open before RECORD/screen.
+            val lsp = linkSyncBytes()
+            val evHolder = AtomicReference<CarPlayEventChannel?>(null)
+            val wifi = if (mib3 || lsp != null) {
+                WifiIap2Link(
+                    linkSync = lsp ?: ByteArray(0),
+                    audi = mib3,
+                ) { frame ->
+                    postControlIap(frame)
+                }
+            } else {
+                Log.w(CarPlayConsts.TAG, "Wi-Fi iAP2 skipped — Bluetooth LSP not ready")
+                null
+            }
             val ev = CarPlayEventChannel.open(
                 host = peerHost,
                 eventPort = eventPort,
@@ -373,66 +763,193 @@ class CarPlayRtspSession(
                 onHidKey = { dev, code, pressed, extra ->
                     CarPlayWheelController.onHidKey(dev, code, pressed, extra)
                 },
+                onIapMessage = { frame -> wifi?.onInbound(frame) },
             )
-            if (ev != null) CarPlayWheelController.setEnabled(true)
-            eventChannel.getAndSet(ev)?.close()
+            if (ev != null) {
+                CarPlayWheelController.setEnabled(true)
+                evHolder.set(ev)
+                eventChannel.getAndSet(ev)?.close()
+                wifi?.let {
+                    wifiIap.getAndSet(it)?.close()
+                    wifiIap.set(it)
+                    it.start()
+                }
+                ev.start()
+            } else {
+                wifi?.close()
+            }
         } else {
             Log.w(CarPlayConsts.TAG, "SETUP session missing eventPort — no touch/forceKeyFrame")
         }
 
-        val record = exchangeEncrypted(
-            RtspMessage("RECORD $sessionUrl RTSP/1.0", headers()),
-        ) ?: return false
-        if (!record.firstLine.contains("200")) {
-            Log.w(CarPlayConsts.TAG, "RECORD non-200: ${record.firstLine}")
-            return false
-        }
-        Log.i(CarPlayConsts.TAG, "RECORD ok — screen SETUP next")
-
-        val streamConnectionId = Random.nextLong() and Long.MAX_VALUE
-        val screenStream = linkedMapOf<String, Any?>(
-            "type" to 110L,
-            "streamConnectionID" to streamConnectionId,
-            // Slightly under audioLatencyMs so DiPlay holds PCM until AVC arrives.
-            "latencyMs" to 60L,
-            "fps" to CarPlayConsts.DEFAULT_VIDEO_FPS.toLong(),
-            "usingScreen" to true,
-            "supportsHighAccuracyTimestamps" to true,
-            "timestampInfo" to listOf(
-                mapOf("name" to "SubSu"),
-                mapOf("name" to "BePxT"),
-                mapOf("name" to "AfPxT"),
-                mapOf("name" to "BefEn"),
-                mapOf("name" to "EmEnc"),
-            ),
+        // DiPlay wants timing keys. CSM audi.10 openScreenStream (type 110):
+        // streamConnectionID (sign-bit cleared), latencyMs=75, uuid, displayWidth/
+        // displayHeight — then VideoStreamSender bare-avcC CONFIG with header[6]=0x04.
+        // Delphi 450.14 used displayUUID-only; Audi CSM uses "uuid" + canvas size.
+        val streamConnectionId = if (mib3) newStreamConnectionId64() else newStreamConnectionId()
+        val timestampInfo = listOf(
+            mapOf("name" to "SubSu"),
+            mapOf("name" to "BePxT"),
+            mapOf("name" to "AfPxT"),
+            mapOf("name" to "BefEn"),
+            mapOf("name" to "EmEnc"),
         )
-        val setupScreenBody = BinaryPlist.encode(mapOf("streams" to listOf(screenStream)))
-        val setup2 = exchangeEncrypted(
-            RtspMessage(
-                "SETUP $sessionUrl RTSP/1.0",
-                headers(
-                    mapOf(
-                        "Content-Type" to "application/x-apple-binary-plist",
-                        "Content-Length" to setupScreenBody.size.toString(),
+        // CSM uses /info widthPixels×heightPixels as-is (no 16-align). Aligning
+        // 1412×654 → 1424×656 made SETUP/CONFIG disagree with the panel touch space.
+        val screenW = if (mib3) accessoryTouchMaxX.coerceAtLeast(16) else CarPlayConsts.ENCODE_WIDTH
+        val screenH = if (mib3) accessoryTouchMaxY.coerceAtLeast(16) else CarPlayConsts.ENCODE_HEIGHT
+        val screenStream: Map<String, Any?> = if (mib3) {
+            val uuid = accessoryDisplayUuid
+            if (uuid == null) {
+                Log.e(CarPlayConsts.TAG, "SETUP screen audi missing uuid from /info")
+                return false
+            }
+            linkedMapOf(
+                "type" to 110,
+                "streamConnectionID" to streamConnectionId,
+                "latencyMs" to 75,
+                "uuid" to uuid,
+                "displayWidth" to screenW,
+                "displayHeight" to screenH,
+            )
+        } else {
+            linkedMapOf(
+                "type" to 110L,
+                "streamConnectionID" to streamConnectionId,
+                // Slightly under audioLatencyMs so DiPlay holds PCM until AVC arrives.
+                "latencyMs" to 60L,
+                "fps" to CarPlayConsts.DEFAULT_VIDEO_FPS.toLong(),
+                "usingScreen" to true,
+                "supportsHighAccuracyTimestamps" to true,
+                "timestampInfo" to timestampInfo,
+            )
+        }
+        fun sendScreenSetup(requested: List<Map<String, Any?>>, label: String): RtspMessage? {
+            val setupScreenBody = BinaryPlist.encode(
+                mapOf("streams" to requested),
+                minObjectRefSize = if (mib3) 2 else 1,
+            )
+            Log.i(
+                CarPlayConsts.TAG,
+                "SETUP screen mib3=$mib3 $label ${screenW}x$screenH " +
+                    "uuid=${accessoryDisplayUuid ?: "none"} streams=${requested.size} " +
+                    "id=$streamConnectionId body=${setupScreenBody.size}B",
+            )
+            return exchangeEncrypted(
+                RtspMessage(
+                    "SETUP $sessionUrl RTSP/1.0",
+                    headers(
+                        mapOf(
+                            "Content-Type" to "application/x-apple-binary-plist",
+                            "Content-Length" to setupScreenBody.size.toString(),
+                        ),
+                    ),
+                    setupScreenBody,
+                ),
+            )
+        }
+        fun sendRecord(): Boolean {
+            val record = exchangeEncrypted(
+                RtspMessage("RECORD $sessionUrl RTSP/1.0", headers()),
+            ) ?: return false
+            if (!record.firstLine.contains("200")) {
+                Log.w(CarPlayConsts.TAG, "RECORD non-200: ${record.firstLine}")
+                return false
+            }
+            Log.i(CarPlayConsts.TAG, "RECORD ok")
+            return true
+        }
+        fun postControlCommand(plist: Map<String, Any?>, label: String): Boolean {
+            // Match CSM Bplist.encode defaults (no forced ref size / key grouping).
+            val body = BinaryPlist.encode(plist)
+            val resp = exchangeEncrypted(
+                RtspMessage(
+                    "POST /command RTSP/1.0",
+                    headers(
+                        mapOf(
+                            "Content-Type" to "application/x-apple-binary-plist",
+                            "Content-Length" to body.size.toString(),
+                        ),
+                    ),
+                    body,
+                ),
+            )
+            val ok = resp?.firstLine?.contains("200") == true
+            Log.i(
+                CarPlayConsts.TAG,
+                "control $label → POST ${body.size}B ${if (ok) "ok" else "fail=${resp?.firstLine}"}",
+            )
+            return ok
+        }
+        /**
+         * iPhone posts modesChanged (~232B) after screen is up; Audi accepts that.
+         * CSM's InitialCarPlayConnection changeModes gets 422 on this HU — skip it.
+         */
+        fun announcePhoneModesChanged(): Boolean = postControlCommand(
+            linkedMapOf(
+                "type" to "modesChanged",
+                "params" to linkedMapOf(
+                    // Screen + MainAudio on phone (entity=1). Without resourceID=2 the
+                    // Audi mixer stays gray / silent even though type-102 AAC is flowing.
+                    "resources" to listOf(
+                        linkedMapOf(
+                            "resourceID" to 1,
+                            "entity" to 1,
+                            "permanentEntity" to 1,
+                        ),
+                        linkedMapOf(
+                            "resourceID" to 2,
+                            "entity" to 1,
+                            "permanentEntity" to 1,
+                        ),
+                    ),
+                    "appStates" to listOf(
+                        linkedMapOf("appStateID" to 2, "entity" to 0),
+                        linkedMapOf("appStateID" to 3, "entity" to 0),
+                        linkedMapOf("appStateID" to 1, "entity" to 0, "speechMode" to -1),
                     ),
                 ),
-                setupScreenBody,
             ),
-        ) ?: return false
-        if (!setup2.firstLine.contains("200")) {
-            Log.w(CarPlayConsts.TAG, "SETUP screen non-200: ${setup2.firstLine}")
-            return false
+            "modesChanged phone-owns-screen+audio",
+        )
+        val setup2 = if (mib3) {
+            if (!sendRecord()) return false
+            // iPhone: answer event commands, then screen SETUP, then control-socket detect.
+            val commands = eventChannel.get()?.awaitBeforeScreen(900L) ?: 0
+            Log.i(CarPlayConsts.TAG, "event commands before screen=$commands")
+            val timingOk = timingSocket?.awaitPacket(1_200L) == true
+            if (!timingOk) {
+                Log.w(CarPlayConsts.TAG, "timing no packet before screen SETUP")
+            }
+            val screen = sendScreenSetup(listOf(screenStream), "screen") ?: return false
+            if (!screen.firstLine.contains("200")) {
+                Log.w(CarPlayConsts.TAG, "SETUP screen audi non-200: ${screen.firstLine}")
+                return false
+            }
+            screen
+        } else {
+            if (!sendRecord()) return false
+            val screen = sendScreenSetup(listOf(screenStream), "diplay") ?: return false
+            if (!screen.firstLine.contains("200")) {
+                Log.w(CarPlayConsts.TAG, "SETUP screen non-200: ${screen.firstLine}")
+                return false
+            }
+            screen
         }
         val setup2Dict = BinaryPlist.asDict(BinaryPlist.decode(setup2.body))
         val streams = setup2Dict?.get("streams") as? List<*>
-        val first = BinaryPlist.asDict(streams?.firstOrNull())
-        val dataPortRaw = BinaryPlist.intOf(first?.get("dataPort"))
+        val screenDict = streams?.firstNotNullOfOrNull { item ->
+            val dict = BinaryPlist.asDict(item) ?: return@firstNotNullOfOrNull null
+            val type = BinaryPlist.intOf(dict["type"])?.toInt()
+            if (mib3 && type != 110) null else dict
+        } ?: BinaryPlist.asDict(streams?.firstOrNull())
+        val dataPortRaw = BinaryPlist.intOf(screenDict?.get("dataPort"))
         val dataPort = dataPortRaw?.toInt()?.and(0xffff)
         if (dataPort == null || dataPort <= 0) {
             Log.e(
                 CarPlayConsts.TAG,
                 "SETUP screen missing dataPort body=${setup2.body.size}B " +
-                    "dictKeys=${setup2Dict?.keys} streamKeys=${first?.keys} raw=$dataPortRaw",
+                    "dictKeys=${setup2Dict?.keys} streamKeys=${screenDict?.keys} raw=$dataPortRaw",
             )
             return false
         }
@@ -440,38 +957,55 @@ class CarPlayRtspSession(
             CarPlayConsts.TAG,
             "SETUP screen ok dataPort=$dataPort streamConnectionID=$streamConnectionId",
         )
+        // iPhone Frida: after screen dataPort 200, phone detect on control → HU SYN on control.
+        if (mib3) awaitWifiSyn(4_000L)
 
-        val w = CarPlayConsts.ENCODE_WIDTH
-        val h = CarPlayConsts.ENCODE_HEIGHT
+        // MIB3: encode at /info panel size as-is; header content==display==coded.
+        // DiPlay keeps the fixed 1280×720 canvas + fourcc-wrapped CONFIG.
         val egress = ScreenStreamEgress.open(
             host = peerHost,
             dataPort = dataPort,
             sessionKey = sharedSecret,
             streamConnectionId = streamConnectionId,
-            width = w,
-            height = h,
+            width = screenW,
+            height = screenH,
+            displayWidth = screenW,
+            displayHeight = screenH,
+            wrapAvccFourcc = !mib3,
         ) ?: return false
         screenEgress.getAndSet(egress)?.close()
         // Shared A/V timeline — must start before encoder + audio pumps.
         CarPlayMediaClock.reset()
-        lastCodecConfig.get()?.let { cfg ->
-            egress.sendCodecConfig(cfg, CarPlayMediaClock.videoTimestampNs())
-        }
+        // Drop stale SPS/PPS from the pre-SETUP encoder. Refresh the codec *before*
+        // arming streaming so ensureEncoder's live-stream gate does not block this one
+        // intentional restart; never wire an old High-profile avcC (Audi black + ~8s kill).
+        lastCodecConfig.set(null)
+        onVideoSetup(screenW, screenH)
         streaming.set(true)
-        onVideoSetup(w, h)
+        onForceKeyFrame()
 
-        // Audio: media always; speech only when system_server has an exclusive nav tap
-        // (otherwise DiPlay mixes a bleed/empty speech stream with media → 重音).
-        setupAudioStream(
-            peerHost,
-            sharedSecret,
-            { extra -> headers(extra) },
-            sessionUrl,
-            { req -> exchangeEncrypted(req) },
-            CarPlayAudioEgress.MEDIA,
-            mediaAudioEgress,
-        )
-        val speechReady = try {
+        // Audio: Audi MIB3 needs type-102 AAC-LC (CSM path). DiPlay keeps type-100 PCM.
+        // Speech only when system_server has an exclusive nav tap (else DiPlay 重音).
+        if (mib3) {
+            setupAacMediaStream(
+                peerHost,
+                sharedSecret,
+                { extra -> headers(extra) },
+                sessionUrl,
+                { req -> exchangeEncrypted(req) },
+            )
+        } else {
+            setupAudioStream(
+                peerHost,
+                sharedSecret,
+                { extra -> headers(extra) },
+                sessionUrl,
+                { req -> exchangeEncrypted(req) },
+                CarPlayAudioEgress.MEDIA,
+                mediaAudioEgress,
+            )
+        }
+        val speechReady = !mib3 && try {
             CoreApi.isCarPlaySpeechCaptureReady()
         } catch (_: Throwable) {
             false
@@ -486,13 +1020,143 @@ class CarPlayRtspSession(
                 CarPlayAudioEgress.SPEECH,
                 speechAudioEgress,
             )
-        } else {
+        } else if (!mib3) {
             Log.i(CarPlayConsts.TAG, "skip speech SETUP — no exclusive AudioPolicy nav tap")
         }
 
         onSessionReady()
         Log.i(CarPlayConsts.TAG, "screen egress armed — AVC frames → dataPort=$dataPort")
+        if (mib3) {
+            // After Wi-Fi iAP auth+burst (~1s). Claiming during AA00/AA05 races the
+            // control socket with iAP POSTs and Audi still dies ~12s later.
+            thread(name = "carplay-modes-announce", isDaemon = true) {
+                try {
+                    Thread.sleep(1_500L)
+                    // Wait until the sole control reader is up so demux can
+                    // deliver the modesChanged 200 (no dual-read race).
+                    val waitPump = System.currentTimeMillis() + 3_000L
+                    while (!controlPumpLive.get() &&
+                        System.currentTimeMillis() < waitPump
+                    ) {
+                        Thread.sleep(50L)
+                    }
+                } catch (_: InterruptedException) {
+                    return@thread
+                }
+                if (!running.get() || !streaming.get()) return@thread
+                // Audi can drop MainAudio after the first claim while AAC still flows
+                // (volume UI live, speakers silent). Re-claim a few times like CSM.
+                announcePhoneModesChanged()
+                for (delayMs in longArrayOf(4_000L, 12_000L)) {
+                    try {
+                        Thread.sleep(delayMs)
+                    } catch (_: InterruptedException) {
+                        return@thread
+                    }
+                    if (!running.get() || !streaming.get()) return@thread
+                    announcePhoneModesChanged()
+                }
+            }
+        }
         return true
+    }
+
+    /**
+     * MIB3 / Audi: SETUP type-102 AAC-LC media (CSM audi.11). Binds a local UDP
+     * controlPort like the phone; HU may return its own controlPort in the 200.
+     */
+    private fun setupAacMediaStream(
+        peerHost: InetAddress,
+        sharedSecret: ByteArray,
+        headers: (Map<String, String>) -> LinkedHashMap<String, String>,
+        sessionUrl: String,
+        exchangeEncrypted: (RtspMessage) -> RtspMessage?,
+    ) {
+        val localControl = try {
+            CarPlayAccessoryNet.openUdp()
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "AAC local controlPort bind failed", e)
+            return
+        }
+        try {
+            val localControlPort = localControl.localPort
+            val streamConnectionId = Random.nextLong() and Long.MAX_VALUE
+            val rate = accessoryAacSampleRate
+            val formatBit = accessoryAacFormatBit
+            val audioStream = linkedMapOf<String, Any?>(
+                "type" to CarPlayAacAudioEgress.STREAM_TYPE,
+                "streamConnectionID" to streamConnectionId,
+                "controlPort" to localControlPort,
+                "encryptionType" to 0L,
+                "audioFormat" to formatBit,
+                "sampleRate" to rate,
+                "channels" to 2L,
+                "bytesPerFrame" to 4L,
+                "framesPerPacket" to 1024L,
+                "audioMode" to 0L,
+                "audioType" to "media",
+                "audioLatencyMs" to CarPlayAacAudioEgress.AUDIO_LATENCY_MS,
+                "supportsHighAccuracyTimestamps" to true,
+                "sr" to rate,
+                "spf" to 1024L,
+                "ct" to 4L,
+            )
+            val body = BinaryPlist.encode(mapOf("streams" to listOf(audioStream)))
+            val resp = exchangeEncrypted(
+                RtspMessage(
+                    "SETUP $sessionUrl RTSP/1.0",
+                    headers(
+                        mapOf(
+                            "Content-Type" to "application/x-apple-binary-plist",
+                            "Content-Length" to body.size.toString(),
+                        ),
+                    ),
+                    body,
+                ),
+            )
+            if (resp == null || !resp.firstLine.contains("200")) {
+                Log.w(
+                    CarPlayConsts.TAG,
+                    "CarPlay AAC media SETUP rejected: ${resp?.firstLine}",
+                )
+                localControl.close()
+                return
+            }
+            val egress = CarPlayAacAudioEgress.open(
+                peerHost,
+                resp,
+                sharedSecret,
+                streamConnectionId,
+                rate,
+                formatBit,
+            )
+            // Keep local control socket open so HU RTCP has a peer (CSM does the same).
+            thread(name = "carplay-audio-rtcp", isDaemon = true) {
+                val buf = ByteArray(2048)
+                try {
+                    while (!localControl.isClosed) {
+                        try {
+                            localControl.receive(DatagramPacket(buf, buf.size))
+                        } catch (_: Throwable) {
+                            break
+                        }
+                    }
+                } finally {
+                    try {
+                        localControl.close()
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+            mediaAacEgress.getAndSet(egress)?.stop()
+            egress?.start()
+        } catch (e: Throwable) {
+            try {
+                localControl.close()
+            } catch (_: Throwable) {
+            }
+            Log.w(CarPlayConsts.TAG, "CarPlay AAC media SETUP failed (screen continues)", e)
+        }
     }
 
     /**
@@ -555,21 +1219,65 @@ class CarPlayRtspSession(
         }
     }
 
-    private fun pumpEncryptedControl(crypto: ControlChannelCrypto, input: BufferedInputStream) {
+    private fun pumpEncryptedControl(
+        crypto: ControlChannelCrypto,
+        input: BufferedInputStream,
+        out: BufferedOutputStream,
+    ) {
         Log.i(CarPlayConsts.TAG, "encrypted control pump (video on dataPort)")
+        var lastFeedbackAt = 0L
         while (running.get()) {
+            controlIapFlush.get()?.invoke()
+            val now = System.currentTimeMillis()
+            // AirPlay source keep-alive: POST /feedback ~2s. Write-only on the
+            // pump thread (never await — that would deadlock the sole reader).
+            if (now - lastFeedbackAt >= 2_000L) {
+                lastFeedbackAt = now
+                try {
+                    sendControlFeedback(crypto, out)
+                } catch (e: Throwable) {
+                    Log.w(CarPlayConsts.TAG, "control feedback failed", e)
+                }
+            }
             val raw = try {
                 crypto.readMessage(input)
+            } catch (_: java.net.SocketTimeoutException) {
+                continue
             } catch (e: Throwable) {
                 Log.w(CarPlayConsts.TAG, "encrypted control read ended", e)
                 break
-            } ?: break
-            val msg = RtspMessage.parse(raw)
-            Log.i(
-                CarPlayConsts.TAG,
-                "AirPlay enc ← ${msg?.firstLine ?: "?"} body=${msg?.body?.size ?: 0}B",
-            )
+            }
+            if (raw == null) {
+                Log.w(CarPlayConsts.TAG, "encrypted control EOF (peer closed)")
+                break
+            }
+            val msg = RtspMessage.parse(raw) ?: continue
+            val cont = controlOnMessage.get()?.invoke(msg) ?: true
+            if (!cont) {
+                Log.i(CarPlayConsts.TAG, "control TEARDOWN — ending pump")
+                break
+            }
         }
+    }
+
+    /** Lightweight control keep-alive (write-only; 200 lands as demux orphan). */
+    private fun sendControlFeedback(
+        crypto: ControlChannelCrypto,
+        out: BufferedOutputStream,
+    ) {
+        val seq = feedbackCseq.getAndIncrement()
+        val req = RtspMessage(
+            "POST /feedback RTSP/1.0",
+            linkedMapOf(
+                "CSeq" to seq.toString(),
+                "Content-Length" to "0",
+                "User-Agent" to "AirPlay/980.77.1",
+            ),
+        )
+        synchronized(writeLock) {
+            crypto.writeMessage(out, req.toBytes())
+        }
+        Log.d(CarPlayConsts.TAG, "control feedback → cseq=$seq")
     }
 
     private fun logAirPlayResponse(label: String, msg: RtspMessage?) {
@@ -826,6 +1534,11 @@ class CarPlayRtspSession(
             lastCodecConfig.set(au)
             val screen = screenEgress.get()
             if (screen != null) {
+                // Mid-stream encoder recycle used to re-send avcC; Audi closes control.
+                if (screen.hasSentConfig()) {
+                    Log.i(CarPlayConsts.TAG, "skip mid-stream CONFIG (${au.size}B)")
+                    return 0
+                }
                 val ok = screen.sendCodecConfig(au, ptsUs * 1_000L)
                 return if (ok) 1 else 0
             }
@@ -835,7 +1548,8 @@ class CarPlayRtspSession(
         val screen = screenEgress.get()
         if (screen != null) {
             if (!screen.hasSentConfig()) {
-                lastCodecConfig.get()?.let { screen.sendCodecConfig(it, ptsUs * 1_000L) }
+                val cfg = lastCodecConfig.get() ?: return 0
+                if (!screen.sendCodecConfig(cfg, ptsUs * 1_000L)) return 0
             }
             val ok = screen.sendVideo(au, ptsUs * 1_000L, isKey)
             return if (ok) 1 else 0
@@ -873,12 +1587,6 @@ class CarPlayRtspSession(
         return written
     }
 
-    /** Test hook: arm streaming without HU RECORD (local loop verification). */
-    fun armStreamingForTest() {
-        streaming.set(true)
-        Log.i(CarPlayConsts.TAG, "RTSP streaming armed (test)")
-    }
-
     private fun parseInterleavedChannel(transport: String): Int {
         val m = Regex("interleaved=(\\d+)", RegexOption.IGNORE_CASE).find(transport)
         return m?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 0
@@ -898,14 +1606,109 @@ class CarPlayRtspSession(
     private fun parseAccessoryInfo(body: ByteArray) {
         val root = BinaryPlist.asDict(BinaryPlist.decode(body)) ?: return
         val displays = root["displays"] as? List<*>
-        val main = BinaryPlist.asDict(displays?.firstOrNull()) ?: return
-        val w = BinaryPlist.intOf(main["widthPixels"])?.toInt()?.and(0xffff)
-        val h = BinaryPlist.intOf(main["heightPixels"])?.toInt()?.and(0xffff)
-        if (w != null && w > 0 && h != null && h > 0) {
-            accessoryTouchMaxX = w
-            accessoryTouchMaxY = h
-            Log.i(CarPlayConsts.TAG, "accessory /info display ${w}x$h (HID touch space)")
+        val main = displays?.firstNotNullOfOrNull { item ->
+            val dict = BinaryPlist.asDict(item) ?: return@firstNotNullOfOrNull null
+            val w = BinaryPlist.intOf(dict["widthPixels"])
+            if (w != null && w > 0) dict else null
+        } ?: BinaryPlist.asDict(displays?.firstOrNull())
+        if (main != null) {
+            val w = BinaryPlist.intOf(main["widthPixels"])?.toInt()?.and(0xffff)
+            val h = BinaryPlist.intOf(main["heightPixels"])?.toInt()?.and(0xffff)
+            if (w != null && w > 0 && h != null && h > 0) {
+                accessoryTouchMaxX = w
+                accessoryTouchMaxY = h
+                Log.i(CarPlayConsts.TAG, "accessory /info display ${w}x$h (HID touch space)")
+            }
+            val uuid = displayUuidOf(main)
+            if (uuid != null) {
+                accessoryDisplayUuid = uuid
+                Log.i(CarPlayConsts.TAG, "accessory display uuid=$uuid")
+            }
         }
+        if (accessoryDisplayUuid == null) {
+            findDisplayUuid(root)?.let { uuid ->
+                accessoryDisplayUuid = uuid
+                Log.i(CarPlayConsts.TAG, "accessory display uuid=$uuid (nested)")
+            }
+        }
+        // Prefer 48 kHz AAC (matches our capture); fall back to 44.1 if that is all
+        // the HU advertises under type=102 media.
+        val formats = root["audioFormats"] as? List<*>
+        var saw48 = false
+        var saw44 = false
+        for (item in formats.orEmpty()) {
+            val dict = BinaryPlist.asDict(item) ?: continue
+            val type = BinaryPlist.intOf(dict["type"])?.toInt()
+            if (type != 102) continue
+            val audioType = dict["audioType"]?.toString()
+            if (audioType != null && !audioType.equals("media", ignoreCase = true)) continue
+            val bits = BinaryPlist.intOf(dict["audioOutputFormats"]) ?: continue
+            if ((bits and CarPlayAacAudioEgress.AUDIO_FORMAT_AAC_LC_48000_STEREO) != 0L) {
+                saw48 = true
+            }
+            if ((bits and CarPlayAacAudioEgress.AUDIO_FORMAT_AAC_LC_44100_STEREO) != 0L) {
+                saw44 = true
+            }
+        }
+        when {
+            saw48 -> {
+                accessoryAacSampleRate = 48_000
+                accessoryAacFormatBit = CarPlayAacAudioEgress.AUDIO_FORMAT_AAC_LC_48000_STEREO
+            }
+            saw44 -> {
+                accessoryAacSampleRate = 44_100
+                accessoryAacFormatBit = CarPlayAacAudioEgress.AUDIO_FORMAT_AAC_LC_44100_STEREO
+            }
+        }
+        Log.i(
+            CarPlayConsts.TAG,
+            "accessory /info AAC media rate=$accessoryAacSampleRate " +
+                "format=0x${accessoryAacFormatBit.toString(16)} saw48=$saw48 saw44=$saw44",
+        )
+    }
+
+    private fun displayUuidOf(dict: Map<String, Any?>): String? {
+        for (key in listOf("uuid", "displayUUID", "UUID")) {
+            val value = dict[key] as? String
+            if (!value.isNullOrBlank() && value.contains('-')) return value
+        }
+        return null
+    }
+
+    private fun findDisplayUuid(node: Any?): String? {
+        when (node) {
+            is Map<*, *> -> {
+                val dict = BinaryPlist.asDict(node)
+                if (dict != null) {
+                    val uuid = displayUuidOf(dict)
+                    val w = BinaryPlist.intOf(dict["widthPixels"])
+                    if (uuid != null && w != null && w > 0) return uuid
+                }
+                for (value in node.values) {
+                    findDisplayUuid(value)?.let { return it }
+                }
+            }
+            is List<*> -> {
+                for (item in node) {
+                    findDisplayUuid(item)?.let { return it }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun align16(v: Int): Int = (v.coerceAtLeast(16) + 15) and 15.inv()
+
+    /** 1..2^31-1 so binary plist writes a 4-byte int (DiPlay echoes this width). */
+    private fun newStreamConnectionId(): Long {
+        val id = Random.nextInt().toLong() and 0x7fffffffL
+        return if (id == 0L) 1L else id
+    }
+
+    /** Full width iOS sends on Delphi 450.14 (connectionID past 2^32). */
+    private fun newStreamConnectionId64(): Long {
+        val id = Random.nextLong() and Long.MAX_VALUE
+        return if (id == 0L) 1L else id
     }
 
     fun stop() {

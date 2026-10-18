@@ -5,8 +5,7 @@ import android.net.nsd.NsdServiceInfo
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import android.view.View
-import io.github.nitsuya.aa.display.BuildConfig
+import io.github.nitsuya.aa.display.CoreApi
 import io.github.nitsuya.aa.display.carplay.protocol.Iap2Csm
 import io.github.nitsuya.aa.display.carplay.protocol.Iap2Session
 import io.github.nitsuya.aa.display.egress.ProjectionSessionGate
@@ -35,6 +34,10 @@ class CarPlaySourceSession(
      */
     @Volatile
     private var supplyFps = CarPlayConsts.DEFAULT_VIDEO_FPS
+    @Volatile
+    private var encodeW = CarPlayConsts.ENCODE_WIDTH
+    @Volatile
+    private var encodeH = CarPlayConsts.ENCODE_HEIGHT
     private var badRateWindows = 0
     private var goodRateWindows = 0
     private var lastDropCount = 0L
@@ -62,7 +65,9 @@ class CarPlaySourceSession(
         if (!running.compareAndSet(false, true)) return
         Log.i(CarPlayConsts.TAG, "CarPlaySourceSession start")
         ProjectionSessionGate.setCarPlayLive(true)
-        wifiHandoff = CarPlayWifiHandoff(appContext)
+        wifiHandoff = CarPlayWifiHandoff(appContext).also { handoff ->
+            handoff.onBound = { mac -> iap2?.noteAccessoryWifiBound(mac) }
+        }
 
         supplyFps = CarPlayConsts.DEFAULT_VIDEO_FPS
         badRateWindows = 0
@@ -76,15 +81,23 @@ class CarPlaySourceSession(
             // Screen SETUP (incl. DiPlay re-SETUP after TCP reset): always mint a fresh
             // MediaCodec input Surface. Keeping a wedged GL→encoder Surface leaves the
             // codec at in=0 while GlCompositor still reports ~60fps — DiPlay freezes.
-            onVideoSetup = { w, h -> ensureEncoder(w, h, forceSurfaceRefresh = true) },
+            onVideoSetup = { w, h ->
+                ensureEncoder(w, h, forceSurfaceRefresh = true)
+                // Audi MIB3 needs a real IDR immediately after dataPort open; intra-refresh
+                // sync frames (~464B) were not enough and the HU timed out the session.
+                encoder.requestKeyFrame()
+            },
             onSessionReady = {
-                ensureEncoder(CarPlayConsts.DEFAULT_VIDEO_WIDTH, CarPlayConsts.DEFAULT_VIDEO_HEIGHT)
+                // Do not ensureEncoder here — a second bindGl/forceFreshSurface mid-stream
+                // re-sends CONFIG and Audi drops control within ~3s.
+                encoder.requestKeyFrame()
                 // CarPlay session live on the car → drive NowPlaying (cluster card) from the
                 // shared lyric store; the host re-triggers its caption per title change.
                 iap2?.let { CarPlayNowPlaying.start(appContext, it) }
             },
             onTouchEvent = { x, y, action -> CarPlayInputBridge.injectNormalized(x, y, action) },
             onForceKeyFrame = { encoder.requestKeyFrame() },
+            linkSyncBytes = { iap2?.acceptedLinkSync() },
         )
         rtsp = rtspSession
         rtspSession.startServer()
@@ -102,24 +115,21 @@ class CarPlaySourceSession(
                 bj.registerControl(port)
             }
             bj.startDiscovery()
-            if (BuildConfig.DEBUG && CarPlayConsts.ENABLE_LOCAL_RTSP_LOOPBACK) {
-                CarPlayLocalLoopback.armAfterServerReady(
-                    portProvider = { rtspSession.localPort },
-                    running = { running.get() },
-                )
-            }
         }.start()
 
         val link = CarPlayBluetoothLink(
             appContext,
             onConnected = { iap2?.onTransportConnected() },
-            onDisconnected = {
-                iap2?.onTransportClosed()
+            onDisconnected = disconnect@{
+                if (iap2?.onTransportClosed() == false) return@disconnect
                 // Stop zombie UDP audio / screen / NowPlaying so DiPlay can re-Auth.
                 rtsp?.releaseMediaStreams("iap-rfcomm-closed")
                 CarPlayNowPlaying.stop()
             },
             onBytes = { bytes -> iap2?.onBytes(bytes) },
+            // Detect/SYN/auth all count as live — mid-negotiate must not be replaced.
+            sessionLive = { iap2?.isNegotiatingOrLive() == true },
+            onPeer = { name, address -> iap2?.notePeer(name, address) },
         )
         bluetooth = link
         iap2 = Iap2Session(
@@ -135,6 +145,12 @@ class CarPlaySourceSession(
                 Log.i(CarPlayConsts.TAG, "iAP auth done → WiFi / CarPlayStartSession")
             },
             onWifiConfig = { wifi ->
+                // Before join: disable saved-STA autojoin so Audi/Carplay cannot
+                // become ACCEPT_UNVALIDATED default and kill cellular.
+                try {
+                    CoreApi.preferCellularOverUnvalidatedWifi()
+                } catch (_: Throwable) {
+                }
                 // Join only; dial waits for CarPlayStartSession + network ready.
                 wifiHandoff?.ensureAccessoryWifi(wifi.ssid, wifi.passphrase, wifi.channel) {}
             },
@@ -185,7 +201,7 @@ class CarPlaySourceSession(
                 Log.e(CarPlayConsts.TAG, "StartSession resolve failed $host", e)
                 return@Thread
             }
-            // Handoff / DHCP may still be settling after bindProcessToNetwork.
+            // Handoff / DHCP may still be settling after accessory Wi‑Fi bind.
             var lastErr: Throwable? = null
             for (attempt in 1..12) {
                 if (!running.get()) return@Thread
@@ -196,10 +212,21 @@ class CarPlaySourceSession(
                             "deviceId=${start.deviceId} attempt=$attempt",
                     )
                     // Probe reachability before committing the AirPlay handshake thread.
-                    java.net.Socket().use { probe ->
+                    CarPlayAccessoryNet.openTcp().use { probe ->
                         probe.connect(java.net.InetSocketAddress(addr, port), 2_500)
                     }
-                    rtsp?.connectAsAirPlaySource(addr, port, start.deviceId)
+                    val mib3 = start.ssid?.let { ssid ->
+                        ssid.contains("audi", ignoreCase = true) ||
+                            ssid.contains("mmi", ignoreCase = true)
+                    } == true
+                    rtsp?.connectAsAirPlaySource(
+                        addr,
+                        port,
+                        start.deviceId,
+                        mib3,
+                        bluetooth?.localAddress(),
+                        wifiHandoff?.staMacForAnnounce(),
+                    )
                     return@Thread
                 } catch (e: Throwable) {
                     lastErr = e
@@ -207,6 +234,22 @@ class CarPlaySourceSession(
                         CarPlayConsts.TAG,
                         "AirPlay dial attempt=$attempt failed: ${e.message}",
                     )
+                    // Stale/missing accessory Network: kick handoff so the next
+                    // probe binds to Wi‑Fi instead of LTE default (10.13.x → AP fail).
+                    val ssid = start.ssid
+                    if (!ssid.isNullOrBlank() &&
+                        (e.message?.contains("accessory Wi-Fi") == true ||
+                            !CarPlayAccessoryNet.hasNetwork())
+                    ) {
+                        try {
+                            wifiHandoff?.ensureAccessoryWifi(
+                                ssid,
+                                start.passphrase,
+                                start.channel,
+                            ) {}
+                        } catch (_: Throwable) {
+                        }
+                    }
                     try {
                         Thread.sleep(750L)
                     } catch (_: InterruptedException) {
@@ -216,19 +259,6 @@ class CarPlaySourceSession(
             }
             Log.e(CarPlayConsts.TAG, "StartSession dial failed $host:$port after retries", lastErr)
         }, "carplay-start-dial").apply { isDaemon = true }.start()
-    }
-
-    fun attachShellView(view: View?) {
-        // Exclusive egress: AA shell is never teed into CarPlay. Keep the hook so
-        // ShellFrameEgress rebind stays harmless if AA UI still offers a shell.
-        tee.attachShell(null)
-        if (view != null) {
-            Log.d(CarPlayConsts.TAG, "attachShellView ignored (CarPlay Host exclusive)")
-        }
-    }
-
-    fun attachFrameProvider(provider: FrameEgressTee.FrameProvider?) {
-        tee.attachFrameProvider(provider)
     }
 
     /**
@@ -254,8 +284,13 @@ class CarPlaySourceSession(
         glCompositor = compositor
         compositor?.onRateReport = { target, actual -> onRateReport(target, actual) }
         if (!running.get()) return
-        // Host may attach after tee-armed SETUP — always rebind with a fresh Surface
+        // Host may attach after tee-armed SETUP — rebind with a fresh Surface
         // (Canvas lockCanvas contaminates the prior MediaCodec input on Samsung).
+        // Never do that while the HU screen stream is live.
+        if (rtsp?.isStreaming() == true) {
+            Log.w(CarPlayConsts.TAG, "attachGl skip rebind — screen streaming")
+            return
+        }
         if (compositor != null) {
             cancelGlRebindRetry()
             if (encoder.currentFps() > 0) {
@@ -263,13 +298,6 @@ class CarPlaySourceSession(
             }
         } else if (encoder.currentFps() > 0) {
             bindGlOrTee(supplyFps, forceFreshSurface = false)
-        }
-    }
-
-    fun onShellSize(width: Int, height: Int) {
-        if (width > 0 && height > 0) {
-            CarPlayInputBridge.shellWidthPx = width
-            CarPlayInputBridge.shellHeightPx = height
         }
     }
 
@@ -311,14 +339,40 @@ class CarPlaySourceSession(
 
     private fun ensureEncoderMain(width: Int, height: Int, forceSurfaceRefresh: Boolean) {
         if (!running.get()) return
-        val encW = CarPlayConsts.ENCODE_WIDTH
-        val encH = CarPlayConsts.ENCODE_HEIGHT
+        // MIB3 /info pixels as-is (Audi 1412×654). 16-align made SPS 1424×656 while
+        // SETUP/CONFIG stayed 1412×654 — HU black + ~12s airplay-control kill.
+        val (encW, encH) = if (
+            width > 0 && height > 0 &&
+            (width != CarPlayConsts.DEFAULT_VIDEO_WIDTH || height != CarPlayConsts.DEFAULT_VIDEO_HEIGHT)
+        ) {
+            width.coerceAtLeast(16) to height.coerceAtLeast(16)
+        } else {
+            CarPlayConsts.ENCODE_WIDTH to CarPlayConsts.ENCODE_HEIGHT
+        }
+        encodeW = encW
+        encodeH = encH
         val fps = supplyFps
         // Block until Host GL is up — async ensure previously raced SETUP into test-pattern.
         resolveGlCompositor(waitMs = 5_000L)
         val wantGl = glCompositor != null
-        // onSessionReady often follows onVideoSetup in the same tick — skip a second
-        // codec recycle when already armed, unless screen SETUP asked for a fresh Surface.
+        // Keep split VDs / touch shell == encode canvas (Audi /info 1412×654 vs boot 1280×720).
+        // Safe while streaming: only resizes VD buffers, does not recycle MediaCodec.
+        if (wantGl) {
+            CarPlayHostRuntime.resizeShell(encW, encH)
+        }
+        // Live screen stream: never recycle MediaCodec (mid-stream CONFIG → Audi kill).
+        if (rtsp?.isStreaming() == true) {
+            if (forceSurfaceRefresh || (wantGl && glCompositor?.isEncoderAttached() != true)) {
+                Log.w(
+                    CarPlayConsts.TAG,
+                    "ensureEncoder skip recycle while streaming " +
+                        "force=$forceSurfaceRefresh glAttached=${glCompositor?.isEncoderAttached()}",
+                )
+            }
+            return
+        }
+        // Skip a second codec recycle when already armed, unless screen SETUP asked for
+        // a fresh Surface (onVideoSetup runs before streaming is armed).
         if (!forceSurfaceRefresh && encoder.isRunningAt(encW, encH, fps)) {
             if (wantGl && glCompositor!!.isEncoderAttached()) {
                 return
@@ -359,8 +413,8 @@ class CarPlaySourceSession(
      * ("already connected"). Always mint a fresh input Surface when (re)attaching GL.
      */
     private fun bindGlOrTee(fps: Int, forceFreshSurface: Boolean = false) {
-        val encW = CarPlayConsts.ENCODE_WIDTH
-        val encH = CarPlayConsts.ENCODE_HEIGHT
+        val encW = encodeW
+        val encH = encodeH
         val gl = resolveGlCompositor(waitMs = 5_000L)
         if (gl != null) {
             tee.setGlExclusive(true)
@@ -405,6 +459,10 @@ class CarPlaySourceSession(
     private val glRebindRunnable = object : Runnable {
         override fun run() {
             if (!running.get()) return
+            if (rtsp?.isStreaming() == true) {
+                Log.w(CarPlayConsts.TAG, "GL rebind skip — screen streaming")
+                return
+            }
             if (glCompositor?.isEncoderAttached() == true) {
                 glRebindRetries = 0
                 return
@@ -474,9 +532,11 @@ class CarPlaySourceSession(
         supplyFps = fps
         mainHandler.post {
             if (!running.get()) return@post
-            val encW = CarPlayConsts.ENCODE_WIDTH
-            val encH = CarPlayConsts.ENCODE_HEIGHT
-            if (encoder.isRunningAt(encW, encH, fps) &&
+            if (rtsp?.isStreaming() == true) {
+                Log.w(CarPlayConsts.TAG, "applySupplyFps=$fps deferred — screen streaming")
+                return@post
+            }
+            if (encoder.isRunningAt(encodeW, encodeH, fps) &&
                 (glCompositor == null || glCompositor!!.isEncoderAttached())
             ) {
                 return@post

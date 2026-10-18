@@ -57,8 +57,10 @@ class CarPlayVideoEncoder(
 
     fun start(width: Int, height: Int, fps: Int = CarPlayConsts.DEFAULT_VIDEO_FPS) {
         stop()
-        this.width = align16(width.coerceAtLeast(16))
-        this.height = align16(height.coerceAtLeast(16))
+        // CSM ScreenH264Encoder configures MediaCodec at /info pixels as-is
+        // (Audi 1412×654). Forcing 16-align made SPS disagree with SETUP/CONFIG.
+        this.width = width.coerceAtLeast(16)
+        this.height = height.coerceAtLeast(16)
         this.fps = fps.coerceIn(1, 120)
         val pixels = this.width * this.height
         argbSlots = arrayOf(IntArray(pixels), IntArray(pixels))
@@ -77,18 +79,13 @@ class CarPlayVideoEncoder(
         // Calling createInputSurface before configure always throws IllegalStateException
         // and forced the expensive ARGB→NV12 buffer path (~40–250ms/frame).
         var surface: Surface? = null
-        val codecInfo = try {
-            encoder.codecInfo
-        } catch (_: Throwable) {
-            null
-        }
         val surfaceOk = try {
             val surfaceFormat = MediaFormat.createVideoFormat(
                 MediaFormat.MIMETYPE_VIDEO_AVC,
                 this.width,
                 this.height,
             ).apply {
-                applyCommonVideoKeys(this, fps, codecInfo)
+                applyCommonVideoKeys(this, fps)
                 setInteger(
                     MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
@@ -124,7 +121,7 @@ class CarPlayVideoEncoder(
                 this.width,
                 this.height,
             ).apply {
-                applyCommonVideoKeys(this, fps, codecInfo)
+                applyCommonVideoKeys(this, fps)
                 setInteger(
                     MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible,
@@ -168,13 +165,13 @@ class CarPlayVideoEncoder(
     fun currentFps(): Int = if (running.get()) fps else 0
 
     /**
-     * True when already running at the given (unaligned) size + rate — lets callers skip
+     * True when already running at the given size + rate — lets callers skip
      * redundant restarts, including the 60→30 degrade re-arm.
      */
     fun isRunningAt(width: Int, height: Int, fps: Int = CarPlayConsts.DEFAULT_VIDEO_FPS): Boolean =
         running.get() &&
-            this.width == align16(width.coerceAtLeast(16)) &&
-            this.height == align16(height.coerceAtLeast(16)) &&
+            this.width == width.coerceAtLeast(16) &&
+            this.height == height.coerceAtLeast(16) &&
             this.fps == fps.coerceIn(1, 120)
 
     /** DiPlay recovery / showUI asks for an IDR via event `forceKeyFrame`. */
@@ -422,32 +419,25 @@ class CarPlayVideoEncoder(
         fps = CarPlayConsts.DEFAULT_VIDEO_FPS
     }
 
-    private fun align16(v: Int): Int = (v + 15) and 15.inv()
+    /** CSM ScreenH264Encoder.bitrateFor — floor 8 Mbps, soft cap w×h×3.6. */
+    private fun bitrateFor(fps: Int): Int {
+        val soft = ((width.toLong() * height.toLong() * 360L) / 100L).toInt()
+        return soft.coerceIn(8_000_000, 30_000_000)
+    }
 
-    private fun bitrateFor(fps: Int): Int =
-        if (fps >= CarPlayConsts.DEFAULT_VIDEO_FPS) CarPlayConsts.BITRATE_FPS60
-        else CarPlayConsts.BITRATE_FPS30
-
-    private fun applyCommonVideoKeys(format: MediaFormat, fps: Int, codecInfo: MediaCodecInfo?) {
+    private fun applyCommonVideoKeys(format: MediaFormat, fps: Int) {
         val rate = fps.coerceIn(1, 120)
         format.setInteger(MediaFormat.KEY_BIT_RATE, bitrateFor(rate))
         format.setInteger(MediaFormat.KEY_FRAME_RATE, rate)
-        // Prefer gradual intra-refresh (no periodic ~200KB IDR bursts). Fallback: long GOP
-        // like scrcpy (10s). DiPlay recovery still uses event forceKeyFrame → requestKeyFrame.
-        if (supportsIntraRefresh(codecInfo)) {
-            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, -1)
-            format.setInteger(MediaFormat.KEY_INTRA_REFRESH_PERIOD, rate.coerceAtLeast(16))
-            Log.i(
-                CarPlayConsts.TAG,
-                "AVC gop=intra-refresh period=${rate}f (no periodic IDR; forceKeyFrame ok)",
-            )
-        } else {
-            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, CarPlayConsts.I_FRAME_INTERVAL_SEC)
-            Log.i(
-                CarPlayConsts.TAG,
-                "AVC gop=${CarPlayConsts.I_FRAME_INTERVAL_SEC}s (no FEATURE_IntraRefresh)",
-            )
-        }
+        // CSM Audi.11: High + real IDRs (i-frame-interval=1). High + intra-refresh
+        // (I_FRAME_INTERVAL=-1) produced tiny non-IDR "keyframes" Audi never showed.
+        applyHighProfile(format)
+        format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, CarPlayConsts.I_FRAME_INTERVAL_SEC)
+        Log.i(
+            CarPlayConsts.TAG,
+            "AVC gop=${CarPlayConsts.I_FRAME_INTERVAL_SEC}s profile=High " +
+                "bitrate=${bitrateFor(rate)}",
+        )
         format.setInteger(MediaFormat.KEY_CAPTURE_RATE, rate)
         format.setInteger(MediaFormat.KEY_OPERATING_RATE, rate)
         format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
@@ -465,13 +455,33 @@ class CarPlayVideoEncoder(
         }
     }
 
-    private fun supportsIntraRefresh(info: MediaCodecInfo?): Boolean {
-        if (info == null) return false
-        return try {
-            val caps = info.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC) ?: return false
-            caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_IntraRefresh)
+    /** CSM ScreenH264Encoder: profile=8 (High) + requiredAvcLevel. */
+    private fun applyHighProfile(format: MediaFormat) {
+        try {
+            format.setInteger(
+                MediaFormat.KEY_PROFILE,
+                MediaCodecInfo.CodecProfileLevel.AVCProfileHigh,
+            )
+            format.setInteger(
+                MediaFormat.KEY_LEVEL,
+                requiredAvcLevel(width, height, fps),
+            )
         } catch (_: Throwable) {
-            false
+            Log.w(CarPlayConsts.TAG, "AVC High@level hint rejected; codec default")
+        }
+    }
+
+    private fun requiredAvcLevel(w: Int, h: Int, fps: Int): Int {
+        val mbs = ((w + 15) / 16).toLong() * ((h + 15) / 16).toLong()
+        val mbsPerSec = mbs * fps
+        return when {
+            mbs <= 8192 && mbsPerSec <= 245_760 ->
+                MediaCodecInfo.CodecProfileLevel.AVCLevel31
+            mbs <= 22_080 && mbsPerSec <= 589_824 ->
+                MediaCodecInfo.CodecProfileLevel.AVCLevel4
+            mbs <= 36_864 && mbsPerSec <= 983_040 ->
+                MediaCodecInfo.CodecProfileLevel.AVCLevel41
+            else -> MediaCodecInfo.CodecProfileLevel.AVCLevel5
         }
     }
 }

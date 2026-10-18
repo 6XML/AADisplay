@@ -16,10 +16,14 @@ object Iap2Csm {
     const val AUTH_RESPONSE = 0xAA03
     const val AUTH_FAILED = 0xAA04
     const val AUTH_SUCCEEDED = 0xAA05
+    /** AccessoryAuthenticationSerialNumber — MIB3 asks the phone for this instead of a cert. */
+    const val AUTH_SERIAL = 0xAA06
 
     const val REQUEST_ACCESSORY_WIFI = 0x5702
     const val ACCESSORY_WIFI_INFO = 0x5703
 
+    const val DEVICE_INFORMATION_UPDATE = 0x4E09
+    const val WIRELESS_SESSION_ID = 0x4E0C
     const val WIRELESS_CARPLAY_UPDATE = 0x4E0D
     const val DEVICE_TRANSPORT_ID = 0x4E0E
 
@@ -31,7 +35,6 @@ object Iap2Csm {
     /** Phone → accessory incremental NowPlaying update (media + playback groups). */
     const val NOW_PLAYING_UPDATE = 0x5001
 
-    const val WIFI_SECURITY_WPA_WPA2 = 2
     const val WIRELESS_CP_AVAILABLE = 1
 
     data class WifiConfig(
@@ -57,6 +60,9 @@ object Iap2Csm {
     fun requestAuthChallenge(challenge: ByteArray): ByteArray =
         Iap2Framing.encodeCsm(REQUEST_AUTH_CHALLENGE, mapOf(0x0000 to challenge))
 
+    fun authenticationSerial(serial: String): ByteArray =
+        Iap2Framing.encodeCsm(AUTH_SERIAL, mapOf(0x0000 to Iap2Framing.utf8Param(serial)))
+
     fun deviceTransportIdentifier(btId: String, usbId: String = ""): ByteArray =
         Iap2Framing.encodeCsm(
             DEVICE_TRANSPORT_ID,
@@ -64,6 +70,20 @@ object Iap2Csm {
                 0x0000 to Iap2Framing.utf8Param(btId),
                 0x0001 to Iap2Framing.utf8Param(usbId),
             ),
+        )
+
+    /** MIB3 `0x4E09`: param 0 is the phone name the HU shows ("iPhone"). */
+    fun deviceInformationUpdate(name: String): ByteArray =
+        Iap2Framing.encodeCsm(
+            DEVICE_INFORMATION_UPDATE,
+            mapOf(0x0000 to Iap2Framing.utf8Param(name)),
+        )
+
+    /** MIB3 `0x4E0C`: one uppercase UUID, stable for the link. */
+    fun wirelessSessionIdentifier(id: String): ByteArray =
+        Iap2Framing.encodeCsm(
+            WIRELESS_SESSION_ID,
+            mapOf(0x0000 to Iap2Framing.utf8Param(id)),
         )
 
     fun wirelessCarPlayUpdate(available: Boolean): ByteArray =
@@ -83,6 +103,30 @@ object Iap2Csm {
         return Iap2Framing.encodeCsm(
             CARPLAY_AVAILABILITY,
             linkedMapOf(0x0001 to wireless),
+        )
+    }
+
+    /**
+     * MIB3 `0x4300`: wired group (param 0) and wireless group (param 1).
+     * Available is the byte `1`. The id is the Bluetooth address, not the Wi-Fi STA.
+     */
+    fun mib3CarPlayAvailability(bluetoothMac: String, serial: String): ByteArray {
+        val available = byteArrayOf(WIRELESS_CP_AVAILABLE.toByte())
+        val wired = encodeGroup(
+            linkedMapOf(
+                0x0000 to available,
+                0x0001 to Iap2Framing.utf8Param(serial),
+            ),
+        )
+        val wireless = encodeGroup(
+            linkedMapOf(
+                0x0000 to available,
+                0x0001 to Iap2Framing.utf8Param(bluetoothMac),
+            ),
+        )
+        return Iap2Framing.encodeCsm(
+            CARPLAY_AVAILABILITY,
+            linkedMapOf(0x0000 to wired, 0x0001 to wireless),
         )
     }
 

@@ -17,8 +17,6 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 import kotlin.concurrent.thread
-import kotlin.math.PI
-import kotlin.math.sin
 
 /**
  * CarPlay realtime audio egress (SETUP type 100).
@@ -32,8 +30,7 @@ import kotlin.math.sin
  *
  * Content from system_server [io.github.nitsuya.aa.display.xposed.carplay.CarPlayAudioCapture]
  * via [CoreApi.pullCarPlayAudio] (media) / [CoreApi.pullCarPlaySpeechAudio] (nav/speech).
- * Rings are exclusive — never feed the same PCM to both. Gaps send silence;
- * [CarPlayConsts.SEND_TEST_AUDIO] injects a 440 Hz tone for pipeline debug.
+ * Rings are exclusive — never feed the same PCM to both. Gaps send silence.
  */
 class CarPlayAudioEgress(
     private val host: InetAddress,
@@ -87,14 +84,13 @@ class CarPlayAudioEgress(
     }
 
     private fun pump() {
-        val socket = DatagramSocket()
+        val socket = CarPlayAccessoryNet.openUdp()
         txSocket = socket
         val target = InetSocketAddress(host, dataPort)
         val rtp = ByteArray(12)
         val ssrc = profile.ssrc
         var sequence = 0
         var nonceCounter = 0L
-        var sampleTime = 0.0
         val framesPerPacket = (profile.sampleRate * PACKET_INTERVAL_MS / 1000L).toInt()
         val bytesPerPacket = framesPerPacket * profile.channels * 2
         val payload = ByteArray(bytesPerPacket)
@@ -177,22 +173,6 @@ class CarPlayAudioEgress(
                         payload[i * 2 + 1] = lo
                     }
                     pulledTotal += n
-                } else if (CarPlayConsts.SEND_TEST_AUDIO) {
-                    for (i in 0 until framesPerPacket) {
-                        val value = (AMPLITUDE * sin(2.0 * PI * FREQUENCY_HZ * sampleTime / profile.sampleRate))
-                            .toInt()
-                            .coerceIn(-32_768, 32_767)
-                        val hi = (value ushr 8).toByte()
-                        val lo = value.toByte()
-                        val base = i * profile.channels * 2
-                        payload[base] = hi
-                        payload[base + 1] = lo
-                        if (profile.channels > 1) {
-                            payload[base + 2] = hi
-                            payload[base + 3] = lo
-                        }
-                        sampleTime += 1.0 / profile.sampleRate
-                    }
                 }
                 rtp[0] = 0x80.toByte()
                 rtp[1] = PAYLOAD_TYPE.toByte()
@@ -293,8 +273,6 @@ class CarPlayAudioEgress(
     )
 
     companion object {
-        private const val FREQUENCY_HZ = 440.0
-        private const val AMPLITUDE = 0.25
         private const val PACKET_INTERVAL_MS = 20L
         private const val PACKET_INTERVAL_NS = PACKET_INTERVAL_MS * 1_000_000L
         /**

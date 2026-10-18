@@ -29,13 +29,25 @@ class ScreenStreamEgress private constructor(
     private val socket: Socket,
     private val out: BufferedOutputStream,
     private val cryptor: ScreenChaChaCryptor?,
+    /** Coded content size (matches SPS / encoder). */
     private val width: Int,
     private val height: Int,
+    /** Accessory panel size from `/info` (header floats 56/60). */
+    private val displayWidth: Int,
+    private val displayHeight: Int,
+    /**
+     * DiPlay [ScreenCodec.detectConfig] wants `0000+"avcC"+record`.
+     * Stock Audi MIB3 expects a bare ISO AVCDecoderConfigurationRecord (version=1 at [0]).
+     */
+    private val wrapAvccFourcc: Boolean,
 ) {
     private val closed = AtomicBoolean(false)
     private val framesSent = AtomicLong(0)
     private val bytesSent = AtomicLong(0)
     private val configSent = AtomicBoolean(false)
+    /** CSM VideoStreamSender: hold P-frames until the first IDR reaches the HU. */
+    private val firstIdrSent = AtomicBoolean(false)
+    private var loggedWaitingForIdr = false
 
     fun hasSentConfig(): Boolean = configSent.get()
 
@@ -46,54 +58,84 @@ class ScreenStreamEgress private constructor(
      * AVCDecoderConfigurationRecord (or an `avcC` fourcc wrapper); length-prefixed /
      * Annex-B SPS+PPS is misread as H265 → black screen (`shown=0`).
      */
+    @Suppress("UNUSED_PARAMETER")
     fun sendCodecConfig(parameterSets: ByteArray, timestampNs: Long): Boolean {
         if (closed.get() || parameterSets.isEmpty()) return false
         val avcc = toAvcDecoderConfigurationRecord(parameterSets) ?: run {
             Log.e(CarPlayConsts.TAG, "screen CONFIG: cannot build avcC from ${parameterSets.size}B")
             return false
         }
-        // Prefix so detectConfig finds fourcc at index≥4 (DiPlay ScreenCodec).
-        val body = ByteArray(4) + "avcC".toByteArray(Charsets.US_ASCII) + avcc
+        val body = if (wrapAvccFourcc) {
+            // DiPlay detectConfig: fourcc at index≥4.
+            ByteArray(4) + "avcC".toByteArray(Charsets.US_ASCII) + avcc
+        } else {
+            // Stock MIB3 / airplay-rs: bare AVCDecoderConfigurationRecord.
+            avcc
+        }
         val header = ByteArray(HEADER_LEN)
         putU32Le(header, 0, body.size)
         header[4] = OPCODE_CONFIG
-        header[6] = if (cryptor != null) 0x16 else 0x12
-        header[7] = 0x01
-        putNtp3232Le(header, 8, timestampNs)
-        val w = width.toFloat()
-        val h = height.toFloat()
-        // content size + source rect + display size (airplay-rs layout)
-        putF32Le(header, 16, w)
-        putF32Le(header, 20, h)
-        putF32Le(header, 32, 0f)
-        putF32Le(header, 36, 0f)
-        putF32Le(header, 40, w)
-        putF32Le(header, 44, h)
-        putF32Le(header, 48, 0f)
-        putF32Le(header, 52, 0f)
-        putF32Le(header, 56, w)
-        putF32Le(header, 60, h)
+        // CSM VideoStreamSender.send(OP_CONFIG): header[6] |= 0x04 only (has-size),
+        // then f32 LE width@16 / height@20. Do NOT set 0x10/"encrypted" — CONFIG body
+        // stays plaintext; Audi closes if it tries to ChaCha-open bare avcC.
+        header[6] = FLAG_HAS_SIZE
+        // Wall-clock NTP 32.32 (epoch 1900). Relative MediaClock nanos → sec≈0 made
+        // Audi discard every frame (DiPlay self-heals; stock does not).
+        putWallNtp3232Le(header, 8)
+        putF32Le(header, 16, width.toFloat())
+        putF32Le(header, 20, height.toFloat())
+        if (wrapAvccFourcc) {
+            // DiPlay also fills source-rect + display floats (airplay-rs layout).
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val dw = displayWidth.toFloat()
+            val dh = displayHeight.toFloat()
+            putF32Le(header, 32, 0f)
+            putF32Le(header, 36, 0f)
+            putF32Le(header, 40, w)
+            putF32Le(header, 44, h)
+            putF32Le(header, 48, 0f)
+            putF32Le(header, 52, 0f)
+            putF32Le(header, 56, dw)
+            putF32Le(header, 60, dh)
+        }
         return writeFrame(header, body).also {
             if (it) {
                 configSent.set(true)
                 Log.i(
                     CarPlayConsts.TAG,
                     "screen CONFIG sent body=${body.size}B avcC=${avcc.size}B " +
-                        "encrypt=${cryptor != null} head=${body.take(12).joinToString("") { b -> "%02x".format(b) }}",
+                        "fourcc=$wrapAvccFourcc content=${width}x$height " +
+                        "display=${displayWidth}x$displayHeight " +
+                        "flags=0x${"%02x".format(header[6])} plaintext " +
+                        "head=${body.take(12).joinToString("") { b -> "%02x".format(b) }}",
                 )
             }
         }
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun sendVideo(accessUnit: ByteArray, timestampNs: Long, isKey: Boolean): Boolean {
         if (closed.get() || accessUnit.isEmpty()) return false
         val avcc = toAvcc(accessUnit)
+        if (avcc.isEmpty()) return false
+        // CSM: skip non-IDR until the first IDR — Audi otherwise opens a decode
+        // session on P-frames and tears the control channel ~12s later.
+        val idr = isKey || containsIdrNal(avcc)
+        if (!firstIdrSent.get() && !idr) {
+            if (!loggedWaitingForIdr) {
+                loggedWaitingForIdr = true
+                Log.i(CarPlayConsts.TAG, "screen waiting for first IDR; skipping P-frames")
+            }
+            return true
+        }
         val overhead = if (cryptor != null) TAG_LEN else 0
         val header = ByteArray(HEADER_LEN)
         putU32Le(header, 0, avcc.size + overhead)
         header[4] = OPCODE_VIDEO
-        header[5] = if (isKey) 0x10 else 0x00
-        putNtp3232Le(header, 8, timestampNs)
+        // CSM leaves header[5]/[6] at 0 for VIDEO; keyframe is inferred from NALs.
+        // Length field already includes +TAG when encrypted (HU detects from size).
+        putWallNtp3232Le(header, 8)
         // clockIdentity at 40..48 left 0 (NTP path)
         val payload = if (cryptor != null) {
             cryptor.seal(avcc, header) ?: return false
@@ -101,7 +143,8 @@ class ScreenStreamEgress private constructor(
             avcc
         }
         return writeFrame(header, payload).also { ok ->
-            if (ok && isKey) {
+            if (ok && idr) firstIdrSent.set(true)
+            if (ok && idr) {
                 val n = framesSent.get()
                 if (n <= 5 || n % 30L == 0L) {
                     Log.d(
@@ -152,6 +195,8 @@ class ScreenStreamEgress private constructor(
         private const val TAG_LEN = 16
         private const val OPCODE_VIDEO: Byte = 0x00
         private const val OPCODE_CONFIG: Byte = 0x01
+        /** CSM VideoStreamSender: CONFIG sets this bit then writes width/height floats. */
+        private const val FLAG_HAS_SIZE: Byte = 0x04
 
         fun open(
             host: InetAddress,
@@ -160,13 +205,17 @@ class ScreenStreamEgress private constructor(
             streamConnectionId: Long,
             width: Int,
             height: Int,
+            displayWidth: Int = width,
+            displayHeight: Int = height,
+            /** false = bare avcC (Audi MIB3); true = DiPlay fourcc wrapper. */
+            wrapAvccFourcc: Boolean = true,
         ): ScreenStreamEgress? {
             if (dataPort <= 0 || dataPort > 65535) {
                 Log.e(CarPlayConsts.TAG, "screen dataPort invalid=$dataPort")
                 return null
             }
             return try {
-                val socket = Socket()
+                val socket = io.github.nitsuya.aa.display.carplay.CarPlayAccessoryNet.openTcp()
                 socket.tcpNoDelay = true
                 socket.connect(InetSocketAddress(host, dataPort), 10_000)
                 socket.soTimeout = 0
@@ -179,7 +228,9 @@ class ScreenStreamEgress private constructor(
                 Log.i(
                     CarPlayConsts.TAG,
                     "screen dataPort connected $host:$dataPort " +
-                        "streamId=$streamConnectionId encrypt=${cryptor != null} ${width}x$height",
+                        "streamId=$streamConnectionId encrypt=${cryptor != null} " +
+                        "content=${width}x$height display=${displayWidth}x$displayHeight " +
+                        "fourcc=$wrapAvccFourcc",
                 )
                 ScreenStreamEgress(
                     socket,
@@ -187,6 +238,9 @@ class ScreenStreamEgress private constructor(
                     cryptor,
                     width,
                     height,
+                    displayWidth,
+                    displayHeight,
+                    wrapAvccFourcc,
                 )
             } catch (e: Throwable) {
                 Log.e(CarPlayConsts.TAG, "screen dataPort connect failed $host:$dataPort", e)
@@ -263,6 +317,18 @@ class ScreenStreamEgress private constructor(
             return len > 0 && len + 4 <= data.size
         }
 
+        /** CSM VideoStreamSender.containsIdrNal — length-prefixed NALs, type 5. */
+        private fun containsIdrNal(avcc: ByteArray): Boolean {
+            var i = 0
+            while (i + 4 <= avcc.size) {
+                val len = ByteBuffer.wrap(avcc, i, 4).int
+                if (len <= 0 || i + 4 + len > avcc.size) return false
+                if ((avcc[i + 4].toInt() and 0x1f) == 5) return true
+                i += 4 + len
+            }
+            return false
+        }
+
         /** DiPlay ScreenCodec.looksLikeAvcC — raw ISO record starting with version=1. */
         private fun looksLikeAvcC(payload: ByteArray): Boolean {
             if (payload.size < 9) return false
@@ -281,18 +347,21 @@ class ScreenStreamEgress private constructor(
         }
 
         /**
-         * DiPlay [com.shilapi.xcertplay.airplay.ScreenCodec.senderNanos]: header bytes 8..15 are a
-         * little-endian u64 holding NTP 32.32 (32-bit seconds + 32-bit fraction) frame time.
+         * Little-endian NTP 32.32 from wall clock (epoch 1900), matching CarPlayTiming /
+         * airplay-rs NetworkClock — not relative MediaClock nanos.
          */
-        private fun putNtp3232Le(buf: ByteArray, off: Int, nanos: Long) {
-            val sec = (nanos / 1_000_000_000L).coerceIn(0L, 0xFFFFFFFFL)
-            val frac = ((nanos % 1_000_000_000L) * 0x100000000L) / 1_000_000_000L
-            var raw = (sec shl 32) or frac
+        private fun putWallNtp3232Le(buf: ByteArray, off: Int) {
+            val wallMs = System.currentTimeMillis()
+            val sec = wallMs / 1000L + NTP_UNIX_DELTA
+            val frac = ((wallMs % 1000L) * 0x100000000L) / 1000L
+            var raw = (sec shl 32) or (frac and 0xffffffffL)
             for (i in 0 until 8) {
                 buf[off + i] = (raw and 0xff).toByte()
                 raw = raw ushr 8
             }
         }
+
+        private const val NTP_UNIX_DELTA = 2_208_988_800L
 
         private fun putF32Le(buf: ByteArray, off: Int, v: Float) {
             val bits = java.lang.Float.floatToIntBits(v)
@@ -315,7 +384,9 @@ class ScreenChaChaCryptor(
     companion object {
         fun fromSessionKey(sessionKey: ByteArray, streamConnectionId: Long): ScreenChaChaCryptor {
             // Unsigned decimal id — match Apple PRIu64 / airplay-rs.
-            val idStr = java.lang.Long.toUnsignedString(streamConnectionId)
+            // CSM: StringBuilder.append(long) → signed decimal. IDs are masked to
+            // Long.MAX_VALUE so signed == unsigned; keep the same formatter.
+            val idStr = streamConnectionId.toString()
             val salt = "DataStream-Salt$idStr"
             val key = HkdfSha512.derive(
                 sessionKey,

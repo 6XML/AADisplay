@@ -34,17 +34,12 @@ object CarPlayConsts {
     /** Degraded supply rate when the link / encoder cannot hold [DEFAULT_VIDEO_FPS]. */
     const val DEGRADED_VIDEO_FPS = 30
 
-    /** AVC bitrate per supply rate: 60 fps needs headroom for 1280x720 motion. */
-    const val BITRATE_FPS60 = 16_000_000
-    const val BITRATE_FPS30 = 8_000_000
-
     /**
-     * Periodic IDR interval when the encoder lacks [FEATURE_IntraRefresh].
-     * Aligns with scrcpy's default (10s): shorter GOPs (2–5s) cause ~200KB WiFi
-     * bursts that hitch DiPlay even at a healthy 60fps supply. DiPlay can still
-     * request an IDR via event `forceKeyFrame`.
+     * Periodic IDR interval (seconds). CSM Audi.11 uses 1s with High@IDR (not
+     * intra-refresh). Intra-refresh-only (I_FRAME_INTERVAL=-1) left Audi black and
+     * killed control ~8s later. DiPlay can also request an IDR via `forceKeyFrame`.
      */
-    const val I_FRAME_INTERVAL_SEC = 10
+    const val I_FRAME_INTERVAL_SEC = 1
 
     /** Sustained actual-fps below this share of target triggers the 60→30 downgrade. */
     const val DEGRADE_RATE_FRACTION = 0.5f
@@ -65,10 +60,6 @@ object CarPlayConsts {
      */
     const val ENCODE_UI_DENSITY_DPI = 160
 
-    /** iAP2 detect preamble only (`FF 55 02 00 EE 10`); link packets use `FF 5A`. */
-    const val IAP2_DETECT_START = 0xFF55
-    const val IAP2_LINK_START = 0xFF5A
-
     /**
      * iPhone / Source advertises this SDP UUID so the accessory can dial back (reconnect path).
      * @see IAP2_ACCESSORY_RFCOMM_UUID
@@ -77,20 +68,13 @@ object CarPlayConsts {
 
     /**
      * Accessory / HU (diplay) advertises this UUID; Source dials it on first connect.
+     * Audi MMI also dials this record inbound, so the phone listens on it as well as …cafe.
      */
     const val IAP2_ACCESSORY_RFCOMM_UUID = "00000000-deca-fade-deca-deafdecacaff"
 
-    /** @deprecated Use [IAP2_PHONE_RFCOMM_UUID] / [IAP2_ACCESSORY_RFCOMM_UUID]. */
-    const val IAP2_RFCOMM_UUID = IAP2_PHONE_RFCOMM_UUID
-
-    /** Debug self-RECORD; keep false when testing against a real HU / diplay simulator. */
-    const val ENABLE_LOCAL_RTSP_LOOPBACK = false
-
     /**
-     * Real app audio feeds type-100 media (48 kHz stereo, 0x8000) and speech/nav
-     * (16 kHz mono, 0x10). When no captured audio is flowing, silent frames are sent —
-     * unless [SEND_TEST_AUDIO] is enabled, in which case a 440 Hz tone stands in
-     * (pipeline debugging only: distinguishes protocol OK vs empty capture).
+     * Wireless CarPlay capability UUID (EIR AD type 0x07 / SDP). VAG btstack sets the
+     * wireless-CarPlay bit only when this UUID is present; iAP2 RFCOMM UUIDs alone are not enough.
      */
-    const val SEND_TEST_AUDIO = false
+    const val WIRELESS_CARPLAY_CAPABILITY_UUID = "ec884348-cd41-40a2-9727-575d50bf1fd3"
 }

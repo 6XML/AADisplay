@@ -187,4 +187,39 @@ interface ICoreManager {
      * heard as echo. Appended at end for Stub ordinals.
      */
     boolean isCarPlaySpeechCaptureReady();
+
+    /**
+     * Turns the Wi-Fi radio on or off from system_server. A normal app
+     * setWifiEnabled() is rejected on API 29+, so Audi handoff cannot scan
+     * while the radio is off. Appended at end for Stub ordinals.
+     */
+    void setWifiEnabled(boolean enabled);
+
+    /**
+     * MAC of the Wi-Fi STA actually associated (the address the accessory AP
+     * sees). Apps only receive 02:00:00:00:00:00. Empty when Wi-Fi is down.
+     * Appended at end for Stub ordinals.
+     */
+    String localWifiMac();
+
+    /**
+     * Public Bluetooth address the accessory sees on the ACL. Apps only receive
+     * 02:00:00:00:00:00. Empty when the adapter has no address.
+     * Appended at end for Stub ordinals.
+     */
+    String localBluetoothMac();
+
+    /**
+     * Audi just paired. Forbid A2DP (a timeout shows "cannot establish Bluetooth")
+     * and reject PBAP/MAP so the contacts permission dialog does not appear.
+     * Appended at end for Stub ordinals.
+     */
+    void prepareCarPlayHeadUnit(String address);
+
+    /**
+     * Car hotspot is up but has no internet. Clear ACCEPT_UNVALIDATED so cellular
+     * becomes the system default for INTERNET while the Wi‑Fi LAN stays associated.
+     * Appended at end for Stub ordinals; requires system_server reload (reboot).
+     */
+    void preferCellularOverUnvalidatedWifi();
 }

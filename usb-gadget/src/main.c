@@ -35,6 +35,7 @@
 struct daemon {
     char udc[64];
     char vendor_driver[128];      /* basename of /sys/class/udc/<x>/driver */
+    char vendor_gadget[64];       /* configfs gadget holding the UDC (AOSP HAL "g1") */
     char vendor_usb_config[128];  /* saved sys.usb.config */
     int vendor_snap_done;
     volatile int armed;
@@ -62,44 +63,79 @@ static void snapshot_vendor(void)
 {
     if (D.vendor_snap_done) return;
     aad_udc_driver(D.udc, D.vendor_driver, sizeof(D.vendor_driver));
+    aad_udc_configfs_holder(D.udc, D.vendor_gadget, sizeof(D.vendor_gadget));
 #ifdef __ANDROID__
     __system_property_get("sys.usb.config", D.vendor_usb_config);
 #endif
     D.vendor_snap_done = 1;
-    LOGI("vendor snapshot: driver='%s' usb.config='%s'",
-         D.vendor_driver, D.vendor_usb_config);
+    LOGI("vendor snapshot: driver='%s' configfs_gadget='%s' usb.config='%s'",
+         D.vendor_driver, D.vendor_gadget, D.vendor_usb_config);
 }
 
+/* Ask the vendor stack to give up the UDC.
+ * - platform driver bound  -> sysfs unbind
+ * - configfs HAL (AOSP usb gadget, e.g. "g1") -> "sys.usb.config none"
+ *   makes the HAL unbind its gadget itself; then unbind any residual holder
+ *   directly (configfs-bound UDCs have no driver symlink, so the only
+ *   reliable release is the holder's UDC file). */
 static void release_vendor_udc(void)
 {
-    if (!D.vendor_driver[0]) return;
-    char path[256];
-    snprintf(path, sizeof(path), "/sys/bus/platform/drivers/%s/unbind",
-             D.vendor_driver);
-    if (aad_sysfs_write(path, D.udc) != 0)
-        LOGI("vendor unbind %s failed — attempting bind anyway", D.vendor_driver);
+#ifdef __ANDROID__
+    if (D.vendor_gadget[0])
+        __system_property_set("sys.usb.config", "none");
+#endif
+    if (D.vendor_driver[0]) {
+        char path[256];
+        snprintf(path, sizeof(path), "/sys/bus/platform/drivers/%s/unbind",
+                 D.vendor_driver);
+        aad_sysfs_write(path, D.udc);
+    }
+    if (D.vendor_gadget[0]) {
+        char path[256];
+        snprintf(path, sizeof(path), "/config/usb_gadget/%s/UDC", D.vendor_gadget);
+        if (aad_sysfs_write(path, "") != 0)
+            LOGI("configfs unbind %s failed", D.vendor_gadget);
+    }
+    /* give the UDC a moment to settle to a free state ("not attached"/
+     * "notattached" — spelling varies by kernel; use the whitelist, not an
+     * exact match) */
+    for (int i = 0; i < 10; i++) {
+        if (!aad_cable_attached(D.udc))
+            break;
+        usleep(200 * 1000);
+    }
 }
 
 static void restore_vendor(void)
 {
-    /* 1) ask the vendor USB HAL to reconfigure (covers module + configfs HALs) */
+    /* 1) ask the vendor USB HAL to reconfigure (module + configfs HALs) */
 #ifdef __ANDROID__
     if (D.vendor_usb_config[0])
         __system_property_set("sys.usb.config", D.vendor_usb_config);
 #endif
-    /* 2) direct rebind fallback */
+    /* 2) wait for the HAL to rebind the UDC (whitelist: "not attached"/
+     * "notattached" are the free states; connected/configured/suspended = back) */
+    for (int i = 0; i < 10; i++) {
+        if (aad_cable_attached(D.udc))
+            return; /* HAL took it back */
+        usleep(200 * 1000);
+    }
+    /* 3) direct rebind fallbacks */
+    if (D.vendor_gadget[0]) {
+        char path[256];
+        snprintf(path, sizeof(path), "/config/usb_gadget/%s/UDC",
+                 D.vendor_gadget);
+        if (aad_sysfs_write(path, D.udc) == 0)
+            return;
+    }
     if (D.vendor_driver[0]) {
         char path[256];
         snprintf(path, sizeof(path), "/sys/bus/platform/drivers/%s/bind",
                  D.vendor_driver);
-        if (aad_sysfs_write(path, D.udc) != 0) {
-            char cfg[256];
-            snprintf(cfg, sizeof(cfg), "/config/usb_gadget/%s/UDC",
-                     D.vendor_driver);
-            if (aad_sysfs_write(cfg, D.udc) != 0)
-                LOGE("vendor restore failed — USB stays unbound until re-plug/reboot");
-        }
+        if (aad_sysfs_write(path, D.udc) == 0)
+            return;
     }
+    LOGE("vendor restore failed — USB stays unbound until re-plug/reboot");
 }
 
 /* ---------------- state push ---------------- */

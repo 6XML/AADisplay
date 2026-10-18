@@ -12,7 +12,7 @@ import android.net.wifi.WifiNetworkSpecifier
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import io.github.nitsuya.aa.display.carplay.protocol.Iap2Csm
+import io.github.nitsuya.aa.display.CoreApi
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -31,6 +31,9 @@ import java.util.concurrent.atomic.AtomicReference
  *   drops them within ~2–3s — that is the DiPlay connect→flash→reconnect loop.
  *   A live specifier callback (local-only, no INTERNET capability) holds the link;
  *   naked "adopt saved network" is only a temporary dial path, then we re-arm hold.
+ * - A saved STA that already has INTERNET sets mMatchLocalOnlySpecifiers=false.
+ *   A local-only specifier never attaches to it and can sit pending forever.
+ *   Adopt that STA and hold it with a listen callback instead.
  * - Specifier [onUnavailable] must not leave a zombie [callbackRef] (dial forever
  *   "already pending"), nor abandon the session without a holding re-request.
  */
@@ -40,6 +43,7 @@ class CarPlayWifiHandoff(context: Context) {
     private val wifi = app.getSystemService(WifiManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val callbackRef = AtomicReference<ConnectivityManager.NetworkCallback?>(null)
+    private val cellularCallbackRef = AtomicReference<ConnectivityManager.NetworkCallback?>(null)
     private val pendingReady = CopyOnWriteArrayList<() -> Unit>()
     private val pendingSsid = AtomicReference<String?>(null)
     private val boundSsid = AtomicReference<String?>(null)
@@ -50,16 +54,14 @@ class CarPlayWifiHandoff(context: Context) {
     private val wantJoin = AtomicBoolean(false)
     private val rejoinGeneration = AtomicInteger(0)
     private val holding = AtomicBoolean(false)
+    private val callbackIsSpecifier = AtomicBoolean(false)
+    private val radioEnableTried = AtomicBoolean(false)
 
-    @SuppressLint("MissingPermission")
-    fun requestJoin(config: Iap2Csm.WifiConfig) {
-        ensureAccessoryWifi(config.ssid, config.passphrase, config.channel) {}
-    }
-
-    fun requestJoinFromStart(start: Iap2Csm.CarPlayStart) {
-        if (start.ssid.isNullOrBlank()) return
-        ensureAccessoryWifi(start.ssid, start.passphrase, start.channel) {}
-    }
+    /**
+     * Fired once the process is bound to the accessory AP (not on a failed specifier).
+     * Argument is the STA MAC actually on the AP, when the platform exposes it.
+     */
+    var onBound: ((String?) -> Unit)? = null
 
     /**
      * When [ssid] is empty or already bound/connected, invokes [onReady] immediately.
@@ -129,22 +131,45 @@ class CarPlayWifiHandoff(context: Context) {
     /**
      * Keep a local-only specifier [NetworkCallback] registered for the whole CP
      * session so Samsung cannot mark the AP UNWANTED and tear TCP mid-stream.
+     *
+     * Never [switchToListenHold] after a Specifier join: unregistering the
+     * Specifier callback drops L2 immediately on One UI (dial then sees
+     * "accessory Wi-Fi Network not bound" forever).
      */
     private fun ensureHoldingSpecifier(ssid: String) {
         if (!wantJoin.get()) return
-        if (holding.get() && callbackRef.get() != null &&
-            (boundSsid.get()?.equals(ssid, ignoreCase = true) == true ||
-                pendingSsid.get()?.equals(ssid, ignoreCase = true) == true)
-        ) {
-            return
-        }
-        if (callbackRef.get() != null &&
-            pendingSsid.get()?.equals(ssid, ignoreCase = true) == true
+        if (callbackRef.get() != null && callbackIsSpecifier.get() &&
+            (pendingSsid.get()?.equals(ssid, ignoreCase = true) == true ||
+                boundSsid.get()?.equals(ssid, ignoreCase = true) == true)
         ) {
             holding.set(true)
             return
         }
+        if (adoptIfAssociated(ssid, reason = "holding")) {
+            fireReady()
+            keepSpecifierHold(ssid)
+            return
+        }
         Log.i(CarPlayConsts.TAG, "WiFi handoff arm holding specifier ssid=$ssid")
+        startSpecifierRequest(
+            ssid = ssid,
+            passphrase = cachedPassphrase.get(),
+            channel = cachedChannel.get(),
+            onReady = null,
+            preserveBind = true,
+        )
+    }
+
+    /** Prefer Specifier ownership; never tear Specifier down for a listen-only hold. */
+    private fun keepSpecifierHold(ssid: String) {
+        if (callbackRef.get() != null && callbackIsSpecifier.get()) {
+            holding.set(true)
+            return
+        }
+        // Listen-only does not own ephemeral AP — safe to drop and re-request Specifier.
+        if (callbackRef.get() != null && !callbackIsSpecifier.get()) {
+            releaseCallbacksOnly()
+        }
         startSpecifierRequest(
             ssid = ssid,
             passphrase = cachedPassphrase.get(),
@@ -168,6 +193,7 @@ class CarPlayWifiHandoff(context: Context) {
             releaseCallbacksOnly()
             boundSsid.set(null)
             boundNetwork.set(null)
+            CarPlayAccessoryNet.clear()
             readyFired.set(false)
             pendingReady.clear()
         } else if (callbackRef.get() != null) {
@@ -187,10 +213,31 @@ class CarPlayWifiHandoff(context: Context) {
             holding.set(false)
         }
 
+        if (wifi?.isWifiEnabled != true) {
+            ensureWifiRadio()
+            if (wifi?.isWifiEnabled != true) {
+                Log.w(CarPlayConsts.TAG, "WiFi radio still off — defer join ssid=$ssid")
+                callbackRef.set(null)
+                scheduleHoldingRetry(ssid, rejoinGeneration.get())
+                return
+            }
+        }
+        if (adoptIfAssociated(ssid, reason = "pre-request")) {
+            fireReady()
+            // Fall through and still register Specifier so we own the hold.
+            // switchToListenHold here used to unregister Specifier → Samsung drops L2.
+        }
+
         try {
             val specifierBuilder = WifiNetworkSpecifier.Builder().setSsid(ssid)
             if (!passphrase.isNullOrEmpty()) {
                 specifierBuilder.setWpa2Passphrase(passphrase)
+            }
+            // Channel is logged only. WifiNetworkSpecifier.setBand() makes Samsung's
+            // WifiNetworkFactory reject the request ("frequency bands not yet supported"),
+            // so a 5 GHz Audi AP (ch 149) never gets scanned. Match by SSID.
+            if (channel != null) {
+                Log.i(CarPlayConsts.TAG, "WiFi handoff ssid=$ssid ch=$channel (no band constraint)")
             }
             // Local-only: do not require INTERNET/VALIDATED — otherwise Samsung
             // scores the AP 0 and emits CMD_UNWANTED_NETWORK within a few seconds.
@@ -211,17 +258,18 @@ class CarPlayWifiHandoff(context: Context) {
                 override fun onUnavailable() {
                     Log.w(CarPlayConsts.TAG, "WiFi handoff unavailable ssid=$ssid")
                     callbackRef.compareAndSet(this, null)
+                    callbackIsSpecifier.set(false)
                     holding.set(false)
                     if (pendingSsid.get()?.equals(ssid, ignoreCase = true) == true) {
                         pendingSsid.compareAndSet(ssid, null)
                     }
                     if (adoptIfAssociated(ssid, reason = "unavailable")) {
                         fireReady()
-                        scheduleHoldingRetry(ssid, generation)
+                        keepSpecifierHold(ssid)
                         return
                     }
-                    Log.w(CarPlayConsts.TAG, "WiFi handoff unavailable — dial fallback without bind")
-                    fireReady()
+                    // Do not fireReady unbound — dial would hit LTE and time out.
+                    Log.w(CarPlayConsts.TAG, "WiFi handoff unavailable — retry Specifier")
                     scheduleHoldingRetry(ssid, generation)
                 }
 
@@ -230,12 +278,15 @@ class CarPlayWifiHandoff(context: Context) {
                     if (current != null && current !== network) return
                     Log.w(CarPlayConsts.TAG, "WiFi handoff lost ssid=$ssid — schedule rejoin")
                     holding.set(false)
-                    boundNetwork.compareAndSet(network, null)
+                    if (boundNetwork.compareAndSet(network, null)) {
+                        CarPlayAccessoryNet.clear()
+                    }
                     boundSsid.compareAndSet(ssid, null)
                     scheduleRejoin(ssid, generation)
                 }
             }
             callbackRef.set(cb)
+            callbackIsSpecifier.set(true)
             cm.requestNetwork(request, cb)
             Log.i(
                 CarPlayConsts.TAG,
@@ -246,10 +297,89 @@ class CarPlayWifiHandoff(context: Context) {
         } catch (e: Throwable) {
             Log.e(CarPlayConsts.TAG, "WiFi handoff request failed", e)
             callbackRef.set(null)
+            callbackIsSpecifier.set(false)
             holding.set(false)
             pendingSsid.set(null)
             fireReady()
         }
+    }
+
+    /**
+     * Saved STA (INTERNET, mMatchLocalOnlySpecifiers=false) cannot satisfy a
+     * local-only specifier. A listen callback observes onLost without owning
+     * the association, so unregister does not tear the link down.
+     */
+    private fun switchToListenHold(ssid: String) {
+        if (callbackRef.get() != null && !callbackIsSpecifier.get()) {
+            holding.set(true)
+            return
+        }
+        if (callbackIsSpecifier.get()) {
+            releaseCallbacksOnly()
+        }
+        armAssociationListen(ssid)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun armAssociationListen(ssid: String) {
+        if (callbackRef.get() != null && !callbackIsSpecifier.get()) {
+            holding.set(true)
+            return
+        }
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                if (!networkMatches(ssid, network)) return
+                Log.i(CarPlayConsts.TAG, "WiFi handoff listen ssid=$ssid")
+                holding.set(true)
+                bindNetwork(ssid, network)
+                fireReady()
+            }
+
+            override fun onLost(network: Network) {
+                val current = boundNetwork.get()
+                if (current != null && current !== network) return
+                Log.w(CarPlayConsts.TAG, "WiFi handoff lost ssid=$ssid — schedule rejoin")
+                holding.set(false)
+                if (boundNetwork.compareAndSet(network, null)) {
+                    CarPlayAccessoryNet.clear()
+                }
+                boundSsid.compareAndSet(ssid, null)
+                scheduleRejoin(ssid, rejoinGeneration.get())
+            }
+        }
+        callbackRef.set(cb)
+        callbackIsSpecifier.set(false)
+        holding.set(true)
+        try {
+            cm.registerNetworkCallback(request, cb)
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "WiFi listen callback failed", e)
+            callbackRef.compareAndSet(cb, null)
+            holding.set(false)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun ensureWifiRadio() {
+        if (wifi?.isWifiEnabled == true) return
+        val viaApp = runCatching { wifi?.setWifiEnabled(true) == true }.getOrDefault(false)
+        Log.i(
+            CarPlayConsts.TAG,
+            "WiFi radio off → setWifiEnabled=$viaApp enabled=${wifi?.isWifiEnabled}",
+        )
+        if (wifi?.isWifiEnabled == true) return
+        if (!radioEnableTried.compareAndSet(false, true)) return
+        val viaSystem = runCatching {
+            CoreApi.setWifiEnabled(true)
+            true
+        }.getOrElse {
+            Log.w(CarPlayConsts.TAG, "WiFi enable via system failed: ${it.message}")
+            false
+        }
+        Log.i(CarPlayConsts.TAG, "WiFi enable via system requested=$viaSystem")
     }
 
     private fun scheduleRejoin(ssid: String, generation: Int) {
@@ -289,10 +419,13 @@ class CarPlayWifiHandoff(context: Context) {
             if (!wantJoin.get()) return@postDelayed
             if (gen != rejoinGeneration.get()) return@postDelayed
             if (readyFired.get() && pendingReady.isEmpty() && holding.get()) return@postDelayed
+            if (isBoundTo(ssid) && holding.get() && !callbackIsSpecifier.get()) return@postDelayed
             if (adoptIfAssociated(ssid, reason = "watch")) {
                 fireReady()
-                ensureHoldingSpecifier(ssid)
+                keepSpecifierHold(ssid)
+                return@postDelayed
             }
+            scheduleAssociationWatch(ssid)
         }, ASSOCIATION_WATCH_MS)
     }
 
@@ -321,36 +454,176 @@ class CarPlayWifiHandoff(context: Context) {
     }
 
     private fun bindNetwork(ssid: String, network: Network) {
+        val first = boundNetwork.get() == null ||
+            !ssid.equals(boundSsid.get(), ignoreCase = true)
         boundSsid.set(ssid)
         boundNetwork.set(network)
+        // Socket-level bind only — process-wide bind pins DNS/default to the
+        // no-internet AP and blocks cellular for this process (and confuses OEM
+        // "stay on Wi‑Fi" paths). Clear any leftover process bind.
+        CarPlayAccessoryNet.set(network)
         try {
-            cm.bindProcessToNetwork(network)
-        } catch (e: Throwable) {
-            Log.w(CarPlayConsts.TAG, "bindProcessToNetwork failed", e)
+            cm.bindProcessToNetwork(null)
+        } catch (_: Throwable) {
         }
+        holdCellularForInternet()
+        // system_server: drop ACCEPT_UNVALIDATED so LTE is default (needs reboot once
+        // for new Stub). Retry — Samsung may re-stamp accept on NetworkAgent recreate.
+        preferCellularNow()
+        mainHandler.postDelayed({ preferCellularNow() }, 1_500L)
+        mainHandler.postDelayed({ preferCellularNow() }, 4_000L)
+        if (first) {
+            val mac = staMacForAnnounce()
+            Log.i(CarPlayConsts.TAG, "WiFi handoff bound ssid=$ssid staMac=${mac ?: "hidden"}")
+            try {
+                onBound?.invoke(mac)
+            } catch (e: Throwable) {
+                Log.w(CarPlayConsts.TAG, "WiFi onBound failed", e)
+            }
+        }
+    }
+
+    private fun preferCellularNow() {
+        try {
+            CoreApi.preferCellularOverUnvalidatedWifi()
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "preferCellularOverUnvalidatedWifi failed", e)
+        }
+    }
+
+    /**
+     * Keep the cellular NetworkAgent up while we hold a local-only car AP, so
+     * system default routing can use mobile data for INTERNET (maps, WeChat, …).
+     */
+    @SuppressLint("MissingPermission")
+    private fun holdCellularForInternet() {
+        if (cellularCallbackRef.get() != null) return
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                Log.i(CarPlayConsts.TAG, "cellular hold available for internet while on car Wi‑Fi")
+            }
+
+            override fun onLost(network: Network) {
+                Log.w(CarPlayConsts.TAG, "cellular hold lost")
+            }
+        }
+        try {
+            cm.requestNetwork(request, cb)
+            cellularCallbackRef.set(cb)
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "cellular hold request failed", e)
+        }
+    }
+
+    private fun releaseCellularHold() {
+        val cb = cellularCallbackRef.getAndSet(null) ?: return
+        try {
+            cm.unregisterNetworkCallback(cb)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** STA MAC for iAP identity. System_server sees the address the AP associated. */
+    @SuppressLint("MissingPermission", "HardwareIds")
+    fun staMacForAnnounce(): String? {
+        val fromSystem = runCatching { CoreApi.localWifiMac() }.getOrNull()
+        normalizeMac(fromSystem)?.let { return it }
+        return currentStaMac()
+    }
+
+    @SuppressLint("MissingPermission", "HardwareIds")
+    private fun currentStaMac(): String? {
+        val fromInfo = try {
+            normalizeMac(wifi?.connectionInfo?.macAddress)
+        } catch (_: Throwable) {
+            null
+        }
+        if (fromInfo != null) return fromInfo
+        val network = boundNetwork.get() ?: return null
+        val caps = try {
+            cm.getNetworkCapabilities(network)
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+        val transport = caps.transportInfo
+        val raw = when (transport) {
+            is WifiInfo -> transport.macAddress
+            null -> null
+            else -> try {
+                transport.javaClass.methods.firstOrNull { it.name == "getMacAddress" }
+                    ?.invoke(transport) as? String
+            } catch (_: Throwable) {
+                null
+            }
+        }
+        return normalizeMac(raw)
+    }
+
+    private fun normalizeMac(raw: String?): String? {
+        val mac = raw?.trim()?.uppercase().orEmpty()
+        if (mac.length < 11 || mac == "02:00:00:00:00:00") return null
+        return mac
     }
 
     @SuppressLint("MissingPermission")
     private fun adoptIfAssociated(ssid: String, reason: String): Boolean {
         if (isBoundTo(ssid)) {
             boundNetwork.get()?.let { net ->
-                try {
-                    cm.bindProcessToNetwork(net)
-                } catch (_: Throwable) {
-                }
+                CarPlayAccessoryNet.set(net)
+                holdCellularForInternet()
             }
             Log.i(CarPlayConsts.TAG, "WiFi handoff skipped: already bound ssid=$ssid ($reason)")
             return true
         }
-        val network = findWifiNetwork(ssid) ?: return false
+        val network = findWifiNetwork(ssid)?.takeIf { networkStillUsable(it) } ?: return false
         bindNetwork(ssid, network)
         Log.i(CarPlayConsts.TAG, "WiFi handoff adopted ssid=$ssid via CM ($reason)")
         return true
     }
 
+    @SuppressLint("MissingPermission")
+    private fun networkMatches(ssid: String, network: Network): Boolean {
+        val caps = try {
+            cm.getNetworkCapabilities(network)
+        } catch (_: Throwable) {
+            null
+        } ?: return false
+        if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return false
+        val seen = readSsid(caps)
+        if (seen != null) return seen.equals(ssid, ignoreCase = true)
+        val target = channelToMhz(cachedChannel.get())
+        val freq = readFrequency(caps)
+        if (target != null && freq > 0) return freq == target
+        return soleWifiNetwork() === network
+    }
+
     private fun isBoundTo(ssid: String): Boolean {
         val bound = boundSsid.get() ?: return false
-        return bound.equals(ssid, ignoreCase = true) && boundNetwork.get() != null
+        if (!bound.equals(ssid, ignoreCase = true)) return false
+        val network = boundNetwork.get() ?: return false
+        // Specifier RELEASE / NetworkAgent recycle leaves a non-null handle that
+        // bindSocket rejects with EPERM — treat as unbound so adopt/rejoin can run.
+        if (!networkStillUsable(network)) {
+            if (boundNetwork.compareAndSet(network, null)) {
+                CarPlayAccessoryNet.clear()
+            }
+            boundSsid.compareAndSet(ssid, null)
+            Log.w(CarPlayConsts.TAG, "WiFi handoff stale Network for ssid=$ssid — cleared")
+            return false
+        }
+        return true
+    }
+
+    private fun networkStillUsable(network: Network): Boolean {
+        return try {
+            cm.getNetworkCapabilities(network) != null
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -370,22 +643,109 @@ class CarPlayWifiHandoff(context: Context) {
             val infoSsid = wifiSsidFrom(caps) ?: continue
             if (infoSsid.equals(ssid, ignoreCase = true)) return network
         }
-        if (isCurrentSsid(ssid)) {
-            return cm.activeNetwork?.takeIf { net ->
-                cm.getNetworkCapabilities(net)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-            } ?: networks.firstOrNull { net ->
-                cm.getNetworkCapabilities(net)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        if (isCurrentSsid(ssid) || isCurrentFrequency()) {
+            return activeWifiNetwork()
+        }
+        val target = channelToMhz(cachedChannel.get())
+        if (target != null) {
+            for (network in networks) {
+                val caps = try {
+                    cm.getNetworkCapabilities(network)
+                } catch (_: Throwable) {
+                    null
+                } ?: continue
+                if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) continue
+                if (readFrequency(caps) == target) return network
             }
+        }
+        val current = currentSsid()
+        if (current != null && !current.equals(ssid, ignoreCase = true)) return null
+        val infoFreq = try {
+            wifi?.connectionInfo?.frequency ?: 0
+        } catch (_: Throwable) {
+            0
+        }
+        if (target != null && infoFreq > 0 && infoFreq != target) return null
+        // SSID (and maybe frequency) redacted for this background FGS. The only
+        // STA during handoff is the accessory AP the radio just joined.
+        val sole = soleWifiNetwork() ?: return null
+        if (infoFreq <= 0 || target == null || infoFreq == target) {
+            Log.i(
+                CarPlayConsts.TAG,
+                "WiFi handoff SSID redacted; using sole STA ssid=$ssid freq=$infoFreq",
+            )
+            return sole
         }
         return null
     }
 
-    private fun wifiSsidFrom(caps: NetworkCapabilities): String? {
+    @SuppressLint("MissingPermission")
+    private fun soleWifiNetwork(): Network? {
+        val wifiNets = try {
+            cm.allNetworks
+        } catch (_: Throwable) {
+            return null
+        }.filter { net ->
+            cm.getNetworkCapabilities(net)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        }
+        return wifiNets.singleOrNull()
+    }
+
+    private fun activeWifiNetwork(): Network? {
+        return cm.activeNetwork?.takeIf { net ->
+            cm.getNetworkCapabilities(net)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        } ?: soleWifiNetwork()
+    }
+
+    private fun wifiSsidFrom(caps: NetworkCapabilities): String? = readSsid(caps)
+
+    private fun readSsid(caps: NetworkCapabilities): String? {
         val transport = caps.transportInfo
         if (transport is WifiInfo) {
             return normalizeSsid(transport.ssid)
         }
-        return null
+        if (transport == null) return null
+        val raw = try {
+            transport.javaClass.methods
+                .firstOrNull { it.name == "getSSID" || it.name == "getSsid" || it.name == "getWifiSsid" }
+                ?.invoke(transport)
+                ?.toString()
+        } catch (_: Throwable) {
+            null
+        }
+        return normalizeSsid(raw)
+    }
+
+    private fun readFrequency(caps: NetworkCapabilities): Int {
+        val transport = caps.transportInfo
+        if (transport is WifiInfo && transport.frequency > 0) return transport.frequency
+        if (transport == null) return 0
+        return try {
+            (transport.javaClass.methods.firstOrNull { it.name == "getFrequency" }
+                ?.invoke(transport) as? Int) ?: 0
+        } catch (_: Throwable) {
+            0
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun isCurrentFrequency(): Boolean {
+        val target = channelToMhz(cachedChannel.get()) ?: return false
+        val freq = try {
+            wifi?.connectionInfo?.frequency ?: 0
+        } catch (_: Throwable) {
+            0
+        }
+        return freq == target
+    }
+
+    private fun channelToMhz(channel: Int?): Int? {
+        if (channel == null || channel <= 0) return null
+        return when (channel) {
+            in 1..14 -> 2407 + channel * 5
+            in 32..196 -> 5000 + channel * 5
+            else -> null
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -410,6 +770,7 @@ class CarPlayWifiHandoff(context: Context) {
     private fun releaseCallbacksOnly() {
         val cb = callbackRef.getAndSet(null) ?: return
         holding.set(false)
+        callbackIsSpecifier.set(false)
         try {
             cm.unregisterNetworkCallback(cb)
         } catch (_: Throwable) {
@@ -448,10 +809,12 @@ class CarPlayWifiHandoff(context: Context) {
         rejoinGeneration.incrementAndGet()
         mainHandler.removeCallbacksAndMessages(null)
         releaseCallbacksOnly()
+        releaseCellularHold()
         pendingReady.clear()
         pendingSsid.set(null)
         boundSsid.set(null)
         boundNetwork.set(null)
+        CarPlayAccessoryNet.clear()
         readyFired.set(false)
         holding.set(false)
         try {

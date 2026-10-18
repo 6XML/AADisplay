@@ -7,6 +7,7 @@ import io.github.nitsuya.aa.display.carplay.protocol.Iap2Framing.CONTROL_SYN
 import io.github.nitsuya.aa.display.carplay.protocol.Iap2Framing.LinkSyncPayload
 import java.io.ByteArrayOutputStream
 import java.security.SecureRandom
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -69,10 +70,30 @@ class Iap2Session(
     private val authStarted = AtomicBoolean(false)
     private val wirelessStarted = AtomicBoolean(false)
     private var pendingChallenge: ByteArray? = null
+    private var transportUsers = 0
+    /** Audi / MIB3: cert request and 20-byte challenge go out together. */
+    private var mib3 = false
+    private var mib3ChallengeSent = false
+    private val startSessionSeen = AtomicBoolean(false)
+    private val wifiRetryArmed = AtomicBoolean(false)
+    private var mib3TransportAnnounced = false
 
     @Volatile
     var linkReady: Boolean = false
         private set
+
+    /** LSP accepted on Bluetooth. Wi-Fi iAP2 echoes this on the event channel. */
+    fun acceptedLinkSync(): ByteArray? = synchronized(lock) {
+        if (!linkReady) null else ourLsp.pack()
+    }
+
+    /**
+     * True from first detect through a live auth/session — RFCOMM must not replace
+     * this peer as "idle" while we wait for Audi's SYN after ours.
+     */
+    fun isNegotiatingOrLive(): Boolean = synchronized(lock) {
+        state != State.Idle && state != State.Dead
+    }
 
     @Volatile
     var identificationComplete: Boolean = false
@@ -82,8 +103,23 @@ class Iap2Session(
     var authenticationComplete: Boolean = false
         private set
 
+    /**
+     * BT peer label from RFCOMM. Audi MMI uses a different accessory-auth order than DiPlay.
+     */
+    fun notePeer(name: String?, address: String?) {
+        val audi = looksLikeAudi(name)
+        synchronized(lock) {
+            mib3 = audi
+        }
+        Log.i(
+            CarPlayConsts.TAG,
+            "iAP peer name=$name addr=$address mib3=$audi",
+        )
+    }
+
     fun onTransportConnected() {
         synchronized(lock) {
+            transportUsers++
             resetLocked()
             state = State.Detect
         }
@@ -91,6 +127,9 @@ class Iap2Session(
         // DiPlay may pad RFCOMM reads to 512B of repeated detect; we must speak first.
         sendRaw(Iap2Framing.DETECT_MARKER)
         Thread({
+            // Detect probe (~1.2s) then SYN retransmit. Audi sometimes drops the first
+            // after-detect SYN; without a retry the RFCOMM pump sits forever and the
+            // HU never reaches Wi-Fi / video (seen: detect+SYN, then silence).
             repeat(8) { i ->
                 try {
                     Thread.sleep(150L)
@@ -99,26 +138,51 @@ class Iap2Session(
                 }
                 synchronized(lock) {
                     if (state != State.Detect && state != State.Negotiate) return@Thread
-                    if (detectSeen.get() && synSent.get()) return@Thread
+                    if (peerLsp != null || linkReady) return@Thread
                     if (!detectSeen.get()) {
                         sendRaw(Iap2Framing.DETECT_MARKER)
                         Log.i(CarPlayConsts.TAG, "iAP detect retransmit #${i + 1}")
                     } else {
-                        maybeSendSynLocked("probe-$i")
+                        maybeSendSynLocked(if (synSent.get()) "syn-retry-$i" else "probe-$i")
                     }
+                }
+            }
+            repeat(10) { i ->
+                try {
+                    Thread.sleep(400L)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                synchronized(lock) {
+                    if (state != State.Detect && state != State.Negotiate) return@Thread
+                    if (peerLsp != null || linkReady) return@Thread
+                    if (!detectSeen.get()) return@Thread
+                    maybeSendSynLocked("syn-retry-late-$i")
                 }
             }
         }, "iap2-detect-probe").apply { isDaemon = true }.start()
     }
 
-    fun onTransportClosed() {
-        synchronized(lock) {
-            // Full reset so the next RFCOMM accept starts Detect cleanly (not sticky Dead
-            // flags / half-finished Auth that make DiPlay drop mid-challenge).
-            resetLocked()
-            state = State.Dead
+    /** @return false when this close belongs to a socket already replaced by a newer peer. */
+    fun onTransportClosed(): Boolean {
+        val current = synchronized(lock) {
+            transportUsers = (transportUsers - 1).coerceAtLeast(0)
+            if (transportUsers > 0) {
+                false
+            } else {
+                // Full reset so the next RFCOMM accept starts Detect cleanly (not sticky Dead
+                // flags / half-finished Auth that make DiPlay drop mid-challenge).
+                resetLocked()
+                state = State.Dead
+                true
+            }
         }
-        Log.i(CarPlayConsts.TAG, "iAP transport closed")
+        if (current) {
+            Log.i(CarPlayConsts.TAG, "iAP transport closed")
+        } else {
+            Log.i(CarPlayConsts.TAG, "iAP stale transport close ignored")
+        }
+        return current
     }
 
     fun onBytes(chunk: ByteArray) {
@@ -150,6 +214,10 @@ class Iap2Session(
         authStarted.set(false)
         wirelessStarted.set(false)
         pendingChallenge = null
+        mib3ChallengeSent = false
+        startSessionSeen.set(false)
+        wifiRetryArmed.set(false)
+        mib3TransportAnnounced = false
         linkReady = false
         identificationComplete = false
         authenticationComplete = false
@@ -261,36 +329,64 @@ class Iap2Session(
         }
         peerLsp = lsp
         peerSeq = packet.seq
-        controlSessionId = lsp.controlSessionId()
         peerMaxOutgoing = lsp.maxOutgoing.coerceIn(1, 255)
+        val negotiated = negotiateLinkLocked(lsp)
+        ourLsp = negotiated
+        controlSessionId = negotiated.controlSessionId()
         fileTransferSessionId =
-            lsp.sessions.firstOrNull { it.second == Iap2Framing.SESSION_TYPE_FILE_TRANSFER }?.first
+            negotiated.sessions.firstOrNull { it.second == Iap2Framing.SESSION_TYPE_FILE_TRANSFER }?.first
+                ?: lsp.sessions.firstOrNull { it.second == Iap2Framing.SESSION_TYPE_FILE_TRANSFER }?.first
                 ?: 0x0C
-        val peerIds = lsp.sessions.map { it.first to it.second }.toSet()
-        val intersect = ourLsp.sessions.filter { (id, type, _) -> (id to type) in peerIds }
-        if (intersect.isNotEmpty()) {
-            ourLsp = ourLsp.copy(sessions = intersect)
-            controlSessionId = ourLsp.controlSessionId()
-        } else {
-            ourLsp = lsp
-            controlSessionId = lsp.controlSessionId()
-        }
         Log.i(
             CarPlayConsts.TAG,
-            "iAP SYN peer sessions=${lsp.sessions} → controlSession=$controlSessionId",
+            "iAP SYN peer sessions=${lsp.sessions} → accept ${negotiated.sessions} " +
+                "controlSession=$controlSessionId",
         )
         if (state == State.Detect) state = State.Negotiate
         ourSeq = (ourSeq + 1) and 0xFF
         sendLinkLocked(
             CONTROL_SYN or CONTROL_ACK,
             sessionId = 0,
-            payload = ourLsp.pack(),
+            payload = negotiated.pack(),
             seqOverride = ourSeq,
         )
         synSent.set(true)
         if (packet.hasAck) {
             markLinkReadyLocked("syn-ack")
+        } else if (negotiated === lsp) {
+            // Audi sends SYN with no ACK and then waits. An empty ACK may never come
+            // once the SYN|ACK echoes its sessions; start identification anyway.
+            schedulePeerSynReadyLocked()
         }
+    }
+
+    /**
+     * DiPlay's SYN sessions are a subset of ours: keep that intersection and our link
+     * parameters. Audi adds an EA session we did not advertise (`id=2`, type 2, ver 1)
+     * and rejects a SYN|ACK that drops it or upgrades control to version 2 — echo its LSP.
+     */
+    private fun negotiateLinkLocked(lsp: LinkSyncPayload): LinkSyncPayload {
+        val ours = ourLsp.sessions.map { (id, type, _) -> id to type }.toSet()
+        val peerCovered = lsp.sessions.all { (id, type, _) -> (id to type) in ours }
+        if (!peerCovered || lsp.sessions.isEmpty()) return lsp
+        val peerIds = lsp.sessions.map { (id, type, _) -> id to type }.toSet()
+        val intersect = ourLsp.sessions.filter { (id, type, _) -> (id to type) in peerIds }
+        return if (intersect.isEmpty()) lsp else ourLsp.copy(sessions = intersect)
+    }
+
+    private fun schedulePeerSynReadyLocked() {
+        Thread({
+            try {
+                Thread.sleep(400)
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+            synchronized(lock) {
+                if (linkReady || state == State.Dead || state == State.Idle) return@synchronized
+                if (state != State.Negotiate && state != State.Detect) return@synchronized
+                markLinkReadyLocked("peer-syn-no-ack")
+            }
+        }, "iap2-syn-ready").apply { isDaemon = true }.start()
     }
 
     private fun maybeSendSyn(reason: String) {
@@ -301,9 +397,12 @@ class Iap2Session(
 
     private fun maybeSendSynLocked(reason: String) {
         if (state != State.Detect && state != State.Negotiate) return
-        if (synSent.get() && peerLsp != null) return
+        if (peerLsp != null) return
         if (synSent.get() && !detectSeen.get()) return
-        ourSeq = (ourSeq + 1) and 0xFF
+        // Retransmits keep the same seq so a late peer SYN|ACK still matches.
+        if (!synSent.get()) {
+            ourSeq = (ourSeq + 1) and 0xFF
+        }
         sendLinkLocked(
             CONTROL_SYN,
             sessionId = 0,
@@ -344,11 +443,26 @@ class Iap2Session(
             Iap2Csm.START_IDENTIFICATION -> sendIdentificationInformationLocked()
             Iap2Csm.IDENTIFICATION_INFORMATION -> {
                 logIdentificationSummary(msg)
+                if (!mib3 && (
+                    looksLikeAudi(Iap2Csm.utf8(msg.parameters[0])) ||
+                        looksLikeAudi(Iap2Csm.utf8(msg.parameters[1])) ||
+                        looksLikeAudi(Iap2Csm.utf8(msg.parameters[2]))
+                    )
+                ) {
+                    mib3 = true
+                    Log.i(CarPlayConsts.TAG, "iAP accessory ident looks like Audi/MIB → MIB3 auth")
+                }
                 sendIdentificationAcceptedLocked()
             }
             Iap2Csm.IDENTIFICATION_ACCEPTED -> markIdentifiedLocked("peer-accepted")
             Iap2Csm.IDENTIFICATION_REJECTED ->
-                Log.w(CarPlayConsts.TAG, "iAP IdentificationRejected")
+                Log.w(
+                    CarPlayConsts.TAG,
+                    "iAP IdentificationRejected params=${msg.parameters.keys} " +
+                        msg.parameters.entries.joinToString { (id, v) ->
+                            "0x${"%04x".format(id)}=${v.size}B"
+                        },
+                )
 
             Iap2Csm.AUTH_CERTIFICATE -> handleAuthCertificateLocked(msg)
             Iap2Csm.AUTH_RESPONSE -> handleAuthResponseLocked(msg)
@@ -359,15 +473,31 @@ class Iap2Session(
             }
 
             Iap2Csm.ACCESSORY_WIFI_INFO -> {
+                if (mib3 && wifiRetryArmed.compareAndSet(false, true)) {
+                    Thread({
+                        try {
+                            Thread.sleep(2_000)
+                        } catch (_: InterruptedException) {
+                            return@Thread
+                        }
+                        synchronized(lock) {
+                            if (state == State.Dead || state == State.Idle || !mib3) return@synchronized
+                            sendControlLocked(Iap2Csm.empty(Iap2Csm.REQUEST_ACCESSORY_WIFI))
+                            Log.i(CarPlayConsts.TAG, "iAP MIB3 re-sent 0x5702 after Wi-Fi creds")
+                        }
+                    }, "iap2-mib3-wifi-retry").apply { isDaemon = true }.start()
+                }
                 val wifi = Iap2Csm.parseWifiConfig(msg)
                 Log.i(
                     CarPlayConsts.TAG,
                     "iAP AccessoryWiFi ssid=${wifi.ssid} ch=${wifi.channel} " +
                         "sec=${wifi.securityType} passLen=${wifi.passphrase?.length ?: 0}",
                 )
+                if (mib3) announceMib3TransportLocked()
                 onWifiConfig?.invoke(wifi)
             }
             Iap2Csm.CARPLAY_START_SESSION -> {
+                startSessionSeen.set(true)
                 val start = Iap2Csm.parseCarPlayStart(msg)
                 Log.i(
                     CarPlayConsts.TAG,
@@ -385,7 +515,15 @@ class Iap2Session(
                 onNowPlayingUpdates?.invoke()
             }
 
-            Iap2Csm.REQUEST_AUTH_CERTIFICATE,
+            Iap2Csm.REQUEST_AUTH_CERTIFICATE -> {
+                if (mib3) {
+                    val serial = bluetoothTransportId().replace(":", "")
+                    sendControlLocked(Iap2Csm.authenticationSerial(serial))
+                    Log.i(CarPlayConsts.TAG, "iAP MIB3 0xAA00 → 0xAA06 serial=$serial")
+                } else {
+                    Log.i(CarPlayConsts.TAG, "iAP CSM device-origin echo/ignore 0xAA00")
+                }
+            }
             Iap2Csm.REQUEST_AUTH_CHALLENGE,
             Iap2Csm.REQUEST_ACCESSORY_WIFI,
             Iap2Csm.CARPLAY_AVAILABILITY,
@@ -413,45 +551,32 @@ class Iap2Session(
     }
 
     private fun sendIdentificationInformationLocked() {
+        // Phone-shaped 0x1D01. Sent only when the HU asks (0x1D00). DiPlay identifies
+        // itself and does not take this path. Audi rejects an accessory-shaped ident.
+        val mac = bluetoothTransportId()
+        val serial = mac.replace(":", "").ifBlank { "000000000000" }
         val params = linkedMapOf(
-            0x0000 to Iap2Framing.utf8Param("AADisplay"),
-            0x0001 to Iap2Framing.utf8Param("CarPlaySource"),
-            0x0002 to Iap2Framing.utf8Param("Nitsuya"),
-            0x0003 to Iap2Framing.utf8Param("AAD-CP-0001"),
-            0x0004 to Iap2Framing.utf8Param("1.0"),
+            0x0000 to Iap2Framing.utf8Param("iPhone"),
+            0x0001 to Iap2Framing.utf8Param("iPhone14,2"),
+            0x0002 to Iap2Framing.utf8Param("Apple"),
+            0x0003 to Iap2Framing.utf8Param(serial),
+            0x0004 to Iap2Framing.utf8Param("17.5.1"),
             0x0005 to Iap2Framing.utf8Param("1.0"),
-            0x0006 to Iap2Framing.u16ListParam(
-                intArrayOf(0xAA01, 0xAA03, 0x5703, 0x4E01, 0xEA03, 0x4301),
-            ),
-            0x0007 to Iap2Framing.u16ListParam(
-                intArrayOf(
-                    0xAA00, 0xAA02, 0xAA04, 0xAA05,
-                    0x5702, 0x4E0B, 0x4E0D, 0x4E0E,
-                    0xEA00, 0xEA01, 0x4300,
-                ),
-            ),
-            0x0008 to byteArrayOf(0x00),
-            0x0009 to byteArrayOf(0x00, 0x00),
-            0x000C to Iap2Framing.utf8Param("en"),
-            0x000D to Iap2Framing.utf8Param("en"),
-            0x0011 to Iap2Csm.encodeGroup(
-                linkedMapOf(
-                    0x0000 to byteArrayOf(0x00, 0x01),
-                    0x0001 to Iap2Framing.utf8Param("AADisplay BT"),
-                    0x0002 to ByteArray(0),
-                ),
-            ),
-            0x0018 to Iap2Csm.encodeGroup(
-                linkedMapOf(
-                    0x0000 to byteArrayOf(0x00, 0x01),
-                    0x0001 to Iap2Framing.utf8Param("AADisplay WiFi"),
-                    0x0002 to ByteArray(0),
-                    0x0004 to ByteArray(0),
-                ),
-            ),
+            0x000C to Iap2Framing.utf8Param("zh-CN"),
+            0x000D to Iap2Framing.utf8Param("zh-CN"),
         )
+        macBytes(mac)?.let { raw ->
+            params[0x0011] = Iap2Csm.encodeGroup(
+                linkedMapOf(
+                    0x0000 to byteArrayOf(0x00, 0x01),
+                    0x0001 to Iap2Framing.utf8Param("Bluetooth"),
+                    0x0002 to byteArrayOf(0x01),
+                    0x0003 to raw,
+                ),
+            )
+        }
         sendControlLocked(Iap2Framing.encodeCsm(Iap2Csm.IDENTIFICATION_INFORMATION, params))
-        Log.i(CarPlayConsts.TAG, "iAP IdentificationInformation (0x1D01) sent")
+        Log.i(CarPlayConsts.TAG, "iAP IdentificationInformation (0x1D01) iPhone bt=$mac")
     }
 
     private fun markIdentifiedLocked(reason: String) {
@@ -468,10 +593,22 @@ class Iap2Session(
         state = State.Authenticating
         sendControlLocked(Iap2Csm.empty(Iap2Csm.REQUEST_AUTH_CERTIFICATE))
         Log.i(CarPlayConsts.TAG, "iAP RequestAuthenticationCertificate (0xAA00) sent")
+        if (!mib3) return
+        // MIB3 signs the challenge that rides with the cert request. A later 0xAA01
+        // must not be followed by a second 32-byte challenge.
+        val challenge = ByteArray(20).also { SecureRandom().nextBytes(it) }
+        pendingChallenge = challenge
+        mib3ChallengeSent = true
+        sendControlLocked(Iap2Csm.requestAuthChallenge(challenge))
+        Log.i(CarPlayConsts.TAG, "iAP MIB3 RequestAuthenticationChallenge (0xAA02) sent 20B")
     }
 
     private fun handleAuthCertificateLocked(msg: Iap2Framing.ControlMessage) {
         Log.i(CarPlayConsts.TAG, "iAP AuthenticationCertificate ${Iap2Csm.authCertificateSummary(msg)}")
+        if (mib3ChallengeSent) {
+            Log.i(CarPlayConsts.TAG, "iAP MIB3 certificate ignored; challenge already sent")
+            return
+        }
         val challenge = ByteArray(32).also { SecureRandom().nextBytes(it) }
         pendingChallenge = challenge
         sendControlLocked(Iap2Csm.requestAuthChallenge(challenge))
@@ -499,15 +636,88 @@ class Iap2Session(
 
     private fun beginWirelessHandoffLocked() {
         if (!wirelessStarted.compareAndSet(false, true)) return
+        if (mib3) {
+            // Ask for the AP first. 0x4E0D/0x4E09/0x4E0E/0x4300 go out only after 0x5703.
+            val sessionId = UUID.randomUUID().toString().uppercase()
+            sendControlLocked(Iap2Csm.wirelessSessionIdentifier(sessionId))
+            Log.i(CarPlayConsts.TAG, "iAP MIB3 wireless session id (0x4E0C) $sessionId")
+            sendControlLocked(Iap2Csm.empty(Iap2Csm.REQUEST_ACCESSORY_WIFI))
+            Log.i(CarPlayConsts.TAG, "iAP RequestAccessoryWiFiConfiguration (0x5702)")
+            return
+        }
         val btId = bluetoothTransportId().ifBlank { "00:00:00:00:00:00" }
-        sendControlLocked(Iap2Csm.deviceTransportIdentifier(btId))
-        Log.i(CarPlayConsts.TAG, "iAP DeviceTransportIdentifier (0x4E0E) bt=$btId")
         sendControlLocked(Iap2Csm.wirelessCarPlayUpdate(available = true))
         Log.i(CarPlayConsts.TAG, "iAP WirelessCarPlayUpdate AVAILABLE (0x4E0D)")
+        sendControlLocked(Iap2Csm.deviceTransportIdentifier(btId))
+        Log.i(CarPlayConsts.TAG, "iAP DeviceTransportIdentifier (0x4E0E) bt=$btId")
         sendControlLocked(Iap2Csm.empty(Iap2Csm.REQUEST_ACCESSORY_WIFI))
         Log.i(CarPlayConsts.TAG, "iAP RequestAccessoryWiFiConfiguration (0x5702)")
         sendControlLocked(Iap2Csm.carPlayAvailability(btId))
         Log.i(CarPlayConsts.TAG, "iAP CarPlayAvailability (0x4300) wireless=true")
+    }
+
+    /** After `0x5703`: declare the Bluetooth transport, then ask for `0x4301`. */
+    private fun announceMib3TransportLocked() {
+        if (mib3TransportAnnounced) return
+        mib3TransportAnnounced = true
+        val btId = bluetoothTransportId().ifBlank { "00:00:00:00:00:00" }
+        val serial = btId.replace(":", "")
+        sendControlLocked(Iap2Csm.wirelessCarPlayUpdate(available = true))
+        Log.i(CarPlayConsts.TAG, "iAP WirelessCarPlayUpdate AVAILABLE (0x4E0D)")
+        sendControlLocked(Iap2Csm.deviceInformationUpdate("iPhone"))
+        Log.i(CarPlayConsts.TAG, "iAP MIB3 DeviceInformationUpdate (0x4E09) name=iPhone")
+        sendControlLocked(Iap2Csm.deviceTransportIdentifier(btId, serial))
+        Log.i(CarPlayConsts.TAG, "iAP MIB3 DeviceTransportIdentifier (0x4E0E) bt=$btId serial=$serial")
+        sendMib3AvailabilityLocked(btId, serial)
+        Thread({
+            try {
+                Thread.sleep(2_500)
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+            synchronized(lock) {
+                if (startSessionSeen.get() || state == State.Dead || state == State.Idle) return@synchronized
+                val id = bluetoothTransportId().ifBlank { btId }
+                sendMib3AvailabilityLocked(id, id.replace(":", ""))
+                Log.i(CarPlayConsts.TAG, "iAP MIB3 re-sent 0x4300; 0x4301 not yet seen")
+            }
+        }, "iap2-mib3-start-retry").apply { isDaemon = true }.start()
+    }
+
+    private fun sendMib3AvailabilityLocked(bluetoothMac: String, serial: String) {
+        sendControlLocked(Iap2Csm.mib3CarPlayAvailability(bluetoothMac, serial))
+        Log.i(CarPlayConsts.TAG, "iAP CarPlayAvailability (0x4300) bt=$bluetoothMac")
+    }
+
+    /** Accessory AP is bound. `0x4300` already carries the Bluetooth id, not the STA MAC. */
+    fun noteAccessoryWifiBound(wifiMac: String?) {
+        synchronized(lock) {
+            if (!mib3 || !mib3TransportAnnounced) return
+            if (startSessionSeen.get() || state == State.Dead || state == State.Idle) return
+            val id = bluetoothTransportId().ifBlank { "00:00:00:00:00:00" }
+            sendMib3AvailabilityLocked(id, id.replace(":", ""))
+            Log.i(
+                CarPlayConsts.TAG,
+                "iAP MIB3 re-sent 0x4300 after Wi-Fi bound bt=$id sta=${wifiMac ?: "hidden"}",
+            )
+        }
+    }
+
+    private fun looksLikeAudi(text: String?): Boolean {
+        val n = text?.trim().orEmpty()
+        if (n.isEmpty()) return false
+        return n.contains("audi", ignoreCase = true) || n.contains("mmi", ignoreCase = true)
+    }
+
+    private fun macBytes(mac: String): ByteArray? {
+        val parts = mac.split(":")
+        if (parts.size != 6) return null
+        val out = ByteArray(6)
+        for (i in 0..5) {
+            val v = parts[i].toIntOrNull(16) ?: return null
+            out[i] = v.toByte()
+        }
+        return out
     }
 
     private fun sendControlLocked(csm: ByteArray) {
@@ -540,10 +750,6 @@ class Iap2Session(
     // ------------------------------------------------------------------
     // CarPlay NowPlaying (0x5001) + iAP2 v2 file transfer (session 12)
     // ------------------------------------------------------------------
-
-    /** True once the host sent StartNowPlayingUpdates (0x5000). */
-    val nowPlayingUpdates: Boolean
-        get() = nowPlayingUpdatesRequested
 
     /**
      * Sends one NowPlayingUpdate. Group bodies are nested TLV8 (DiPlay

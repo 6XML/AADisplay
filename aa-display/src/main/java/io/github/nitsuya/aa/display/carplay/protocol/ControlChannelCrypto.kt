@@ -24,12 +24,24 @@ class ControlChannelCrypto(
     private val readCounter = AtomicLong(0)
 
     fun writeMessage(out: OutputStream, plaintext: ByteArray) {
-        var offset = 0
-        while (offset < plaintext.size) {
-            val n = minOf(MAX_PLAINTEXT, plaintext.size - offset)
-            val chunk = plaintext.copyOfRange(offset, offset + n)
-            out.write(sealFrame(chunk))
-            offset += n
+        writeFrames(out, plaintext)
+    }
+
+    /**
+     * One ChaCha frame per part. iPhone's event `POST /command` seals the RTSP
+     * header and the plist body as two frames; a single combined frame is what
+     * this HU retransmits the detect over.
+     */
+    fun writeFrames(out: OutputStream, vararg parts: ByteArray) {
+        for (part in parts) {
+            if (part.isEmpty()) continue
+            var offset = 0
+            while (offset < part.size) {
+                val n = minOf(MAX_PLAINTEXT, part.size - offset)
+                val chunk = part.copyOfRange(offset, offset + n)
+                out.write(sealFrame(chunk))
+                offset += n
+            }
         }
         out.flush()
     }

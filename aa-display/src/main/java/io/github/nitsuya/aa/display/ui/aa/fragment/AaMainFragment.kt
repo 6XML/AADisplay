@@ -26,8 +26,6 @@ import com.github.kyuubiran.ezxhelper.utils.tryOrNull
 import io.github.duzhaokun123.template.bases.BaseFragment
 import io.github.nitsuya.aa.display.CoreApi
 import io.github.nitsuya.aa.display.databinding.FragmentAaMainBinding
-import io.github.nitsuya.aa.display.egress.ProjectionSessionGate
-import io.github.nitsuya.aa.display.egress.ShellFrameEgress
 import io.github.nitsuya.aa.display.ui.aa.AaDisplayActivityKt
 import io.github.nitsuya.aa.display.ui.aa.split.SplitAppPickerController
 import io.github.nitsuya.aa.display.ui.aa.split.SplitPane
@@ -318,10 +316,8 @@ class AaMainFragment : BaseFragment<FragmentAaMainBinding>(FragmentAaMainBinding
 
     override fun onResume() {
         super.onResume()
-        ShellFrameEgress.setAaUiAttached(true)
         baseBinding.splitContainer.post {
             reportAaUiDisplayId()
-            syncSecondaryShellTee("resume")
             if (displayId == Display.INVALID_DISPLAY) {
                 isDisplayCreateRequested = false
             }
@@ -361,7 +357,6 @@ class AaMainFragment : BaseFragment<FragmentAaMainBinding>(FragmentAaMainBinding
         // Drop coalesced MOVE before tearing down VDs — never inject after destroy.
         cancelPendingPaneTouches()
         tryOrNull { CoreApi.reportAaUiDisplayId(Display.INVALID_DISPLAY) }
-        ShellFrameEgress.setAaUiAttached(false)
         super.onDestroy()
         Log.d(TAG, "onDestroy: displayId=$displayId")
         clearDisplaySurfaces("destroy")
@@ -1389,28 +1384,11 @@ class AaMainFragment : BaseFragment<FragmentAaMainBinding>(FragmentAaMainBinding
                 reportAaUiDisplayId()
                 primarySurface?.let { CoreApi.setPaneSurface(SplitPane.PRIMARY, it) }
                 secondarySurface?.let { CoreApi.setPaneSurface(SplitPane.SECONDARY, it) }
-                syncSecondaryShellTee("onAvailableDisplay")
                 registerControlReceivers()
                 // One reconnect settle pipeline (occupancy + optional ratio), not N parallel delays.
                 scheduleConnectSettle(create)
             }
         }
-    }
-
-    /**
-     * Offer the composited split shell to a secondary egress (CarPlay installs the sink).
-     * AA UI must not import the carplay package — see [ShellFrameEgress].
-     */
-    private fun syncSecondaryShellTee(reason: String) {
-        if (!isBaseBindingInitialized()) return
-        val shell = baseBinding.splitContainer
-        ShellFrameEgress.attachShell(shell)
-        ShellFrameEgress.onShellSize(shell.width, shell.height)
-        Log.d(
-            TAG,
-            "syncSecondaryShellTee[$reason] tee=${ProjectionSessionGate.shouldTeeFromAaShell()} " +
-                "${shell.width}x${shell.height}",
-        )
     }
 
     /**

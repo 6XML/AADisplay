@@ -18,8 +18,6 @@ object CarPlayStatusUi {
     private var channelChangeFromUser = true
 
     fun bind(activity: Activity, binding: ActivityMainBinding) {
-        // Register AA-shell tee sink even when the channel stays on Android Auto.
-        CarPlayProjectionService.ensureShellSinkInstalled()
         binding.rgCarplayChannel.setOnCheckedChangeListener { _, checkedId ->
             if (!channelChangeFromUser) {
                 channelChangeFromUser = true

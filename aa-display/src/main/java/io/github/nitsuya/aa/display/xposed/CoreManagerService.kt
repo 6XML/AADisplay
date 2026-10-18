@@ -1,8 +1,15 @@
 package io.github.nitsuya.aa.display.xposed
 
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothManager
+import android.bluetooth.BluetoothProfile
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.ContextParams
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.MotionEvent
@@ -41,6 +48,7 @@ import io.github.nitsuya.aa.display.xposed.util.logDebug
 import io.github.duzhaokun123.template.utils.runIO
 import io.github.duzhaokun123.template.utils.runMain
 import io.github.qauxv.ui.CommonContextWrapper
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 
 class CoreManagerService private constructor() : ICoreManager.Stub() {
@@ -50,6 +58,19 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
 
     companion object {
         const val TAG = "CoreManagerService"
+        private const val ACCESS_REJECTED = 2
+        private const val CONNECTION_POLICY_FORBIDDEN = 0
+        private const val PROFILE_PBAP = 6
+        private const val PROFILE_MAP = 9
+        private const val ACTION_CONNECTION_ACCESS_REQUEST =
+            "android.bluetooth.device.action.CONNECTION_ACCESS_REQUEST"
+        private const val EXTRA_ACCESS_REQUEST_TYPE =
+            "android.bluetooth.device.extra.ACCESS_REQUEST_TYPE"
+        private const val REQUEST_PHONEBOOK = 2
+        private const val REQUEST_MESSAGE = 3
+        private const val REQUEST_SIM = 4
+        private val headUnitAddresses = ConcurrentHashMap.newKeySet<String>()
+        private var headUnitAccessReceiver: BroadcastReceiver? = null
 
         @Volatile
         var carPlaySessionLive: Boolean = false
@@ -148,6 +169,12 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
          * system_server can already see VirtualDevice / CarActivity at the new dpi.
          */
         private fun resolveReportedHostDensityDpi(clientReported: Int): Int {
+            // CarPlay Host paints at ENCODE_UI_DENSITY_DPI (1dp≈1px on the encode canvas).
+            // Do not replace with a leftover AA / gearhead HU dpi — that desyncs
+            // SplitPane.dividerPx between GL strips and VD buffers → left black gutter.
+            if (carPlaySessionLive && clientReported > 0) {
+                return clientReported
+            }
             val observed = if (hasSystemContext) {
                 DisplayProfileSettle.observeHuReportedDensityDpi(systemContext)
             } else {
@@ -222,6 +249,9 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
             val current = mLockedDisplayProfile ?: return
             if (mSplitController == null) return
             if (!hasSystemContext) return
+            // CarPlay encode canvas == reported size; Coolwalk FacetBar math must not
+            // shrink the split profile mid-session (left pillar / bottom crop on HU).
+            if (carPlaySessionLive) return
             val railW = resolveRailWidthPx()
             val fullW = resolveObservedFullHuWidthPx(current.width, current.height)
             val settled = DisplayProfileSettle.settle(
@@ -309,6 +339,27 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
             newSession: Boolean
         ): DisplayProfile {
             val reported = sanitizeDisplayProfile(width, height, densityDpi)
+            // CarPlay Host / encoder size is the accessory panel (e.g. Audi 1412×654).
+            // Coolwalk FacetBar settle would subtract a leftover AA rail and leave a
+            // left black strip + aspect mismatch vs the screen stream.
+            if (carPlaySessionLive) {
+                cancelRailSettleRetry()
+                val current = mLockedDisplayProfile
+                if (current != reported) {
+                    mLockedDisplayProfile = reported
+                    logDebug(
+                        TAG,
+                        "displayProfile locked(carplay): ${reported.width}*${reported.height}," +
+                            "${reported.densityDpi}" +
+                            if (current != null) {
+                                " (was ${current.width}*${current.height})"
+                            } else {
+                                ""
+                            },
+                    )
+                }
+                return reported
+            }
             val railW = resolveRailWidthPx()
             val fullW = if (hasSystemContext) {
                 resolveObservedFullHuWidthPx(reported.width, reported.height)
@@ -1185,6 +1236,339 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
 
     override fun isCarPlaySpeechCaptureReady(): Boolean =
         CarPlayAudioCapture.isSpeechCaptureReady()
+
+    @Suppress("DEPRECATION")
+    override fun setWifiEnabled(enabled: Boolean) {
+        if (!hasSystemContext) {
+            log(TAG, "setWifiEnabled($enabled) skipped: systemContext not initialized")
+            return
+        }
+        val wm = systemContext.getSystemService(android.net.wifi.WifiManager::class.java)
+        if (wm == null) {
+            log(TAG, "setWifiEnabled($enabled) skipped: no WifiManager")
+            return
+        }
+        val token = android.os.Binder.clearCallingIdentity()
+        try {
+            val ok = runCatching { wm.setWifiEnabled(enabled) }.getOrDefault(false)
+            log(TAG, "setWifiEnabled($enabled) ok=$ok now=${runCatching { wm.isWifiEnabled }.getOrNull()}")
+        } finally {
+            android.os.Binder.restoreCallingIdentity(token)
+        }
+    }
+
+    @Suppress("DEPRECATION", "HardwareIds", "MissingPermission")
+    override fun localWifiMac(): String {
+        if (!hasSystemContext) return ""
+        // Binder calling uid is the app. WifiManager rejects that against the
+        // system package ("Package android does not belong to <appUid>").
+        val token = android.os.Binder.clearCallingIdentity()
+        try {
+            return localWifiMacCleared()
+        } finally {
+            android.os.Binder.restoreCallingIdentity(token)
+        }
+    }
+
+    @Suppress("DEPRECATION", "HardwareIds", "MissingPermission")
+    private fun localWifiMacCleared(): String {
+        val cm = systemContext.getSystemService(android.net.ConnectivityManager::class.java)
+        val networks = runCatching { cm?.allNetworks }.getOrNull().orEmpty()
+        for (network in networks) {
+            val caps = runCatching { cm?.getNetworkCapabilities(network) }.getOrNull() ?: continue
+            if (!caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) continue
+            val info = caps.transportInfo as? android.net.wifi.WifiInfo ?: continue
+            val mac = usableMac(info.macAddress) ?: continue
+            log(TAG, "localWifiMac $mac")
+            return mac
+        }
+        val wm = systemContext.getSystemService(android.net.wifi.WifiManager::class.java)
+        val fromInfo = usableMac(wm?.connectionInfo?.macAddress)
+        if (fromInfo != null) {
+            log(TAG, "localWifiMac $fromInfo")
+            return fromInfo
+        }
+        return ""
+    }
+
+    @Suppress("HardwareIds", "MissingPermission")
+    override fun localBluetoothMac(): String {
+        if (!hasSystemContext) return ""
+        val token = android.os.Binder.clearCallingIdentity()
+        try {
+            val adapter = systemContext
+                .getSystemService(android.bluetooth.BluetoothManager::class.java)
+                ?.adapter
+            usableMac(adapter?.address)?.let {
+                log(TAG, "localBluetoothMac $it")
+                return it
+            }
+            val fromSettings = android.provider.Settings.Secure.getString(
+                systemContext.contentResolver,
+                "bluetooth_address",
+            )
+            usableMac(fromSettings)?.let {
+                log(TAG, "localBluetoothMac $it")
+                return it
+            }
+            return ""
+        } finally {
+            android.os.Binder.restoreCallingIdentity(token)
+        }
+    }
+
+    /**
+     * Samsung keeps an unvalidated car hotspot as Active default when the user
+     * once chose "stay connected" (ACCEPT_UNVALIDATED). That installs a wlan0
+     * policy route with no default gateway → whole-phone "no network" while LTE
+     * is still up. Clear the flag (do **not** setAvoidUnvalidated — that tears
+     * the association). Also sticky network_avoid_bad_wifi + noInternetExpected.
+     */
+    @SuppressLint("MissingPermission")
+    override fun preferCellularOverUnvalidatedWifi() {
+        if (!hasSystemContext) return
+        val token = android.os.Binder.clearCallingIdentity()
+        try {
+            preferCellularOverUnvalidatedWifiUnlocked()
+        } finally {
+            android.os.Binder.restoreCallingIdentity(token)
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun preferCellularOverUnvalidatedWifiUnlocked() {
+        try {
+            android.provider.Settings.Global.putInt(
+                systemContext.contentResolver,
+                "network_avoid_bad_wifi",
+                1,
+            )
+        } catch (e: Throwable) {
+            log(TAG, "network_avoid_bad_wifi put failed", e)
+        }
+        val wm = systemContext.getSystemService(android.net.wifi.WifiManager::class.java)
+        try {
+            @Suppress("UNCHECKED_CAST")
+            val configs = wm?.configuredNetworks as? List<android.net.wifi.WifiConfiguration>
+            configs?.forEach { cfg ->
+                val bare = cfg.SSID?.trim('"').orEmpty()
+                if (!isCarHotspotSsid(bare)) return@forEach
+                try {
+                    val f = cfg.javaClass.getField("noInternetAccessExpected")
+                    f.setBoolean(cfg, true)
+                    wm.updateNetwork(cfg)
+                    log(TAG, "noInternetAccessExpected=true ssid=$bare")
+                } catch (e: Throwable) {
+                    log(TAG, "noInternetAccessExpected failed ssid=$bare", e)
+                }
+                // Stop WifiNetworkFactory from auto-joining the saved STA (that path
+                // stamps ACCEPT_UNVALIDATED and steals the default route). Specifier
+                // joins from CarPlayWifiHandoff still work with autojoin off.
+                try {
+                    android.net.wifi.WifiManager::class.java
+                        .getMethod("allowAutojoin", Int::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+                        .invoke(wm, cfg.networkId, false)
+                    log(TAG, "allowAutojoin(false) ssid=$bare id=${cfg.networkId}")
+                } catch (e: Throwable) {
+                    log(TAG, "allowAutojoin failed ssid=$bare", e)
+                }
+            }
+            runCatching { wm?.saveConfiguration() }
+        } catch (e: Throwable) {
+            log(TAG, "wifi config mark failed", e)
+        }
+        val cm = systemContext.getSystemService(android.net.ConnectivityManager::class.java) ?: return
+        val networks = runCatching { cm.allNetworks }.getOrNull().orEmpty()
+        for (network in networks) {
+            val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull() ?: continue
+            if (!caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) continue
+            if (caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)) continue
+            try {
+                android.net.ConnectivityManager::class.java
+                    .getMethod(
+                        "setAcceptUnvalidated",
+                        android.net.Network::class.java,
+                        java.lang.Boolean.TYPE,
+                        java.lang.Boolean.TYPE,
+                    )
+                    .invoke(cm, network, false, true)
+                log(TAG, "setAcceptUnvalidated(false) $network")
+            } catch (e: Throwable) {
+                log(TAG, "setAcceptUnvalidated failed $network", e)
+            }
+            try {
+                cm.reportNetworkConnectivity(network, false)
+            } catch (e: Throwable) {
+                log(TAG, "reportNetworkConnectivity failed $network", e)
+            }
+        }
+    }
+
+    private fun isCarHotspotSsid(ssid: String): Boolean {
+        if (ssid.isEmpty()) return false
+        val s = ssid.lowercase()
+        return s.contains("audi") ||
+            s.contains("mmi") ||
+            s.contains("carplay") ||
+            s.contains("diplay") ||
+            s.startsWith("carplay")
+    }
+
+    @SuppressLint("MissingPermission")
+    override fun prepareCarPlayHeadUnit(address: String?) {
+        val mac = address?.trim()?.uppercase().orEmpty()
+        if (mac.length < 11 || !hasSystemContext) return
+        headUnitAddresses.add(mac)
+        armHeadUnitAccessWatch()
+        val token = android.os.Binder.clearCallingIdentity()
+        try {
+            val adapter = systemContext.getSystemService(BluetoothManager::class.java)?.adapter
+            if (adapter == null || !adapter.isEnabled) return
+            val device = adapter.getRemoteDevice(mac)
+            val book = setAccess(device, "setPhonebookAccessPermission")
+            val msg = setAccess(device, "setMessageAccessPermission")
+            val sim = setAccess(device, "setSimAccessPermission")
+            log(TAG, "prepareCarPlayHeadUnit $mac pbap=$book map=$msg sim=$sim")
+            forbidProfile(adapter, device, BluetoothProfile.A2DP, "a2dp")
+            forbidProfile(adapter, device, PROFILE_PBAP, "pbap")
+            forbidProfile(adapter, device, PROFILE_MAP, "map")
+        } catch (e: Throwable) {
+            log(TAG, "prepareCarPlayHeadUnit failed ${e.message}")
+        } finally {
+            android.os.Binder.restoreCallingIdentity(token)
+        }
+    }
+
+    /**
+     * PBAP/MAP dialogs and the HU pairing prompt are ordered broadcasts.
+     * The app process cannot call `setPairingConfirmation` (no BLUETOOTH_PRIVILEGED);
+     * system_server can, and aborting here keeps Settings from cancelling the bond.
+     */
+    @SuppressLint("UnspecifiedRegisterReceiverFlag", "MissingPermission")
+    private fun armHeadUnitAccessWatch() {
+        if (headUnitAccessReceiver != null || !hasSystemContext) return
+        val rx = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent?) {
+                val action = intent?.action ?: return
+                val device = if (Build.VERSION.SDK_INT >= 33) {
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                } ?: return
+                val mac = device.address?.trim()?.uppercase().orEmpty()
+                if (mac !in headUnitAddresses) return
+                when (action) {
+                    ACTION_CONNECTION_ACCESS_REQUEST -> {
+                        val type = intent.getIntExtra(EXTRA_ACCESS_REQUEST_TYPE, -1)
+                        if (type != REQUEST_PHONEBOOK && type != REQUEST_MESSAGE && type != REQUEST_SIM) return
+                        val token = android.os.Binder.clearCallingIdentity()
+                        try {
+                            setAccess(device, "setPhonebookAccessPermission")
+                            setAccess(device, "setMessageAccessPermission")
+                            setAccess(device, "setSimAccessPermission")
+                        } finally {
+                            android.os.Binder.restoreCallingIdentity(token)
+                        }
+                        try {
+                            abortBroadcast()
+                        } catch (_: Throwable) {
+                        }
+                        log(TAG, "reject HU access type=$type $mac")
+                    }
+                    BluetoothDevice.ACTION_PAIRING_REQUEST -> {
+                        val token = android.os.Binder.clearCallingIdentity()
+                        val ok = try {
+                            device.setPairingConfirmation(true)
+                        } catch (e: Throwable) {
+                            log(TAG, "HU pairing confirm failed ${e.message}")
+                            false
+                        } finally {
+                            android.os.Binder.restoreCallingIdentity(token)
+                        }
+                        if (!ok) return
+                        try {
+                            abortBroadcast()
+                        } catch (_: Throwable) {
+                        }
+                        log(TAG, "HU pairing confirmed $mac")
+                    }
+                }
+            }
+        }
+        headUnitAccessReceiver = rx
+        val filter = IntentFilter().apply {
+            addAction(ACTION_CONNECTION_ACCESS_REQUEST)
+            addAction(BluetoothDevice.ACTION_PAIRING_REQUEST)
+            priority = IntentFilter.SYSTEM_HIGH_PRIORITY
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                systemContext.registerReceiver(rx, filter, Context.RECEIVER_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                systemContext.registerReceiver(rx, filter)
+            }
+        } catch (e: Throwable) {
+            headUnitAccessReceiver = null
+            log(TAG, "HU access watch failed ${e.message}")
+        }
+    }
+
+    private fun setAccess(device: BluetoothDevice, method: String): Boolean {
+        return try {
+            val m = device.javaClass.getMethod(method, Int::class.javaPrimitiveType)
+            m.invoke(device, ACCESS_REJECTED) as? Boolean ?: false
+        } catch (e: Throwable) {
+            log(TAG, "$method failed ${e.message}")
+            false
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun forbidProfile(
+        adapter: android.bluetooth.BluetoothAdapter,
+        device: BluetoothDevice,
+        profile: Int,
+        label: String,
+    ) {
+        val listener = object : BluetoothProfile.ServiceListener {
+            override fun onServiceConnected(profileId: Int, proxy: BluetoothProfile) {
+                val token = android.os.Binder.clearCallingIdentity()
+                val ok = try {
+                    val method = proxy.javaClass.getMethod(
+                        "setConnectionPolicy",
+                        BluetoothDevice::class.java,
+                        Int::class.javaPrimitiveType,
+                    )
+                    method.invoke(proxy, device, CONNECTION_POLICY_FORBIDDEN) as? Boolean ?: false
+                } catch (e: Throwable) {
+                    log(TAG, "forbid $label failed ${e.message}")
+                    false
+                } finally {
+                    android.os.Binder.restoreCallingIdentity(token)
+                }
+                log(TAG, "forbid $label ${device.address} ok=$ok")
+                try {
+                    adapter.closeProfileProxy(profileId, proxy)
+                } catch (_: Throwable) {
+                }
+            }
+
+            override fun onServiceDisconnected(profileId: Int) {}
+        }
+        try {
+            adapter.getProfileProxy(systemContext, listener, profile)
+        } catch (e: Throwable) {
+            log(TAG, "forbid $label proxy failed ${e.message}")
+        }
+    }
+
+    private fun usableMac(raw: String?): String? {
+        val mac = raw?.trim()?.uppercase().orEmpty()
+        if (mac.length < 11 || mac == "02:00:00:00:00:00" || mac == "00:00:00:00:00:00") return null
+        return mac
+    }
 
     override fun scrollPane(pane: Int, x: Int, y: Int, vScroll: Int, hScroll: Int) {
         runIO {

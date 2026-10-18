@@ -7,7 +7,6 @@ import android.util.Log
 import android.view.Display
 import android.view.Surface
 import io.github.nitsuya.aa.display.CoreApi
-import io.github.nitsuya.aa.display.egress.ShellFrameEgress
 import io.github.nitsuya.aa.display.ui.aa.split.SplitPane
 import io.github.nitsuya.aa.display.util.LastSplitStore
 import io.github.nitsuya.aa.display.xposed.IVirtualDisplayCreatedListener
@@ -153,7 +152,6 @@ object CarPlayHostRuntime {
             compositor = gl
             primarySurface = primary
             secondarySurface = secondary
-            ShellFrameEgress.setAaUiAttached(false)
             CarPlayInputBridge.shellWidthPx = w
             CarPlayInputBridge.shellHeightPx = h
             // Soft reconnect keeps system_server VDs + live ratio; resetting GL to 0.5
@@ -163,7 +161,6 @@ object CarPlayHostRuntime {
             CarPlayInputBridge.primaryRatio = bootRatio
             syncGlBuffersForRatio(gl, bootRatio, w, h, dpi)
             CarPlayProjectionService.attachGlCompositor(gl)
-            ShellFrameEgress.onShellSize(w, h)
             CarPlayAppPickerOverlay.bindContext(app)
             CarPlayWheelController.onRecentsToggle = { CarPlayRecentsOverlay.toggle() }
             pendingCreateW = w
@@ -246,6 +243,60 @@ object CarPlayHostRuntime {
         val left = (usable * ratio).toInt().coerceAtLeast(1)
         val right = (usable - left).coerceAtLeast(1)
         gl.syncPaneBuffers(left, right, height)
+    }
+
+    /**
+     * Keep Host shell / split VDs / touch space equal to the negotiated encode size.
+     * Host boots at [CarPlayConsts.ENCODE_WIDTH]×[ENCODE_HEIGHT]; Audi MIB3 SETUP
+     * switches to `/info` (e.g. 1412×654). Without this, GL stretches 16:9 panes into
+     * an ultrawide canvas → slight zoom + bottom crop, and VD/GL strip desync leaves
+     * a left black gutter.
+     */
+    fun resizeShell(width: Int, height: Int): Boolean {
+        val w = width.coerceAtLeast(16)
+        val h = height.coerceAtLeast(16)
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return resizeShellMain(w, h)
+        }
+        val ok = AtomicBoolean(false)
+        val done = CountDownLatch(1)
+        mainHandler.post {
+            try {
+                ok.set(resizeShellMain(w, h))
+            } finally {
+                done.countDown()
+            }
+        }
+        done.await(3, TimeUnit.SECONDS)
+        return ok.get()
+    }
+
+    private fun resizeShellMain(width: Int, height: Int): Boolean {
+        synchronized(bootLock) {
+            if (!started.get()) return false
+            val gl = compositor ?: return false
+            if (pendingCreateW == width && pendingCreateH == height) {
+                return true
+            }
+            val dpi = CarPlayConsts.ENCODE_UI_DENSITY_DPI
+            val ratio = CarPlayInputBridge.primaryRatio.coerceIn(
+                SplitPane.MIN_RATIO,
+                SplitPane.MAX_RATIO,
+            )
+            pendingCreateW = width
+            pendingCreateH = height
+            pendingCreateDpi = dpi
+            pendingCreateRatio = ratio
+            CarPlayInputBridge.shellWidthPx = width
+            CarPlayInputBridge.shellHeightPx = height
+            syncGlBuffersForRatio(gl, ratio, width, height, dpi)
+            requestCreateSplitDisplay("resize-${width}x$height")
+            Log.i(
+                CarPlayConsts.TAG,
+                "CarPlayHostRuntime resizeShell ${width}x$height dpi=$dpi ratio=$ratio",
+            )
+            return true
+        }
     }
 
     fun stop(reason: String) {

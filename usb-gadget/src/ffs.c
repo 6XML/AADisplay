@@ -234,13 +234,14 @@ int aad_ffs_ctl_start(aad_gadget *g, int ep0_fd, aad_mode_cb cb, void *user, aad
     if (!ctl) return -1;
     ctl->g = g;
     ctl->ep0_usbmux = ep0_fd;
-    /* re-open the other ep0 fds (we need our own handles per thread) */
+    /* re-open the other ep0 fds (we need our own handles per thread);
+     * -1 fds are dropped by the poll loop */
     char d[128];
-    snprintf(d, sizeof(d), "/dev/usb-ffs/ptp");
+    snprintf(d, sizeof(d), "/dev/usb-ffs/aadptp");
     ctl->ep0_ptp = open(d, O_RDWR | O_CLOEXEC);
-    snprintf(d, sizeof(d), "/dev/usb-ffs/ptp2");
+    snprintf(d, sizeof(d), "/dev/usb-ffs/aadptp2");
     ctl->ep0_ptp2 = open(d, O_RDWR | O_CLOEXEC);
-    snprintf(d, sizeof(d), "/dev/usb-ffs/appleeth");
+    snprintf(d, sizeof(d), "/dev/usb-ffs/aadeth");
     ctl->ep0_ae = open(d, O_RDWR | O_CLOEXEC);
     ctl->cb = cb;
     ctl->user = user;

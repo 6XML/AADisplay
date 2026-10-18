@@ -18,7 +18,6 @@ object Iap2Framing {
 
     const val CONTROL_SYN = 0x80
     const val CONTROL_ACK = 0x40
-    const val CONTROL_EAK = 0x20
     const val CONTROL_RST = 0x10
 
     /** Session type 0 = control, 1 = file transfer, 2 = external accessory. */
@@ -273,12 +272,6 @@ object Iap2Framing {
     fun u32Param(value: Long): ByteArray {
         val out = ByteBuffer.allocate(4).order(ByteOrder.BIG_ENDIAN)
         out.putInt(value.toInt())
-        return out.array()
-    }
-
-    fun u16ListParam(ids: IntArray): ByteArray {
-        val out = ByteBuffer.allocate(ids.size * 2).order(ByteOrder.BIG_ENDIAN)
-        for (id in ids) out.putShort(id.toShort())
         return out.array()
     }
 }

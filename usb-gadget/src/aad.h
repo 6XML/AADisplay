@@ -109,6 +109,9 @@ int  aad_sysfs_write(const char *path, const char *value);
 int  aad_sysfs_read_str(const char *path, char *buf, size_t len);   /* strips trailing NL */
 int  aad_mkdirs(const char *path);
 int  aad_rmrf(const char *path);
+/* configfs-aware: rmdir object dirs bottom-up (attribute files are not
+ * unlinkable; the kernel drops them with their object dir) */
+int  aad_rmrfdirs(const char *path);
 long aad_now_ms(void);
 void aad_random_bytes(unsigned char *buf, size_t len);
 unsigned aad_random_u32(void);
@@ -116,6 +119,9 @@ unsigned aad_random_u32(void);
 int  aad_probe_udc(char *buf, size_t len);
 /* current driver bound to the UDC ("" if none) */
 int  aad_udc_driver(const char *udc, char *buf, size_t len);
+/* configfs gadget holding the UDC ("" if none; configfs-bound UDCs have
+ * no driver symlink) */
+int  aad_udc_configfs_holder(const char *udc, char *buf, size_t len);
 /* is a cable attached to the UDC (state file contains connected/configured/suspended) */
 int  aad_cable_attached(const char *udc);
 

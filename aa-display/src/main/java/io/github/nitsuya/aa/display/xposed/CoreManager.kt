@@ -413,6 +413,48 @@ object CoreManager : ICoreManager, DeathRecipient {
         }
     }
 
+    override fun setWifiEnabled(enabled: Boolean) {
+        try {
+            getService()?.setWifiEnabled(enabled)
+        } catch (e: Throwable) {
+            Log.e(TAG, "setWifiEnabled failed", e)
+        }
+    }
+
+    override fun localWifiMac(): String {
+        return try {
+            getService()?.localWifiMac().orEmpty()
+        } catch (e: Throwable) {
+            Log.e(TAG, "localWifiMac failed", e)
+            ""
+        }
+    }
+
+    override fun localBluetoothMac(): String {
+        return try {
+            getService()?.localBluetoothMac().orEmpty()
+        } catch (e: Throwable) {
+            Log.e(TAG, "localBluetoothMac failed", e)
+            ""
+        }
+    }
+
+    override fun prepareCarPlayHeadUnit(address: String?) {
+        try {
+            getService()?.prepareCarPlayHeadUnit(address)
+        } catch (e: Throwable) {
+            Log.e(TAG, "prepareCarPlayHeadUnit failed", e)
+        }
+    }
+
+    override fun preferCellularOverUnvalidatedWifi() {
+        try {
+            getService()?.preferCellularOverUnvalidatedWifi()
+        } catch (e: Throwable) {
+            Log.e(TAG, "preferCellularOverUnvalidatedWifi failed", e)
+        }
+    }
+
     override fun scrollPane(pane: Int, x: Int, y: Int, vScroll: Int, hScroll: Int) {
         try {
             getService()?.scrollPane(pane, x, y, vScroll, hScroll)

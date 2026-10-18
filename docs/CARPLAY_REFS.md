@@ -56,9 +56,7 @@ RFCOMM 上自研状态机：
 
 `0x4301` 之后才期望媒体 **TCP**（本机 RTSP listen 或按 StartSession IP:port dial）。StartSession dial → `GET /info`/`OPTIONS` → Pair-Setup → 加密控制帧 SETUP/RECORD → screen `dataPort`（HKP DataStream ChaCha + AVC）。legacy FairPlay AES/`fp-setup` 仍待真机对照。
 
-Debug 下可选 `CarPlayLocalLoopback`（本机对 RTSP 发 SETUP/RECORD），用于验证 RTP 写出路径。
-
-运行时链路见 [EXECUTION.md §14](EXECUTION.md)。
+建连时序见 [CARPLAY_CONNECT.md](CARPLAY_CONNECT.md)；运行时出画见 [EXECUTION.md §14](EXECUTION.md)。
 
 ## 其它（刻意不纳入代码）
 

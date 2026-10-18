@@ -6,6 +6,8 @@
 - **Recent 卡片图标美化：** 放大 × 居中盖在图标上（不再独占上方一行）；图标约 72dp（分屏列按槽高放大，`fitCenter` 不形变）；CarPlay Canvas Recents 同几何与命中对齐。
 
 ### Fixed
+- **CarPlay 奥迪 BORROW 之后一直无声：** 车机 `BORROW_CHANGE` 后除了 200 应答，又 POST 一次 `modesChanged` 把主音频抢回。车机立刻再 BORROW，随后 RTP 仍在发、喇叭不再出声。BORROW 只保留声明手机持有屏幕和主音频的 200，不再补发抢回。
+- **CarPlay AAC 放着放着杂音然后没声：** RTP 时间戳经微秒往返整除后每帧 1024 样本变成 1023，抖动缓冲慢慢被拖空。改为每发出一帧精确 +1024。随后「落后就丢帧」在编码超过 21ms 时连着掏空发送队列，奥迪空窗后不再出声；改为先按节拍睡再编码，只在落后超过约 170ms 时对齐时钟，不丢已编码帧。
 - **重启后 CarPlay 连不上：** `CarPlayAutoArmReceiver` 在 targetSdk 36 下 `exported=false`，系统不投递 `BOOT_COMPLETED` / `USER_UNLOCKED` / BT `STATE_CHANGED`，`…cafe` 无 listen，DiPlay SDP 失败。改为 `exported=true`。
 - **DiPlay 音频落后好几秒（只改手机 Source）：** 真机 `DiPlay-AudioStats` 坐实 HU `queue=192`（≈3.8s）满时丢最新留最旧；首包触发 DiPlay `createTrack` 时我们仍在灌包，队列钉死。车机不动：media 首包后 settle 1.2s（丢采集），再 8s 按 22ms 软慢发泄残量；TX 前冲预缓冲；水位 100→40ms；`audioLatencyMs` 80 / screen `latencyMs` 60。
 - **CarPlay 又突然没声音（手机也静音）：** `PcmRing.pull` 环绕拷贝误用 `available - off`，在 `available == 2*(capacity-tail)` 时 `chunk==0` 持锁死循环；Binder `pullCarPlayAudio` 全堵、采集写线程一起堵，egress 发不出 PCM 且 session-live 本地静音不解除。改为按 `min(take-off, available, capacity-tail)` 拷贝并 `chunk<=0` 退出；write 丢弃改为向上对齐，避免 `available > capacity`。

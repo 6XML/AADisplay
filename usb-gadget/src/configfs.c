@@ -12,9 +12,35 @@
  * CarPlay layout = all 6, cfg6 active. Initial layout = cfg1..4, cfg1 active
  * (matches usbmuxd guess_mode: 6 configs -> mode 4 CarPlay, <=4 -> mode 1).
  *
- * ffs functions (usbmux/ptp/ptp2/appleeth) are driven by the ffs.c control
- * thread; the kernel f_ncm function handles CDC-NCM (control + data) fully in
- * kernel, including class requests and alt switching.
+ * configfs attribute names (kernel 5.10, live-verified on the target phone):
+ *   base:  idVendor / idProduct / bcdDevice ...  (flat files; 6.x kernels
+ *           use an ID/ subdirectory instead — we try both)
+ *   strings/0x409: manufacturer / product / serialnumber   (6.x: "serial")
+ *   configs/b.N: MaxPower / bmAttributes                  (no
+ *           bConfigurationValue file on 5.10 — the value derives from the
+ *           directory name b.N)
+ *
+ * FunctionFS instance setup (verified against v5.10 f_fs.c + uapi):
+ *   1. mkdir functions/ffs.<inst> — registers the ffs_dev under <inst>.
+ *      Instance names must be unique GLOBALLY (the vendor gadget registers
+ *      its own ffs.ptp/ffs.mtp/... in the same kernel name space): ours are
+ *      usbmux / aadptp / aadptp2 / aadeth.
+ *   2. mkdir /dev/usb-ffs/<inst> + mount("functionfs") — the ep files live
+ *      on a private per-instance superblock that only exists AFTER the
+ *      mount (v5.10 ffs_sb_fill creates ep0; nothing exists before it).
+ *   3. open ep0; write V2 descriptors (flags HAS_FS|HAS_HS|VIRTUAL_ADDR|
+ *      ALL_CTRL_RECIP) + strings (v5.10: 16B header + u16 lang + NUL-
+ *      terminated UTF-8 strings — NOT the legacy fixed 30x u16 tables).
+ *   4. the kernel then runs ffs_epfiles_create() + ffs_ready()
+ *      (desc_ready=1, the configfs "ready" attribute turns 1). The UDC bind
+ *      rejects ffs functions that are not desc_ready (-ENODEV in
+ *      ffs_do_functionfs_bind), so this MUST happen before the UDC write.
+ *   5. open the endpoint files — with VIRTUAL_ADDR the kernel names them
+ *      ep%02x of the FULL bEndpointAddress (ep04/ep85, ep02/ep81/ep83,
+ *      ep05/ep86).
+ *
+ * The kernel f_ncm function handles CDC-NCM fully in kernel (no ep files).
+ * The ep0 control traffic of all ffs functions is served by ffs.c.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -27,6 +53,7 @@
 #include <sys/stat.h>
 #if defined(__linux__)
 #include <endian.h>
+#include <sys/mount.h>
 #elif defined(__APPLE__)
 #include <libkern/OSByteOrder.h>
 #define htole16(x) OSSwapHostToLittleInt16(x)
@@ -35,6 +62,12 @@
 #endif
 
 #include "aad.h"
+
+/* functionfs_flags (uapi/linux/usb/functionfs.h, kernel 5.10) */
+#define FF_HAS_FS_DESC    1
+#define FF_HAS_HS_DESC    2
+#define FF_VIRTUAL_ADDR   16
+#define FF_ALL_CTRL_RECIP 64
 
 struct aad_gadget {
     char udc[64];
@@ -48,6 +81,9 @@ struct aad_gadget {
     int ep_ae_out, ep_ae_in;
     int ep_ptp_out, ep_ptp_in, ep_ptp_int;
     int ep_ptp2_out, ep_ptp2_in, ep_ptp2_int;
+    /* /dev/usb-ffs mounts WE created (unmounted in destroy) */
+    char dev_mounted[4][16];
+    int dev_nmounted;
     int bound;
 };
 
@@ -76,61 +112,118 @@ static int wf(const char *dir, const char *file, const char *value)
 
 static int mkdirs(const char *p) { return aad_mkdirs(p); }
 
-static int symlink_fn(const char *configdir, const char *target)
+/*
+ * config function <-> function link. The target is stored ABSOLUTE; the
+ * kernel normalizes it to its vendor-style relative form (live-verified:
+ * writing an absolute target yields a relative symlink on disk).
+ */
+static int symlink_fn(const char *base, const char *configdir, const char *target)
 {
-    char path[PATH_MAX];
+    char path[PATH_MAX], abs[PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", configdir, target);
-    if (symlink(target, path) != 0 && errno != EEXIST) {
-        LOGE("symlink %s -> %s failed: %s", path, target, strerror(errno));
+    snprintf(abs, sizeof(abs), "%s/%s", base, target);
+    if (symlink(abs, path) != 0 && errno != EEXIST) {
+        LOGE("symlink %s -> %s failed: %s", path, abs, strerror(errno));
         return -1;
     }
     return 0;
 }
 
 /*
- * ffs function scaffolding: mkdir the configfs function, open /dev/usb-ffs,
- * install V2 descriptors (FS+HS) + interface string, keep the ep0 fd open,
- * then open the declared bulk/INT endpoint files.
- *
- * Descriptor block (per uapi functionfs.h, V2):
- *   [0]=magic(3) [4]=length [8]=flags | u32 fs_count | u32 hs_count
- *   per count: usb_interface_descriptor(9) + per-ep usb_endpoint_descriptor(7)
- * Strings write:
- *   [0]=magic(2) [4]=length [8]=u32 count | count x {u16 id; u8 utf16le[30]}
+ * Mount the per-instance functionfs superblock under /dev/usb-ffs/<name>.
+ * Skipped when <name> is already mounted (ep0 present). Returns 0 on
+ * success (mounted or pre-mounted), -1 otherwise. Records self-created
+ * mounts in g for the teardown umount.
  */
-static int install_ffs(const char *base, const char *name,
+static int mount_ffs_dev(aad_gadget *g, const char *name)
+{
+    char dev[PATH_MAX], chk[PATH_MAX];
+    snprintf(dev, sizeof(dev), "/dev/usb-ffs/%s", name);
+    snprintf(chk, sizeof(chk), "%s/ep0", dev);
+    if (access(chk, F_OK) == 0)
+        return 0; /* somebody else mounted it (e.g. vendor init) */
+    if (mkdir(dev, 0550) != 0 && errno != EEXIST) {
+        LOGE("mkdir %s: %s (SELinux?)", dev, strerror(errno));
+        return -1;
+    }
+#ifdef __linux__
+    if (mount(name, dev, "functionfs", 0,
+              "rmode=0550 fmode=0660 uid=0 gid=0") != 0) {
+        LOGE("mount functionfs %s: %s (SELinux?)", name, strerror(errno));
+        return -1;
+    }
+#else
+    LOGI("[host] skip mount: functionfs %s at %s", name, dev);
+#endif
+    if (g->dev_nmounted < (int)(sizeof(g->dev_mounted) / sizeof(g->dev_mounted[0]))) {
+        snprintf(g->dev_mounted[g->dev_nmounted],
+                 sizeof(g->dev_mounted[0]), "%s", name);
+        g->dev_nmounted++;
+    }
+    return 0;
+}
+
+static void unmount_ffs_devs(aad_gadget *g)
+{
+    for (int i = 0; i < g->dev_nmounted; i++) {
+        char dev[PATH_MAX];
+        snprintf(dev, sizeof(dev), "/dev/usb-ffs/%s", g->dev_mounted[i]);
+#ifdef __linux__
+        if (umount2(dev, MNT_DETACH) != 0)
+            LOGI("umount %s: %s", dev, strerror(errno));
+        rmdir(dev); /* best effort; the vendor keeps /dev/usb-ffs itself */
+#endif
+    }
+    g->dev_nmounted = 0;
+}
+
+/*
+ * ffs function scaffolding: see the file header for the 5-step flow.
+ */
+static int install_ffs(aad_gadget *g, const char *name,
                        uint8_t cls, uint8_t sub, uint8_t proto,
-                       const char *ifstr,
+                       const char *ifstr, uint8_t ifid,
                        const uint8_t *eps, int neps,
-                       int flags_ctrl,
-                       int *ep0_fd, int *ep_fds, int nep_out)
+                       int flags_ctrl, uint16_t wmax_hs,
+                       int *ep0_fd, int *ep_fds)
 {
     char dir[PATH_MAX], dev[PATH_MAX];
-    snprintf(dir, sizeof(dir), "%s/functions/ffs.%s", base, name);
+    snprintf(dir, sizeof(dir), "%s/functions/ffs.%s", g->base, name);
     if (mkdir(dir, 0755) != 0 && errno != EEXIST) {
         LOGE("mkdir %s failed: %s", dir, strerror(errno));
         return -1;
     }
+
+    /* functionfs mount (must precede the ep0 open) */
+    if (mount_ffs_dev(g, name) != 0)
+        return -1;
+
     snprintf(dev, sizeof(dev), "/dev/usb-ffs/%s", name);
     int ep0 = open(dev, O_RDWR | O_CLOEXEC);
     if (ep0 < 0) {
-        LOGE("open %s failed: %s (is CONFIG_USB_F_FS available?)", dev, strerror(errno));
+        LOGE("open %s/ep0 failed: %s (functionfs not mounted / SELinux?)",
+             dev, strerror(errno));
         return -1;
     }
 
-    /* ---- descriptors (FS + HS) ---- */
+    /* ---- descriptors (V2: 20B header = magic/len/flags/fs/hs) ---- */
     uint8_t dbuf[64];
     memset(dbuf, 0, sizeof(dbuf));
     uint32_t *h = (uint32_t *)dbuf;
     h[0] = 3;                    /* FUNCTIONFS_DESCRIPTORS_MAGIC_V2 */
     h[1] = 0;                    /* length, fixed below */
-    h[2] = 1 | 2 | (flags_ctrl ? 64 : 0); /* FS | HS | ALL_CTRL_RECIP */
-    h[3] = 1;                    /* fs_count */
-    h[4] = 1;                    /* hs_count */
+    h[2] = FF_HAS_FS_DESC | FF_HAS_HS_DESC | FF_VIRTUAL_ADDR |
+           (flags_ctrl ? FF_ALL_CTRL_RECIP : 0);
+    /* 5.10 uapi: per-speed counts = number of descriptor ENTITIES
+     * (interfaces + endpoints) in that speed's block (v5.10 ffs_do_descs
+     * parses exactly `count` entities; a 66B block with count=1 is
+     * rejected EINVAL — the bytes must all be consumed). */
+    h[3] = 1 + neps;             /* fs_count = 1 interface + neps */
+    h[4] = 1 + neps;             /* hs_count (same shape) */
     uint8_t *p = dbuf + 20;
 
     for (int set = 0; set < 2; set++) {
-        uint16_t wmax = set ? USBMUX_WMAXPKT : 64; /* FS=64, HS=512 */
+        uint16_t wmax = set ? wmax_hs : 64; /* FS=64, HS per-function */
         /* interface descriptor (9) */
         struct {
             uint8_t bLength, bDescriptorType;
@@ -147,7 +240,7 @@ static int install_ffs(const char *base, const char *name,
         i->bInterfaceClass = cls;
         i->bInterfaceSubClass = sub;
         i->bInterfaceProtocol = proto;
-        i->iInterface = 1;
+        i->iInterface = ifid; /* assigned at bind: 3 gadget strings + ffs */
         p += 9;
         for (int e = 0; e < neps; e++) {
             struct {
@@ -158,8 +251,7 @@ static int install_ffs(const char *base, const char *name,
             ed->bLength = 7;
             ed->bDescriptorType = 5;
             ed->bAddress = eps[e * 2];
-            ed->bmAttributes = (eps[e * 2 + 1] & 1) ? 2 : 0x02; /* INT=2? no: bulk=2, int=1 */
-            ed->bmAttributes = (eps[e * 2 + 1] & 1) ? 1 : 2;
+            ed->bmAttributes = (eps[e * 2 + 1] & 1) ? 1 : 2; /* int vs bulk */
             ed->wMaxPacketSize = htole16((uint16_t)(eps[e * 2 + 1] & 1 ? 16 : wmax));
             ed->bInterval = 1;
             p += 7;
@@ -168,36 +260,48 @@ static int install_ffs(const char *base, const char *name,
     h[1] = (uint32_t)(p - dbuf);
     ssize_t w = write(ep0, dbuf, p - dbuf);
     if (w != (ssize_t)(p - dbuf)) {
-        LOGE("ffs %s: descriptor write failed: %s", name, strerror(errno));
+        LOGE("ffs %s: descriptor write failed: %s (errno=%d)", name,
+             strerror(errno), (int)errno);
         close(ep0);
         return -1;
     }
 
-    /* ---- strings (one: iInterface=1) ---- */
-    uint8_t sbuf[64];
+    /* ---- strings (5.10: 16B header + u16 lang + NUL-terminated UTF-8) ---- */
+    uint8_t sbuf[128];
     memset(sbuf, 0, sizeof(sbuf));
     uint32_t *sh = (uint32_t *)sbuf;
     sh[0] = 2;                   /* FUNCTIONFS_STRINGS_MAGIC */
-    sh[1] = 0;
-    sh[2] = 1;                   /* count */
-    uint16_t *sid = (uint16_t *)(sbuf + 12);
-    *sid = 1;
-    uint8_t *sdata = sbuf + 14;
-    for (size_t i = 0; ifstr[i]; i++)
-        ((uint16_t *)sdata)[i] = htole16(ifstr[i]);
-    size_t slen = 12 + 2 + 30;
-    sh[1] = (uint32_t)slen;
-    w = write(ep0, sbuf, slen);
-    if (w != (ssize_t)slen) {
+    sh[2] = 1;                   /* str_count */
+    sh[3] = 1;                   /* lang_count */
+    uint16_t lang = htole16(0x409);
+    memcpy(sbuf + 16, &lang, 2);
+    size_t ilen = strlen(ifstr);
+    memcpy(sbuf + 18, ifstr, ilen);   /* + the NUL from memset */
+    sh[1] = (uint32_t)(16 + 2 + ilen + 1);
+    w = write(ep0, sbuf, sh[1]);
+    if (w != (ssize_t)sh[1]) {
         LOGE("ffs %s: strings write failed: %s", name, strerror(errno));
         close(ep0);
         return -1;
     }
 
-    /* ---- open declared endpoints (created by the kernel after descs) ---- */
+    /* kernel: ffs_epfiles_create() + ffs_ready() just ran. Verify via the
+     * configfs "ready" attribute when the kernel exposes it. */
+    {
+        char rpath[PATH_MAX], rv[16] = {0};
+        snprintf(rpath, sizeof(rpath), "%s/ready", dir);
+        if (aad_sysfs_read_str(rpath, rv, sizeof(rv)) == 0 && rv[0] != '1') {
+            LOGE("ffs %s: kernel reports not-ready after descs/strings", name);
+            close(ep0);
+            return -1;
+        }
+    }
+
+    /* ---- open declared endpoints (created after the strings write;
+     *      VIRTUAL_ADDR => ep%02x of the FULL bEndpointAddress) ---- */
     for (int e = 0; e < neps; e++) {
         char ep[64];
-        snprintf(ep, sizeof(ep), "%s/ep%02x", dev, eps[e * 2] & 0x1f);
+        snprintf(ep, sizeof(ep), "%s/ep%02x", dev, eps[e * 2]);
         int f = open(ep, O_RDWR | O_CLOEXEC);
         if (f < 0) {
             LOGE("open %s failed: %s", ep, strerror(errno));
@@ -208,7 +312,6 @@ static int install_ffs(const char *base, const char *name,
         ep_fds[e] = f;
     }
     *ep0_fd = ep0;
-    (void)nep_out;
     return 0;
 }
 
@@ -270,12 +373,12 @@ void aad_gadget_destroy(aad_gadget *g)
     close_fd(&g->ep_ae_out);  close_fd(&g->ep_ae_in);
     close_fd(&g->ep_ptp_out); close_fd(&g->ep_ptp_in); close_fd(&g->ep_ptp_int);
     close_fd(&g->ep_ptp2_out); close_fd(&g->ep_ptp2_in); close_fd(&g->ep_ptp2_int);
-    aad_rmrf(g->base);
+    unmount_ffs_devs(g);
+    aad_rmrfdirs(g->base);
     free(g);
 }
 
-static int build_config(aad_gadget *g, int cfg, int carplay,
-                        const char *const *fns, int nfns)
+static int build_config(aad_gadget *g, int cfg, const char *const *fns, int nfns)
 {
     char dir[PATH_MAX];
     snprintf(dir, sizeof(dir), "%s/configs/b.%d", g->base, cfg);
@@ -288,18 +391,38 @@ static int build_config(aad_gadget *g, int cfg, int carplay,
         write(fd, "250", 3);
         close(fd);
     }
-    for (int i = 0; i < nfns; i++) {
-        if (symlink_fn(dir, fns[i]) != 0) return -1;
-    }
-    (void)carplay;
+    /* NOTE: no bConfigurationValue attribute on 5.10 kernels — the value
+     * derives from the directory name b.<cfg>. Nothing to write. */
+    for (int i = 0; i < nfns; i++)
+        if (symlink_fn(g->base, dir, fns[i]) != 0)
+            return -1;
     return 0;
 }
 
+/* ffs instance names are a GLOBAL kernel name space (ffs_name_dev): the
+ * vendor gadget registers ffs.adb/ffs.mtp/ffs.ptp/ffs.diag... — reuse would
+ * fail with -EBUSY. Hence the aad* prefixes. */
 static const char *FN_USBMUX = "functions/ffs.usbmux";
-static const char *FN_PTP    = "functions/ffs.ptp";
-static const char *FN_PTP2   = "functions/ffs.ptp2";
-static const char *FN_AE     = "functions/ffs.appleeth";
+static const char *FN_PTP    = "functions/ffs.aadptp";
+static const char *FN_PTP2   = "functions/ffs.aadptp2";
+static const char *FN_AE     = "functions/ffs.aadeth";
 static const char *FN_NCM    = "functions/ncm.0";
+
+/*
+ * configfs attribute layouts differ between kernel generations:
+ *   5.10: base/idVendor, strings/0x409/serialnumber
+ *   6.x:  base/ID/vendor,  strings/0x409/serial
+ * Try the 5.10 name first, fall back to the other; ENOENT on a write
+ * attempt is expected for the layout that is not present.
+ */
+static int wf_layout(const char *base, const char *a, const char *b,
+                     const char *value)
+{
+    if (wf(base, a, value) == 0) return 0;
+    if (wf(base, b, value) == 0) return 0;
+    LOGE("write %s|%s failed on both layouts", a, b);
+    return -1;
+}
 
 int aad_gadget_create(const char *udc, int carplay_layout, aad_gadget **out)
 {
@@ -315,48 +438,55 @@ int aad_gadget_create(const char *udc, int carplay_layout, aad_gadget **out)
     g->ep_ptp_out = g->ep_ptp_in = g->ep_ptp_int = -1;
     g->ep_ptp2_out = g->ep_ptp2_in = g->ep_ptp2_int = -1;
 
-    aad_rmrf(g->base);
+    aad_rmrfdirs(g->base);
     if (mkdirs(g->base) != 0) { aad_gadget_destroy(g); return -1; }
 
-    /* device identity */
-    if (wf(g->base, "ID/vendor", "0x05ac") ||
-        wf(g->base, "ID/product", "0x12a8") ||
-        wf(g->base, "ID/device", "0x1704")) {
-        LOGE("failed to write device ID (configfs layout mismatch?)");
+    /* device identity (5.10 flat idVendor.. vs 6.x ID/ subdirs) */
+    if (wf_layout(g->base, "idVendor", "ID/vendor", "0x05ac") ||
+        wf_layout(g->base, "idProduct", "ID/product", "0x12a8") ||
+        wf_layout(g->base, "bcdDevice", "ID/device", "0x1704")) {
+        LOGE("failed to write device ID");
         aad_gadget_destroy(g);
         return -1;
     }
-    /* strings */
+    /* strings (5.10: serialnumber; 6.x: serial) */
     char sp[PATH_MAX];
     snprintf(sp, sizeof(sp), "%s/strings/0x409", g->base);
     mkdirs(sp);
-    snprintf(sp, sizeof(sp), "%s/strings/0x409", g->base);
-    wf(sp, "manufacture", AAD_MANUF);
-    snprintf(sp, sizeof(sp), "%s/strings/0x409", g->base);
+    wf(sp, "manufacturer", AAD_MANUF);
     wf(sp, "product", AAD_PRODUCT);
-    snprintf(sp, sizeof(sp), "%s/strings/0x409", g->base);
-    wf(sp, "serial", AAD_UDID);
+    wf_layout(sp, "serialnumber", "serial", AAD_UDID);
 
-    /* ffs functions */
+    /* ffs functions (usbmux ep0 serves the vendor 0x45/0x52 requests) */
     static const uint8_t ep_usbmux[] = { USBMUX_EP_OUT, 0, USBMUX_EP_IN, 0 };
     static const uint8_t ep_ptp[]    = { PTP_EP_OUT, 0, PTP_EP_IN, 0, PTP_EP_INT, 1 };
     static const uint8_t ep_ae[]     = { AE_EP_OUT, 0, AE_EP_IN, 0 };
-    int fds[5];
-    if (install_ffs(g->base, "usbmux", USBMUX_CLASS, USBMUX_SUBCLASS, USBMUX_PROTOCOL,
-                    USBMUX_STR, ep_usbmux, 2, 1, &g->ep0_usbmux, fds, 0) ||
-        install_ffs(g->base, "ptp", PTP_CLASS, PTP_SUBCLASS, PTP_PROTOCOL,
-                    PTP_STR, ep_ptp, 3, 0, &g->ep0_ptp, fds, 0) ||
-        install_ffs(g->base, "ptp2", PTP_CLASS, PTP_SUBCLASS, PTP_PROTOCOL,
-                    PTP_STR, ep_ptp, 3, 0, &g->ep0_ptp2, fds, 0) ||
-        install_ffs(g->base, "appleeth", AE_CLASS, AE_SUBCLASS, AE_PROTOCOL,
-                    AE_STR, ep_ae, 2, 0, &g->ep0_ae, fds, 0)) {
+    /* ffs string IDs: 3 gadget strings (manufacturer/product/serialnumber)
+     * + one per ffs function, allocated in BIND order (config list order,
+     * functions in config order). CarPlay layout binds b.6 (usbmux+ncm)
+     * first => usbmux=4, aadptp=5; initial layout binds b.1 (aadptp) first
+     * => aadptp=4, usbmux=5. iInterface is fixed at ep0-write time, so it
+     * must already reference the ID the string will get at bind. */
+    int usb_ifid = carplay_layout ? 4 : 5;
+    int ptp_ifid = carplay_layout ? 5 : 4;
+    int fds_usb[2], fds_ptp[3], fds_ptp2[3], fds_ae[2];
+    if (install_ffs(g, "usbmux", USBMUX_CLASS, USBMUX_SUBCLASS, USBMUX_PROTOCOL,
+                    USBMUX_STR, (uint8_t)usb_ifid, ep_usbmux, 2, 1, USBMUX_WMAXPKT, &g->ep0_usbmux, fds_usb) ||
+        install_ffs(g, "aadptp", PTP_CLASS, PTP_SUBCLASS, PTP_PROTOCOL,
+                    PTP_STR, (uint8_t)ptp_ifid, ep_ptp, 3, 0, PTP_WMAXPKT, &g->ep0_ptp, fds_ptp) ||
+        install_ffs(g, "aadptp2", PTP_CLASS, PTP_SUBCLASS, PTP_PROTOCOL,
+                    PTP_STR, 6, ep_ptp, 3, 0, PTP_WMAXPKT, &g->ep0_ptp2, fds_ptp2) ||
+        install_ffs(g, "aadeth", AE_CLASS, AE_SUBCLASS, AE_PROTOCOL,
+                    AE_STR, 7, ep_ae, 2, 0, AE_WMAXPKT, &g->ep0_ae, fds_ae)) {
         aad_gadget_destroy(g);
         return -1;
     }
-    g->ep_usb_out = fds[0]; g->ep_usb_in = fds[1];
-    /* ptp fds: [out,in,int] for ptp; [out,in,int] for ptp2 */
-    /* (re-read from install order: ptp fds were fds[0..2], ptp2 fds[0..2] last) */
-    /* NOTE: install_ffs overwrote fds[] each call; capture via re-open for clarity */
+    g->ep_usb_out = fds_usb[0]; g->ep_usb_in = fds_usb[1];
+    /* the other eps are re-opened below (REOPEN); drop these handles */
+    for (int e = 0; e < 3; e++) close(fds_ptp[e]);
+    for (int e = 0; e < 3; e++) close(fds_ptp2[e]);
+    for (int e = 0; e < 2; e++) close(fds_ae[e]);
+    /* re-open the remaining endpoints */
     char d[128];
     int f;
 #define REOPEN(name, dst) do { \
@@ -364,17 +494,17 @@ int aad_gadget_create(const char *udc, int carplay_layout, aad_gadget **out)
         f = open(d, O_RDWR | O_CLOEXEC); \
         (dst) = (f >= 0) ? f : -1; \
     } while (0)
-    REOPEN("ptp/ep02", g->ep_ptp_out);
-    REOPEN("ptp/ep81", g->ep_ptp_in);
-    REOPEN("ptp/ep83", g->ep_ptp_int);
-    REOPEN("ptp2/ep02", g->ep_ptp2_out);
-    REOPEN("ptp2/ep81", g->ep_ptp2_in);
-    REOPEN("ptp2/ep83", g->ep_ptp2_int);
-    REOPEN("appleeth/ep05", g->ep_ae_out);
-    REOPEN("appleeth/ep86", g->ep_ae_in);
+    REOPEN("aadptp/ep02", g->ep_ptp_out);
+    REOPEN("aadptp/ep81", g->ep_ptp_in);
+    REOPEN("aadptp/ep83", g->ep_ptp_int);
+    REOPEN("aadptp2/ep02", g->ep_ptp2_out);
+    REOPEN("aadptp2/ep81", g->ep_ptp2_in);
+    REOPEN("aadptp2/ep83", g->ep_ptp2_int);
+    REOPEN("aadeth/ep05", g->ep_ae_out);
+    REOPEN("aadeth/ep86", g->ep_ae_in);
 #undef REOPEN
 
-    /* kernel NCM function */
+    /* kernel NCM function (no userspace eps) */
     {
         char np[PATH_MAX];
         snprintf(np, sizeof(np), "%s/functions/ncm.0", g->base);
@@ -386,22 +516,22 @@ int aad_gadget_create(const char *udc, int carplay_layout, aad_gadget **out)
         }
     }
 
-    /* configs — creation order = interface/activation order (first = active) */
+    /* configs — creation order = enumeration order (first = active) */
     if (carplay_layout) {
         /* 6 configs; b.6 first => active on bind */
-        if (build_config(g, 6, 1, (const char *const[]){ FN_USBMUX, FN_NCM }, 2) ||
-            build_config(g, 1, 1, (const char *const[]){ FN_PTP }, 1) ||
-            build_config(g, 2, 1, (const char *const[]){ FN_USBMUX }, 1) ||
-            build_config(g, 3, 1, (const char *const[]){ FN_PTP2, FN_USBMUX }, 2) ||
-            build_config(g, 4, 1, (const char *const[]){ FN_PTP2, FN_USBMUX, FN_AE }, 3) ||
-            build_config(g, 5, 1, (const char *const[]){ FN_USBMUX, FN_NCM, FN_AE }, 3))
+        if (build_config(g, 6, (const char *const[]){ FN_USBMUX, FN_NCM }, 2) ||
+            build_config(g, 1, (const char *const[]){ FN_PTP }, 1) ||
+            build_config(g, 2, (const char *const[]){ FN_USBMUX }, 1) ||
+            build_config(g, 3, (const char *const[]){ FN_PTP2, FN_USBMUX }, 2) ||
+            build_config(g, 4, (const char *const[]){ FN_PTP2, FN_USBMUX, FN_AE }, 3) ||
+            build_config(g, 5, (const char *const[]){ FN_USBMUX, FN_NCM, FN_AE }, 3))
             goto fail;
     } else {
         /* 4-config initial layout; b.1 first => active */
-        if (build_config(g, 1, 0, (const char *const[]){ FN_PTP }, 1) ||
-            build_config(g, 2, 0, (const char *const[]){ FN_USBMUX }, 1) ||
-            build_config(g, 3, 0, (const char *const[]){ FN_PTP2, FN_USBMUX }, 2) ||
-            build_config(g, 4, 0, (const char *const[]){ FN_PTP2, FN_USBMUX, FN_AE }, 3))
+        if (build_config(g, 1, (const char *const[]){ FN_PTP }, 1) ||
+            build_config(g, 2, (const char *const[]){ FN_USBMUX }, 1) ||
+            build_config(g, 3, (const char *const[]){ FN_PTP2, FN_USBMUX }, 2) ||
+            build_config(g, 4, (const char *const[]){ FN_PTP2, FN_USBMUX, FN_AE }, 3))
             goto fail;
     }
 

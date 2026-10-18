@@ -39,10 +39,10 @@ AADisplay 是 [Nitsuya/AADisplay](https://github.com/Nitsuya/AADisplay) 的生�
 | `xposed/hook/` | 系统 / 通用钩子 |
 | `xposed/hook/aa/` | Android Auto 专用钩子（`Aa*Hook`） |
 | `ui/main/` | 手机端激活状态页（`MainActivity`，`CATEGORY_INFO`；无桌面图标，经 LSPosed 打开；CarPlay 控件经 `carplay/CarPlayStatusUi` 绑定） |
-| `ui/aa/` | 车机投影 Activity / Fragment / VirtualDisplay 适配（**不** import carplay 包；壳帧经 `egress/ShellFrameEgress`） |
+| `ui/aa/` | 车机投影 Activity / Fragment / VirtualDisplay 适配（**不** import carplay 包） |
 | `ui/window/` | 显示会话策略（`DisplaySessionPolicy`：Delay Destroy / keep-awake；二次出口 live 门控；手机悬浮 UI 已移除） |
 | `ui/aa/split/` | 双 VD / 分屏门面 `SplitDisplayController` + 协作类（`SplitVdLifecycle` / `SplitLaunchRestore` / `SplitOwnership` / `SplitInputRecents` / `SplitImeController` / `PaneAppStack` / `SplitLockedPeelController` 等；每窗最多 3 应用保活） |
-| `egress/` | 二次出口桥：`ShellFrameEgress` / `ProjectionSessionGate`（AA UI ↔ CarPlay 仲裁，无协议依赖） |
+| `egress/` | 二次出口门控：`ProjectionSessionGate`（CarPlay 会话是否存活；无协议依赖） |
 | `carplay/` | 无线 CarPlay Source：协议 / 编码 / Host / FGS / 状态页绑定（与 AA 钩子隔离） |
 | `xposed/carplay/` | system_server 侧 CarPlay 能力（`CarPlayAudioCapture` / `CarPlayProcessBoost`；非协议栈） |
 | `service/` | `AaActivityService` |
@@ -247,7 +247,7 @@ Debug 联调可 `adb install -r aa-display/build/outputs/apk/debug/aa-display-*.
 | 系统 VirtualDisplay / Binder 桥 | `xposed/hook/AndroidHook.kt`、`CoreManagerService.kt` |
 | VD DPI pin / Metrics 镜像 / 竖屏 letterbox 铺满 / Presentation 拦截 / IME 落屏 | `xposed/hook/VdDensityPin.kt`、`VdMetricsMirror.kt`、`VdOrientationFill.kt`、`PanePresentationGuard.kt`、`VdImeDisplayPin.kt` |
 | 手机蓝牙键鼠（操作 / 双窗 / 分隔条 / 堆栈） | [docs/EXECUTION.md](docs/EXECUTION.md) §10.1；`xposed/hook/PhoneHidRedirect.kt` |
-| 无线 CarPlay 出口（与 AA 双轨） | [docs/EXECUTION.md](docs/EXECUTION.md) §14（§14.1 播放链路速查 + 包边界）；协议外参 [docs/CARPLAY_REFS.md](docs/CARPLAY_REFS.md)；`carplay/`、`egress/ShellFrameEgress`、`xposed/carplay/`；iAP2 → `protocol/Iap2Session.kt` |
+| 无线 CarPlay 出口（与 AA 双轨） | [docs/EXECUTION.md](docs/EXECUTION.md) §14（§14.1 播放链路速查 + 包边界）；**建连时序** [docs/CARPLAY_CONNECT.md](docs/CARPLAY_CONNECT.md)；协议外参 [docs/CARPLAY_REFS.md](docs/CARPLAY_REFS.md)；`carplay/`、`egress/ProjectionSessionGate`、`xposed/carplay/`；iAP2 → `protocol/Iap2Session.kt` |
 | 重连分辨率结算（HU vs 内容区） | [docs/COOLWALK_FACETBAR.md](docs/COOLWALK_FACETBAR.md)、`util/DisplayProfileSettle.kt` + `CoreManagerService.resolveDisplayProfile`；`AaUiHook` starve `GhFacetBar` |
 | 仪表横条歌词（AA Title） | `xposed/cluster/ClusterLyricMirror.kt`、`LyricLineExtractor.kt`；`service/ClusterLyricMediaService.kt`（`:cluster`）；gearhead `AaMediaAllowlistHook` / `AaClusterLyricEgressHook` |
 | 音视频单发声 / 三源仪表 | `util/AvMediaArbiter.kt`、`util/MusicAppClassifier.kt`；`SplitBuriedPlayback` |

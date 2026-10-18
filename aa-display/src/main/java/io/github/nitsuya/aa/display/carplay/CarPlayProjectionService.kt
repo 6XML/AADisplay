@@ -13,36 +13,17 @@ import android.os.IBinder
 import android.util.Log
 import io.github.nitsuya.aa.display.CoreApi
 import io.github.nitsuya.aa.display.R
-import io.github.nitsuya.aa.display.egress.ShellFrameEgress
 import io.github.nitsuya.aa.display.ui.main.MainActivity
 import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Foreground service owning [CarPlaySourceSession] for wireless CarPlay Source egress.
- *
- * Still registers a [ShellFrameEgress] sink (AA must not import this class) but exclusive
- * channel policy ignores AA shell frames — CarPlay paints only via Host GL.
+ * CarPlay paints only via Host GL.
  */
 class CarPlayProjectionService : Service() {
     companion object {
         private val sessionRef = AtomicReference<CarPlaySourceSession?>(null)
         private val glCompositorRef = AtomicReference<CarPlayGlCompositor?>(null)
-
-        init {
-            ShellFrameEgress.install(
-                object : ShellFrameEgress.Sink {
-                    override fun attachShell(view: android.view.View?) {
-                        sessionRef.get()?.attachShellView(view)
-                    }
-
-                    override fun onShellSize(width: Int, height: Int) {
-                        sessionRef.get()?.onShellSize(width, height)
-                    }
-                },
-            )
-        }
-
-        fun sessionOrNull(): CarPlaySourceSession? = sessionRef.get()
 
         /**
          * CarPlay-only Host GPU compositor (SurfaceTexture → GLES → encoder).
@@ -53,13 +34,7 @@ class CarPlayProjectionService : Service() {
             sessionRef.get()?.attachGlCompositor(compositor)
         }
 
-        /** Ensures the [ShellFrameEgress] sink is registered (companion init). */
-        fun ensureShellSinkInstalled() {
-            // Touching the companion object runs init {}.
-        }
-
         fun start(context: Context) {
-            ensureShellSinkInstalled()
             val i = Intent(context, CarPlayProjectionService::class.java).setAction(CarPlayConsts.ACTION_CONNECT)
             context.startForegroundService(i)
         }
@@ -67,14 +42,6 @@ class CarPlayProjectionService : Service() {
         fun stop(context: Context) {
             val i = Intent(context, CarPlayProjectionService::class.java).setAction(CarPlayConsts.ACTION_STOP)
             context.startService(i)
-        }
-
-        fun attachShell(view: android.view.View?) {
-            sessionRef.get()?.attachShellView(view)
-        }
-
-        fun onShellSize(width: Int, height: Int) {
-            sessionRef.get()?.onShellSize(width, height)
         }
     }
 
@@ -145,11 +112,16 @@ class CarPlayProjectionService : Service() {
 
     private fun ensureSession() {
         if (session != null) {
+            // Mark live before any soft-reconnect create so Coolwalk rail settle
+            // cannot shrink CarPlay VDs under the encode canvas.
+            reportLive(true)
             CarPlayHostRuntime.ensureStartedSync(this, timeoutMs = 5_000L)
             glCompositorRef.get()?.let { session?.attachGlCompositor(it) }
             return
         }
         Log.i(CarPlayConsts.TAG, "CarPlayProjectionService CONNECT")
+        // Live flag first: Host onCreateSplitDisplay must skip FacetBar settle.
+        reportLive(true)
         // Sync Host before session: SETUP must see glCompositor, not tee test-pattern.
         val hostOk = CarPlayHostRuntime.ensureStartedSync(this, timeoutMs = 5_000L)
         Log.i(CarPlayConsts.TAG, "CarPlayProjectionService hostRuntime=$hostOk")
@@ -162,7 +134,6 @@ class CarPlayProjectionService : Service() {
         }
         s.start()
         CarPlayHostActivity.launch(this)
-        reportLive(true)
     }
 
     private fun tearDown(reason: String) {

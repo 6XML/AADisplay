@@ -9,7 +9,12 @@ import java.nio.ByteOrder
  * Supports dict / array / string / bool / int / data — enough for control SETUP/RECORD.
  */
 object BinaryPlist {
-    fun encode(root: Any?): ByteArray {
+    /**
+     * @param groupKeys Apple's writer interns every dict key before any value.
+     *   Event-channel `iAPSendMessage` on this Audi is byte-identical only in that order.
+     *   SETUP bodies stay on the previous walk; those lengths are already accepted.
+     */
+    fun encode(root: Any?, minObjectRefSize: Int = 1, groupKeys: Boolean = false): ByteArray {
         val objects = ArrayList<Any?>()
         val indexOf = HashMap<IdentityKey, Int>()
         fun internNormalized(n: Any?): Int {
@@ -21,9 +26,15 @@ object BinaryPlist {
             when (n) {
                 is Map<*, *> -> {
                     @Suppress("UNCHECKED_CAST")
-                    for ((k, value) in n as Map<String, Any?>) {
-                        internNormalized(k)
-                        internNormalized(value)
+                    val map = n as Map<String, Any?>
+                    if (groupKeys) {
+                        for (k in map.keys) internNormalized(k)
+                        for (value in map.values) internNormalized(value)
+                    } else {
+                        for ((k, value) in map) {
+                            internNormalized(k)
+                            internNormalized(value)
+                        }
                     }
                 }
                 is List<*> -> for (item in n) internNormalized(item)
@@ -31,7 +42,9 @@ object BinaryPlist {
             return idx
         }
         internNormalized(normalize(root))
-        val objectRefSize = refSizeFor(objects.size)
+        // Same three-key screen dict is 158B with 1-byte object refs and 167B with
+        // 2-byte refs. iPhone's Delphi SETUP body is 167B.
+        val objectRefSize = maxOf(refSizeFor(objects.size), minObjectRefSize.coerceIn(1, 4))
         fun refBytes(ref: Int): ByteArray = intBytes(ref, objectRefSize)
 
         val objectBytes = Array(objects.size) { i ->
