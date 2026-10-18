@@ -31,14 +31,21 @@ import java.util.concurrent.atomic.AtomicLong
  * - **speech** — navigation / assistant (SETUP `audioType=speech`, 16 kHz mono) via [pullSpeech]
  *
  * Separation rules (DiPlay mixes both; duplicate PCM = echo):
- * - Media capture matches only USAGE_MEDIA/GAME/UNKNOWN ([AudioPlaybackCaptureConfiguration]
- *   + [MediaProjection]; fallback [MediaRecorder.AudioSource.REMOTE_SUBMIX] is unfiltered).
- * - Speech capture is AudioPolicy [AudioMix] loopback for NAVIGATION/ASSISTANT/SONIFICATION
- *   only. Never downsample or remotesubmix-mirror media into speech — silence is preferred
- *   over double content. MediaProjection cannot legally match NAVIGATION usage.
+ * - Media prefer AudioPolicy RENDER|LOOP_BACK → REMOTE_SUBMIX (true route off speaker),
+ *   then [AudioPlaybackCaptureConfiguration] + [MediaProjection], then unfiltered
+ *   [MediaRecorder.AudioSource.REMOTE_SUBMIX]. Entertainment, alerts, **and**
+ *   telephony downlink / ringtone (on media so Audi AAC path hears calls — MIB3
+ *   never opens speech PCM).
+ * - Speech is AudioPolicy [AudioMix] RENDER|LOOP_BACK for nav/assistant only.
+ *   Never mirror media into speech. MediaProjection cannot match NAVIGATION or
+ *   call usages — those only leave the phone speaker on AudioPolicy RENDER.
  *
  * Mute: playback-capture → stream mute (pre-volume tap) + local-device mute.
- * remotesubmix → no mute (device mute zeros the tap on some OEMs).
+ * audio-policy-render → **no** mute (speaker is out of the path).
+ * remotesubmix fallback → no mute (device mute zeros the tap on some OEMs).
+ *
+ * Scope: phone→car **playback** (media, nav, ringtone, call downlink). Car mic
+ * uplink / full CarPlay telephony protocol is out of scope here.
  *
  * Arm / disarm follows the CarPlay FGS session ([reportCarPlaySessionLive]), not
  * individual RTSP audio SETUP/TEARDOWN — soft reconnect must not unmute the phone.
@@ -56,15 +63,30 @@ object CarPlayAudioCapture {
         STREAM_VOICE_ASSISTANCE,
         AudioManager.STREAM_SYSTEM,
         AudioManager.STREAM_ALARM,
+        AudioManager.STREAM_RING,
+        AudioManager.STREAM_VOICE_CALL,
+        AudioManager.STREAM_DTMF,
     )
 
+    /**
+     * 48 kHz media CarPlay stream: entertainment, alerts, and telephony downlink /
+     * ringtone. Calls stay on media (not speech) so MIB3 AAC hears them — Audi never
+     * opens type-100 speech.
+     */
     private val MEDIA_CAPTURE_USAGES = intArrayOf(
         AudioAttributes.USAGE_MEDIA,
         AudioAttributes.USAGE_GAME,
         AudioAttributes.USAGE_UNKNOWN,
+        AudioAttributes.USAGE_NOTIFICATION,
+        AudioAttributes.USAGE_NOTIFICATION_EVENT,
+        AudioAttributes.USAGE_NOTIFICATION_RINGTONE,
+        AudioAttributes.USAGE_ALARM,
+        AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY,
+        AudioAttributes.USAGE_VOICE_COMMUNICATION,
+        AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING,
     )
 
-    /** Nav / assistant prompts that belong on the CarPlay speech channel. */
+    /** Nav / assistant on the 16 kHz speech CarPlay stream (DiPlay; skipped on MIB3). */
     private val SPEECH_CAPTURE_USAGES = intArrayOf(
         AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE,
         AudioAttributes.USAGE_ASSISTANCE_SONIFICATION,
@@ -103,15 +125,22 @@ object CarPlayAudioCapture {
     /** CSM re-enforces local mute every 250ms — Samsung restores MUSIC when apps start. */
     private const val MUTE_ENFORCE_MS = 250L
     private const val PULL_TIMEOUT_MS = 5 * 60_000L
+    /** Floor between projection-stop / pull-stall rearms while session still desired. */
+    private const val REARM_MIN_GAP_MS = 8_000L
     private const val MEDIA_READ_BYTES = 3_840 // 20 ms @ 48 kHz stereo s16
     private const val SPEECH_READ_BYTES = 640 // 20 ms @ 16 kHz mono s16
     private const val VOLUME_CHANGED_ACTION = "android.media.VOLUME_CHANGED_ACTION"
     private const val EXTRA_VOLUME_STREAM_TYPE = "android.media.EXTRA_VOLUME_STREAM_TYPE"
 
     private val opLock = Any()
+    /** FGS / AIDL still wants capture — survives soft reconnect and transient tap death. */
+    private val desired = AtomicBoolean(false)
     private val armed = AtomicBoolean(false)
     private val lastPullMs = AtomicLong(0L)
+    private val lastRearmMs = AtomicLong(0L)
     private val muteEnforceActive = AtomicBoolean(false)
+    /** Suppress MediaProjection.onStop → rearm while we intentionally stop() the projection. */
+    @Volatile private var ignoringProjectionStop = false
 
     private val mediaRing = PcmRing(
         MEDIA_RING_BYTES,
@@ -165,9 +194,13 @@ object CarPlayAudioCapture {
 
     fun isEnabled(): Boolean = armed.get()
 
+    /** True while FGS/AIDL last requested capture (may be briefly disarmed during rearm). */
+    fun isDesired(): Boolean = desired.get()
+
     fun setEnabled(enabled: Boolean) {
         var reassertMute = false
         synchronized(opLock) {
+            desired.set(enabled)
             // Already armed: still re-assert phone mute (Samsung restores MUSIC on playback).
             if (enabled && armed.get()) {
                 if (mediaMode == "playback-capture") {
@@ -185,7 +218,11 @@ object CarPlayAudioCapture {
                 // MANAGE_MEDIA_PROJECTION. Drop to system identity for the arm window.
                 val identity = Binder.clearCallingIdentity()
                 try {
-                    if (enabled) enableLocked() else disableLocked()
+                    if (enabled) {
+                        enableLocked()
+                    } else {
+                        disableLocked(restoreAudio = true)
+                    }
                 } finally {
                     Binder.restoreCallingIdentity(identity)
                 }
@@ -222,11 +259,15 @@ object CarPlayAudioCapture {
         totalMediaPulled = 0L
         totalSpeechPulled = 0L
         mediaPcmPeak.set(0)
-        phoneMuted = false
-        speakerDeviceMuted = false
-        savedSpeakerVolumes = null
-        savedSpeakerStreamTypes = null
-        mutedStreamTypes = null
+        // Rearm keep-mute: preserve saved volumes / phoneMuted across tap rebuild.
+        if (!phoneMuted) {
+            mutedStreamTypes = null
+            savedVolumes = null
+        }
+        if (!speakerDeviceMuted) {
+            savedSpeakerVolumes = null
+            savedSpeakerStreamTypes = null
+        }
 
         val threads = HandlerThread("aad-cp-audio-capture").also { it.start() }
         val handler = Handler(threads.looper)
@@ -237,26 +278,53 @@ object CarPlayAudioCapture {
         var mMode = "none"
         var sMode = "none"
         try {
-            proj = obtainMediaProjection(ctx)
-            if (proj != null) {
-                runCatching {
-                    proj.registerCallback(
-                        object : MediaProjection.Callback() {
-                            override fun onStop() {
-                                log(TAG, "MediaProjection stopped — disarming")
-                                setEnabled(false)
-                            }
-                        },
-                        handler,
+            // Prefer true AudioPolicy RENDER (media off speaker) + speech LOOP_BACK.
+            val renderArm = tryOpenAudioPolicyRender(ctx)
+            if (renderArm != null) {
+                mediaRec = renderArm.mediaRecord
+                speechRec = renderArm.speechRecord
+                policy = renderArm.policy
+                mMode = "audio-policy-render"
+                sMode = renderArm.speechMode
+            } else {
+                proj = obtainMediaProjection(ctx)
+                if (proj != null) {
+                    runCatching {
+                        proj.registerCallback(
+                            object : MediaProjection.Callback() {
+                                override fun onStop() {
+                                    if (ignoringProjectionStop) return
+                                    // Session still live → rebuild tap, keep phone mute.
+                                    // Full unmute only when desired=false (FGS tearDown).
+                                    log(TAG, "MediaProjection stopped — rearm if desired")
+                                    scheduleRearm("projection-stop")
+                                }
+                            },
+                            handler,
+                        )
+                    }
+                    mediaRec = openPlaybackCaptureRecord(
+                        proj,
+                        MEDIA_SAMPLE_RATE,
+                        MEDIA_CHANNEL_MASK,
+                        MEDIA_CAPTURE_USAGES,
                     )
+                    if (mediaRec != null) mMode = "playback-capture"
                 }
-                mediaRec = openPlaybackCaptureRecord(proj, MEDIA_SAMPLE_RATE, MEDIA_CHANNEL_MASK, MEDIA_CAPTURE_USAGES)
-                if (mediaRec != null) mMode = "playback-capture"
+                if (mediaRec == null) {
+                    mediaRec = openRemoteSubmixRecord(MEDIA_SAMPLE_RATE, MEDIA_CHANNEL_MASK)
+                    mMode = "remote-submix"
+                }
+                // Speech: AudioPolicy loopback for nav/assistant (separate policy).
+                val speechPair = openSpeechRecord(
+                    ctx,
+                    mediaIsPlaybackCapture = mMode == "playback-capture",
+                )
+                speechRec = speechPair.first
+                policy = speechPair.second
+                sMode = speechPair.third
             }
-            if (mediaRec == null) {
-                mediaRec = openRemoteSubmixRecord(MEDIA_SAMPLE_RATE, MEDIA_CHANNEL_MASK)
-                mMode = "remote-submix"
-            }
+
             if (mediaRec == null || mediaRec.state != AudioRecord.STATE_INITIALIZED) {
                 val st = mediaRec?.state ?: -1
                 throw IllegalStateException(
@@ -268,19 +336,15 @@ object CarPlayAudioCapture {
                 throw IllegalStateException("media AudioRecord failed to start (mode=$mMode)")
             }
 
-            // Speech: AudioPolicy loopback for nav/assistant. REMOTE_SUBMIX only when media
-            // is also remotesubmix (no mute) — otherwise mute would zero the speech mix.
-            val speechPair = openSpeechRecord(ctx, mediaIsPlaybackCapture = mMode == "playback-capture")
-            speechRec = speechPair.first
-            policy = speechPair.second
-            sMode = speechPair.third
             if (speechRec != null) {
                 if (speechRec.state != AudioRecord.STATE_INITIALIZED) {
                     log(TAG, "speech AudioRecord not initialized (mode=$sMode) — speech silence")
                     runCatching { speechRec.release() }
                     speechRec = null
-                    unregisterAudioPolicy(am, policy)
-                    policy = null
+                    if (mMode != "audio-policy-render") {
+                        unregisterAudioPolicy(am, policy)
+                        policy = null
+                    }
                     sMode = "none"
                 } else {
                     speechRec.startRecording()
@@ -288,8 +352,10 @@ object CarPlayAudioCapture {
                         log(TAG, "speech AudioRecord failed to start (mode=$sMode) — speech silence")
                         runCatching { speechRec.release() }
                         speechRec = null
-                        unregisterAudioPolicy(am, policy)
-                        policy = null
+                        if (mMode != "audio-policy-render") {
+                            unregisterAudioPolicy(am, policy)
+                            policy = null
+                        }
                         sMode = "none"
                     }
                 }
@@ -309,21 +375,27 @@ object CarPlayAudioCapture {
             startMediaReaderLocked(mediaRec, mMode)
             speechRec?.let { startSpeechReaderLocked(it) }
 
-            // Kill phone-side sinks so CarPlay is the only audible path (phone speaker /
-            // wired / A2DP→车机 BT 与 WiFi CarPlay 叠在一起就是「重音」).
-            // playback-capture: stream mute (pre-volume tap still hears apps) + device mute.
-            // remotesubmix: do NOT mute — on Samsung, setStreamVolumeIndex(0) on SPEAKER
-            // often zeros the remote-submix tap too (all-zero PCM → car silent). Accept
-            // possible phone+car double on this fallback path.
-            if (mMode == "playback-capture") {
-                // OEM stream tables differ — STREAM_VOICE_ASSISTANCE(13) throws
-                // "Bad stream type" on Samsung API 33 and used to abort the whole arm
-                // after playback-capture was already live (phone unmuted again).
-                phoneMuted = mutePhoneStreams(am)
-                speakerDeviceMuted = muteLocalPlaybackDevices()
-                ensureMuteEnforceLocked()
-            } else {
-                log(TAG, "media=$mMode — skip local mute so remotesubmix tap stays live")
+            // Kill phone-side sinks only for playback-capture (copy still hits speaker).
+            // audio-policy-render: true route — speaker out of path, never mute.
+            // remotesubmix: do NOT mute — Samsung device mute zeros the tap.
+            when (mMode) {
+                "playback-capture" -> {
+                    // OEM stream tables differ — STREAM_VOICE_ASSISTANCE(13) throws
+                    // "Bad stream type" on Samsung API 33 and used to abort the whole arm
+                    // after playback-capture was already live (phone unmuted again).
+                    phoneMuted = mutePhoneStreams(am)
+                    speakerDeviceMuted = muteLocalPlaybackDevices()
+                    ensureMuteEnforceLocked()
+                }
+                "audio-policy-render" -> {
+                    // Rearm may have held mute from a prior playback-capture arm.
+                    clearHeldMuteLocked(am, "audio-policy-render")
+                    log(TAG, "media=audio-policy-render — skip mute (RENDER off speaker)")
+                }
+                else -> {
+                    clearHeldMuteLocked(am, mMode)
+                    log(TAG, "media=$mMode — skip local mute so remotesubmix tap stays live")
+                }
             }
 
             log(
@@ -338,7 +410,9 @@ object CarPlayAudioCapture {
             runCatching { mediaRec?.release() }
             runCatching { speechRec?.release() }
             unregisterAudioPolicy(am, policy)
+            ignoringProjectionStop = true
             runCatching { proj?.stop() }
+            ignoringProjectionStop = false
             threads.quitSafely()
             mediaProjection = null
             mediaRecord = null
@@ -349,10 +423,49 @@ object CarPlayAudioCapture {
             mediaMode = "none"
             speechMode = "none"
             armed.set(false)
+            // Keep mute if session still desired; retry after gap (no capture looper).
+            if (desired.get()) {
+                Thread(
+                    {
+                        try {
+                            Thread.sleep(REARM_MIN_GAP_MS)
+                        } catch (_: InterruptedException) {
+                            return@Thread
+                        }
+                        if (desired.get() && !armed.get()) {
+                            lastRearmMs.set(0L)
+                            rearmIfDesired("enable-failed")
+                        }
+                    },
+                    "aad-cp-audio-rearm-retry",
+                ).also {
+                    it.isDaemon = true
+                    it.start()
+                }
+            }
         }
     }
 
-    private fun disableLocked() {
+    /** Drop stream/device mute left over from a keep-mute rearm into a non-mute mode. */
+    private fun clearHeldMuteLocked(am: AudioManager, reason: String) {
+        if (!phoneMuted && !speakerDeviceMuted) return
+        log(TAG, "clear held mute for $reason")
+        stopMuteEnforceLocked()
+        if (phoneMuted) restorePhoneStreams(am)
+        if (speakerDeviceMuted) restoreLocalPlaybackDevices()
+        savedVolumes = null
+        mutedStreamTypes = null
+        phoneMuted = false
+        speakerDeviceMuted = false
+        savedSpeakerVolumes = null
+        savedSpeakerStreamTypes = null
+    }
+
+    /**
+     * Tear down AudioRecord / projection / policy.
+     * [restoreAudio]=false keeps phone mute across rearm (projection death, pull stall).
+     */
+    private fun disableLocked(restoreAudio: Boolean) {
         readerRunning.set(false)
         mediaReaderThread?.interrupt()
         mediaReaderThread = null
@@ -382,10 +495,13 @@ object CarPlayAudioCapture {
         speechRecord = null
         unregisterAudioPolicy(audioManager, audioPolicy)
         audioPolicy = null
+        ignoringProjectionStop = true
         try {
             mediaProjection?.stop()
         } catch (e: Throwable) {
             logDebug(TAG, "MediaProjection.stop failed: ${e.message}")
+        } finally {
+            ignoringProjectionStop = false
         }
         mediaProjection = null
         captureHandler?.removeCallbacksAndMessages(null)
@@ -393,27 +509,88 @@ object CarPlayAudioCapture {
         captureThread = null
         captureHandler = null
         armed.set(false)
-        stopMuteEnforceLocked()
-        if (phoneMuted) {
-            restorePhoneStreams(audioManager)
+        if (restoreAudio) {
+            stopMuteEnforceLocked()
+            if (phoneMuted) {
+                restorePhoneStreams(audioManager)
+            }
+            if (speakerDeviceMuted) {
+                restoreLocalPlaybackDevices()
+            }
+            savedVolumes = null
+            mutedStreamTypes = null
+            phoneMuted = false
+            speakerDeviceMuted = false
+            savedSpeakerVolumes = null
+            savedSpeakerStreamTypes = null
         }
-        if (speakerDeviceMuted) {
-            restoreLocalPlaybackDevices()
-        }
-        savedVolumes = null
-        mutedStreamTypes = null
-        phoneMuted = false
-        speakerDeviceMuted = false
-        savedSpeakerVolumes = null
-        savedSpeakerStreamTypes = null
+        // else: keep mute + saved volumes; mute enforce thread stays for playback-capture
         log(
             TAG,
-            "disarmed: media=$mediaMode speech=$speechMode " +
+            "disarmed: media=$mediaMode speech=$speechMode restoreAudio=$restoreAudio " +
                 "pulledMedia=${totalMediaPulled / 1024}KB pulledSpeech=${totalSpeechPulled / 1024}KB " +
                 "dropMedia=${mediaRing.dropped / 1024}KB dropSpeech=${speechRing.dropped / 1024}KB",
         )
         mediaMode = "none"
         speechMode = "none"
+    }
+
+    /**
+     * Rebuild tap while [desired] without unmuting the phone.
+     * Used when MediaProjection dies or TX stalls mid-session.
+     */
+    private fun scheduleRearm(reason: String) {
+        if (!desired.get()) {
+            setEnabled(false)
+            return
+        }
+        val now = System.currentTimeMillis()
+        val last = lastRearmMs.get()
+        if (last != 0L && now - last < REARM_MIN_GAP_MS) {
+            logDebug(TAG, "rearm skipped (gap) reason=$reason")
+            return
+        }
+        val postTarget = captureHandler
+        val task = Runnable { rearmIfDesired(reason) }
+        if (postTarget != null) {
+            postTarget.post(task)
+        } else {
+            Thread(task, "aad-cp-audio-rearm").also {
+                it.isDaemon = true
+                it.start()
+            }
+        }
+    }
+
+    private fun rearmIfDesired(reason: String) {
+        synchronized(opLock) {
+            if (!desired.get()) {
+                if (armed.get() || phoneMuted || speakerDeviceMuted) {
+                    val identity = Binder.clearCallingIdentity()
+                    try {
+                        disableLocked(restoreAudio = true)
+                    } finally {
+                        Binder.restoreCallingIdentity(identity)
+                    }
+                }
+                return
+            }
+            if (armed.get() && mediaRecord != null) {
+                logDebug(TAG, "rearm noop — already armed reason=$reason")
+                return
+            }
+            lastRearmMs.set(System.currentTimeMillis())
+            log(TAG, "rearm keep-mute reason=$reason")
+            val identity = Binder.clearCallingIdentity()
+            try {
+                if (armed.get()) {
+                    disableLocked(restoreAudio = false)
+                }
+                enableLocked()
+            } finally {
+                Binder.restoreCallingIdentity(identity)
+            }
+        }
     }
 
     private fun startMediaReaderLocked(record: AudioRecord, mode: String) {
@@ -548,7 +725,11 @@ object CarPlayAudioCapture {
      * [opLock] again → deadlock, mute thread dies, phone speaker comes back.
      */
     private fun enforcePhoneMute(am: AudioManager?) {
-        if (am == null || mediaMode != "playback-capture" || !armed.get()) return
+        if (am == null) return
+        // Hold mute across rearm windows (desired + phoneMuted) even while briefly unarmed.
+        val liveCapture = armed.get() && mediaMode == "playback-capture"
+        val holdAcrossRearm = phoneMuted && desired.get()
+        if (!liveCapture && !holdAcrossRearm) return
         val streams = mutedStreamTypes?.toList() ?: MUTED_STREAMS
         var touched = false
         var restoredVol: Int? = null
@@ -645,7 +826,9 @@ object CarPlayAudioCapture {
                         muteMonitorThread === self
                     ) {
                         try {
-                            if (armed.get() && mediaMode == "playback-capture") {
+                            if ((armed.get() && mediaMode == "playback-capture") ||
+                                (desired.get() && phoneMuted)
+                            ) {
                                 enforcePhoneMute(audioManager)
                             }
                         } catch (e: Throwable) {
@@ -694,7 +877,9 @@ object CarPlayAudioCapture {
                 val stream = intent.getIntExtra(EXTRA_VOLUME_STREAM_TYPE, Int.MIN_VALUE)
                 if (stream != Int.MIN_VALUE && stream != AudioManager.STREAM_MUSIC) return
                 // No opLock here — see enforcePhoneMute. Snapshot gates only.
-                if (armed.get() && mediaMode == "playback-capture") {
+                if ((armed.get() && mediaMode == "playback-capture") ||
+                    (desired.get() && phoneMuted)
+                ) {
                     enforcePhoneMute(audioManager)
                 }
             }
@@ -932,21 +1117,185 @@ object CarPlayAudioCapture {
         return Triple(null, null, "none")
     }
 
+    private data class AudioPolicyRenderArm(
+        val policy: Any,
+        val mediaRecord: AudioRecord,
+        val speechRecord: AudioRecord?,
+        val speechMode: String,
+    )
+
     /**
-     * system_server AudioPolicy + AudioMix loopback for speech/nav usages.
-     * Soft-fails on OEMs that hide or restrict the API.
+     * True-route media + speech: both RENDER|LOOP_BACK onto REMOTE_SUBMIX so matching
+     * players (incl. call downlink / ringtone on speech) leave the phone speaker;
+     * capture via [createAudioRecordSource]. Soft-fails → playback-capture / remotesubmix.
      */
+    private fun tryOpenAudioPolicyRender(ctx: Context): AudioPolicyRenderArm? {
+        return try {
+            val mixClass = Class.forName("android.media.audiopolicy.AudioMix")
+            val routeRender = mixClass.getField("ROUTE_FLAG_RENDER").getInt(null)
+            val routeLoopBack = mixClass.getField("ROUTE_FLAG_LOOP_BACK").getInt(null)
+            val renderLoop = routeRender or routeLoopBack
+            val remoteSubmix = runCatching {
+                Class.forName("android.media.AudioSystem")
+                    .getField("DEVICE_OUT_REMOTE_SUBMIX")
+                    .getInt(null)
+            }.getOrNull() ?: run {
+                log(TAG, "audio-policy-render: DEVICE_OUT_REMOTE_SUBMIX missing")
+                return null
+            }
+
+            val mediaMix = buildAudioMix(
+                usages = MEDIA_CAPTURE_USAGES,
+                sampleRate = MEDIA_SAMPLE_RATE,
+                channelMask = MEDIA_CHANNEL_MASK,
+                routeFlags = renderLoop,
+                deviceSystemType = remoteSubmix,
+                deviceAddress = "0",
+            ) ?: run {
+                log(TAG, "audio-policy-render: media mix build failed")
+                return null
+            }
+            // Prefer RENDER for voice/call (off speaker); LOOP_BACK-only still captures
+            // nav but leaves call/ringtone on the phone — only used if RENDER fails.
+            val speechMix = buildAudioMix(
+                usages = SPEECH_CAPTURE_USAGES,
+                sampleRate = SPEECH_SAMPLE_RATE,
+                channelMask = SPEECH_CHANNEL_MASK,
+                routeFlags = renderLoop,
+                deviceSystemType = remoteSubmix,
+                deviceAddress = "0",
+            ) ?: buildAudioMix(
+                usages = SPEECH_CAPTURE_USAGES,
+                sampleRate = SPEECH_SAMPLE_RATE,
+                channelMask = SPEECH_CHANNEL_MASK,
+                routeFlags = routeLoopBack,
+                deviceSystemType = null,
+                deviceAddress = null,
+            )
+
+            val mixes = buildList {
+                add(mediaMix)
+                if (speechMix != null) add(speechMix)
+            }
+            val policy = registerAudioPolicy(ctx, mixes) ?: run {
+                log(TAG, "audio-policy-render: registerAudioPolicy failed")
+                return null
+            }
+
+            val mediaRec = createAudioRecordSource(policy, mediaMix)
+            if (mediaRec == null || mediaRec.state != AudioRecord.STATE_INITIALIZED) {
+                log(
+                    TAG,
+                    "audio-policy-render: media record not ready state=${mediaRec?.state}",
+                )
+                runCatching { mediaRec?.release() }
+                unregisterAudioPolicy(audioManager, policy)
+                return null
+            }
+
+            var speechRec: AudioRecord? = null
+            var sMode = "none"
+            if (speechMix != null) {
+                val rec = createAudioRecordSource(policy, speechMix)
+                if (rec != null && rec.state == AudioRecord.STATE_INITIALIZED) {
+                    speechRec = rec
+                    sMode = "audio-policy-mix"
+                } else {
+                    runCatching { rec?.release() }
+                    log(TAG, "audio-policy-render: speech mix present but record failed — speech silence")
+                }
+            } else {
+                log(TAG, "audio-policy-render: speech mix build failed — speech silence")
+            }
+
+            log(
+                TAG,
+                "audio-policy-render armed media+speech policy " +
+                    "usagesMedia=${MEDIA_CAPTURE_USAGES.toList()} " +
+                    "usagesSpeech=${SPEECH_CAPTURE_USAGES.toList()} speechMode=$sMode",
+            )
+            AudioPolicyRenderArm(policy, mediaRec, speechRec, sMode)
+        } catch (e: Throwable) {
+            log(TAG, "audio-policy-render unavailable — fallback capture", e)
+            null
+        }
+    }
+
+    /** Speech-only policy (fallback when media is playback-capture / remotesubmix). */
     private fun openSpeechViaAudioPolicy(ctx: Context): Pair<AudioRecord, Any>? {
+        return try {
+            val mixClass = Class.forName("android.media.audiopolicy.AudioMix")
+            val routeRender = mixClass.getField("ROUTE_FLAG_RENDER").getInt(null)
+            val routeLoopBack = mixClass.getField("ROUTE_FLAG_LOOP_BACK").getInt(null)
+            val remoteSubmix = runCatching {
+                Class.forName("android.media.AudioSystem")
+                    .getField("DEVICE_OUT_REMOTE_SUBMIX")
+                    .getInt(null)
+            }.getOrNull()
+            // Prefer RENDER so call/ringtone leave the speaker even on capture fallback.
+            val mix = if (remoteSubmix != null) {
+                buildAudioMix(
+                    usages = SPEECH_CAPTURE_USAGES,
+                    sampleRate = SPEECH_SAMPLE_RATE,
+                    channelMask = SPEECH_CHANNEL_MASK,
+                    routeFlags = routeRender or routeLoopBack,
+                    deviceSystemType = remoteSubmix,
+                    deviceAddress = "0",
+                )
+            } else {
+                null
+            } ?: buildAudioMix(
+                usages = SPEECH_CAPTURE_USAGES,
+                sampleRate = SPEECH_SAMPLE_RATE,
+                channelMask = SPEECH_CHANNEL_MASK,
+                routeFlags = routeLoopBack,
+                deviceSystemType = null,
+                deviceAddress = null,
+            ) ?: return null
+            val policy = registerAudioPolicy(ctx, listOf(mix)) ?: return null
+            val record = createAudioRecordSource(policy, mix)
+            if (record == null || record.state != AudioRecord.STATE_INITIALIZED) {
+                runCatching { record?.release() }
+                unregisterAudioPolicy(audioManager, policy)
+                return null
+            }
+            log(TAG, "speech AudioPolicy mix registered usages=${SPEECH_CAPTURE_USAGES.toList()}")
+            record to policy
+        } catch (e: Throwable) {
+            logDebug(TAG, "speech AudioPolicy mix unavailable: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * Reflect [AudioMix] for matching [usages]. When [deviceSystemType] is set (RENDER),
+     * binds that sink via [AudioMix.Builder.setDevice]; LOOP_BACK-only mixes omit device.
+     */
+    private fun buildAudioMix(
+        usages: IntArray,
+        sampleRate: Int,
+        channelMask: Int,
+        routeFlags: Int,
+        deviceSystemType: Int?,
+        deviceAddress: String?,
+    ): Any? {
         return try {
             val ruleBuilderClass = Class.forName("android.media.audiopolicy.AudioMixingRule\$Builder")
             val ruleBuilder = ruleBuilderClass.getDeclaredConstructor().newInstance()
+            // MIX_ROLE_PLAYERS divert matching AudioTracks into this mix (VirtualAudioSession).
+            runCatching {
+                val mixRuleClass = Class.forName("android.media.audiopolicy.AudioMixingRule")
+                val rolePlayers = mixRuleClass.getField("MIX_ROLE_PLAYERS").getInt(null)
+                ruleBuilderClass.getMethod("setTargetMixRole", Int::class.javaPrimitiveType)
+                    .invoke(ruleBuilder, rolePlayers)
+            }
             val addRule = ruleBuilderClass.methods.first { m ->
                 m.name == "addRule" && m.parameterTypes.size == 2
             }
             val ruleMatchUsage = Class.forName("android.media.audiopolicy.AudioMixingRule")
                 .getField("RULE_MATCH_ATTRIBUTE_USAGE")
                 .getInt(null)
-            for (usage in SPEECH_CAPTURE_USAGES) {
+            for (usage in usages) {
                 val attrs = AudioAttributes.Builder().setUsage(usage).build()
                 addRule.invoke(ruleBuilder, attrs, ruleMatchUsage)
             }
@@ -957,26 +1306,54 @@ object CarPlayAudioCapture {
                 Class.forName("android.media.audiopolicy.AudioMixingRule"),
             ).newInstance(rule)
             val format = AudioFormat.Builder()
-                .setSampleRate(SPEECH_SAMPLE_RATE)
-                .setChannelMask(SPEECH_CHANNEL_MASK)
+                .setSampleRate(sampleRate)
+                .setChannelMask(channelMask)
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                 .build()
             mixBuilderClass.getMethod("setFormat", AudioFormat::class.java).invoke(mixBuilder, format)
-            val routeLoopBack = Class.forName("android.media.audiopolicy.AudioMix")
-                .getField("ROUTE_FLAG_LOOP_BACK")
-                .getInt(null)
             mixBuilderClass.getMethod("setRouteFlags", Int::class.javaPrimitiveType)
-                .invoke(mixBuilder, routeLoopBack)
-            val mix = mixBuilderClass.getMethod("build").invoke(mixBuilder)
+                .invoke(mixBuilder, routeFlags)
+            if (deviceSystemType != null) {
+                // RENDER requires a device (framework: "Can't have flag ROUTE_FLAG_RENDER
+                // without an audio device"). Prefer (int, String) SystemApi.
+                val setDeviceIS = runCatching {
+                    mixBuilderClass.getMethod(
+                        "setDevice",
+                        Int::class.javaPrimitiveType,
+                        String::class.java,
+                    )
+                }.getOrNull()
+                if (setDeviceIS != null) {
+                    setDeviceIS.invoke(mixBuilder, deviceSystemType, deviceAddress ?: "0")
+                } else {
+                    val attrsCtor = Class.forName("android.media.AudioDeviceAttributes")
+                        .getConstructor(Int::class.javaPrimitiveType, String::class.java)
+                    val attrs = attrsCtor.newInstance(deviceSystemType, deviceAddress ?: "0")
+                    mixBuilderClass.methods.first { m ->
+                        m.name == "setDevice" && m.parameterTypes.size == 1
+                    }.invoke(mixBuilder, attrs)
+                }
+            }
+            mixBuilderClass.getMethod("build").invoke(mixBuilder)
+        } catch (e: Throwable) {
+            logDebug(TAG, "buildAudioMix failed usages=${usages.toList()}: ${e.message}")
+            null
+        }
+    }
 
+    private fun registerAudioPolicy(ctx: Context, mixes: List<Any>): Any? {
+        if (mixes.isEmpty()) return null
+        return try {
             val policyBuilderClass = Class.forName("android.media.audiopolicy.AudioPolicy\$Builder")
             val policyBuilder = policyBuilderClass.getConstructor(Context::class.java).newInstance(ctx)
-            policyBuilderClass.getMethod(
+            val addMix = policyBuilderClass.getMethod(
                 "addMix",
                 Class.forName("android.media.audiopolicy.AudioMix"),
-            ).invoke(policyBuilder, mix)
+            )
+            for (mix in mixes) {
+                addMix.invoke(policyBuilder, mix)
+            }
             val policy = policyBuilderClass.getMethod("build").invoke(policyBuilder)
-
             val am = audioManager ?: return null
             val register = AudioManager::class.java.methods.first { m ->
                 m.name == "registerAudioPolicy" && m.parameterTypes.size == 1
@@ -991,19 +1368,21 @@ object CarPlayAudioCapture {
                 log(TAG, "registerAudioPolicy returned false")
                 return null
             }
+            policy
+        } catch (e: Throwable) {
+            logDebug(TAG, "registerAudioPolicy failed: ${e.message}")
+            null
+        }
+    }
 
+    private fun createAudioRecordSource(policy: Any, mix: Any): AudioRecord? {
+        return try {
             val createRecord = policy.javaClass.methods.first { m ->
                 m.name == "createAudioRecordSource" && m.parameterTypes.size == 1
             }
-            val record = createRecord.invoke(policy, mix) as? AudioRecord
-            if (record == null) {
-                unregisterAudioPolicy(am, policy)
-                return null
-            }
-            log(TAG, "speech AudioPolicy mix registered usages=${SPEECH_CAPTURE_USAGES.toList()}")
-            record to policy
+            createRecord.invoke(policy, mix) as? AudioRecord
         } catch (e: Throwable) {
-            logDebug(TAG, "speech AudioPolicy mix unavailable: ${e.message}")
+            logDebug(TAG, "createAudioRecordSource failed: ${e.message}")
             null
         }
     }
@@ -1314,10 +1693,32 @@ object CarPlayAudioCapture {
     private fun scheduleWatchdog(handler: Handler) {
         handler.postDelayed(
             {
-                if (!armed.get()) return@postDelayed
+                if (!desired.get()) {
+                    // Session released — if somehow still armed, full unmute path.
+                    if (armed.get()) setEnabled(false)
+                    return@postDelayed
+                }
                 if (System.currentTimeMillis() - lastPullMs.get() > PULL_TIMEOUT_MS) {
-                    log(TAG, "no pull for ${PULL_TIMEOUT_MS / 1000}s — disarming (app gone?)")
-                    setEnabled(false)
+                    // App TX may be stuck or projection died; never unmute while FGS
+                    // still desires capture — rebuild tap and keep phone mute.
+                    log(
+                        TAG,
+                        "no pull for ${PULL_TIMEOUT_MS / 1000}s — rearm keep-mute " +
+                            "(desired=true, not unmuting)",
+                    )
+                    lastPullMs.set(System.currentTimeMillis())
+                    scheduleRearm("pull-timeout")
+                    // Rearm may quit this handler; if still alive, keep ticking.
+                    if (desired.get() && captureHandler === handler) {
+                        scheduleWatchdog(handler)
+                    }
+                    return@postDelayed
+                }
+                if (!armed.get()) {
+                    scheduleRearm("watchdog-unarmed")
+                    if (desired.get() && captureHandler === handler) {
+                        scheduleWatchdog(handler)
+                    }
                     return@postDelayed
                 }
                 // Revive sticky-mute if One UI killed / deadlocked the enforce thread.
@@ -1326,12 +1727,31 @@ object CarPlayAudioCapture {
                         if (armed.get()) ensureMuteEnforceLocked()
                     }
                 }
+                // Lifetime max stays for "ever heard audio"; window peak shows if tap is live now.
+                val peak = mediaPcmPeak.getAndSet(0)
+                // RENDER path must not fall back to device mute (Samsung zeros remotesubmix).
+                if (mediaMode == "audio-policy-render" && peak == 0 && totalMediaPulled > 0L) {
+                    log(
+                        TAG,
+                        "watchdog: audio-policy-render pcmPeak=0 with pulls — tap silent " +
+                            "(not muting; check OEM RENDER)",
+                    )
+                }
+                if (peak == 0 && totalMediaPulled > 0L &&
+                    (mediaMode == "remote-submix" || mediaMode == "playback-capture")
+                ) {
+                    log(
+                        TAG,
+                        "watchdog: $mediaMode windowPeak=0 — capture silence " +
+                            "(HU may still get empty AAC; check app volume / route)",
+                    )
+                }
                 val muteAlive = muteMonitorThread?.isAlive == true
                 log(
                     TAG,
-                    "watchdog media=$mediaMode speech=$speechMode " +
+                    "watchdog media=$mediaMode speech=$speechMode desired=true " +
                         "pulledMedia=${totalMediaPulled / 1024}KB pulledSpeech=${totalSpeechPulled / 1024}KB " +
-                        "pcmPeak=${mediaPcmPeak.get()} dropMedia=${mediaRing.dropped / 1024}KB " +
+                        "pcmPeak=$peak dropMedia=${mediaRing.dropped / 1024}KB " +
                         "muteThread=$muteAlive",
                 )
                 scheduleWatchdog(handler)

@@ -79,7 +79,9 @@ class AirPlayPairVerify(
             return null
         }
         val expectedAccessoryId = identity.accessoryId.toByteArray(Charsets.UTF_8)
-        if (!accessoryId.contentEquals(expectedAccessoryId)) {
+        if (identity.accessoryId.isNotEmpty() &&
+            !accessoryId.contentEquals(expectedAccessoryId)
+        ) {
             Log.w(
                 CarPlayConsts.TAG,
                 "AirPlay pair-verify accessory id mismatch " +
@@ -88,11 +90,21 @@ class AirPlayPairVerify(
             )
             return null
         }
-        // DiPlay PairVerify.m2: sign(accessoryEph || accessoryId || clientEph)
-        val accessorySignData = accessoryEphPub + accessoryId + ourPub
-        if (!AirPlayCurveCrypto.ed25519Verify(identity.accessoryLtpk, accessorySignData, accessorySig)) {
-            Log.w(CarPlayConsts.TAG, "AirPlay pair-verify accessory signature invalid")
-            return null
+        // DiPlay PairVerify.m2: sign(accessoryEph || accessoryId || clientEph).
+        // Audi 403 fast path (no prior M6 / no mDNS pk): skip when LTPK unknown — CarDeck same.
+        if (identity.accessoryLtpk.size == 32) {
+            val accessorySignData = accessoryEphPub + accessoryId + ourPub
+            if (!AirPlayCurveCrypto.ed25519Verify(
+                    identity.accessoryLtpk,
+                    accessorySignData,
+                    accessorySig,
+                )
+            ) {
+                Log.w(CarPlayConsts.TAG, "AirPlay pair-verify accessory signature invalid")
+                return null
+            }
+        } else {
+            Log.i(CarPlayConsts.TAG, "AirPlay pair-verify skip accessory LTPK check (none saved)")
         }
 
         val controllerIdBytes = identity.controllerId.toByteArray(Charsets.UTF_8)

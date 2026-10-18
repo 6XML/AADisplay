@@ -565,18 +565,22 @@ CarPlay Host（唯一 CP 出画路径，GPU 零拷贝）:
 **音频（media ⊕ speech，互斥内容）**
 
 ```
-USAGE_MEDIA/GAME/UNKNOWN
-  → media ring（48k stereo；PlaybackCapture 优先，否则 REMOTE_SUBMIX）
-  → pullCarPlayAudio → egress media（SETUP audioType=media 0x8000）
+USAGE_MEDIA/GAME/UNKNOWN/NOTIFICATION*/ALARM/ACCESSIBILITY/VOICE_COMMUNICATION*/RINGTONE
+  → media ring（48k stereo）
+     1) AudioPolicy RENDER|LOOP_BACK → REMOTE_SUBMIX（真改道，不 mute；含通话下行/铃声）
+     2) PlaybackCapture + MediaProjection（采不到通话 usage）
+     3) REMOTE_SUBMIX AudioRecord（回退）
+  → pullCarPlayAudio → egress media（SETUP audioType=media 0x8000 / 奥迪 type-102 AAC）
 USAGE_ASSISTANCE_NAVIGATION_GUIDANCE / ASSISTANT / SONIFICATION
-  → speech ring（16k mono；仅 AudioPolicy AudioMix loopback）
-  → pullCarPlaySpeechAudio → egress speech（SETUP audioType=speech 0x10）
+  → speech ring（16k mono；AudioPolicy RENDER|LOOP_BACK→REMOTE_SUBMIX；与 media 同 policy 或单独）
+  → pullCarPlaySpeechAudio → egress speech（SETUP audioType=speech 0x10；MIB3 不开）
 ```
 
-- 奥迪 MIB3：只开 type-102 AAC-LC media（`CarPlayAacAudioEgress`），不开 speech PCM（奥迪混音器会静音）。
+- 奥迪 MIB3：只开 type-102 AAC-LC media（`CarPlayAacAudioEgress`），不开 speech PCM（奥迪混音器会静音）→ 通话/铃声走 media mix。
 - 其它车机：type-100 media（`0x8000` 48 kHz stereo）；speech（`0x10` 16 kHz mono）仅在 `CoreApi.isCarPlaySpeechCaptureReady()` 时打开。无内容发静音。**禁止** media→speech 镜像 / 双路 remotesubmix（DiPlay 混出重音）。
-- AudioPolicy 不可用时 speech 保持静音（导航提示缺席优于重音）；MediaProjection 采不到 NAVIGATION。
-- Mute：playback-capture → stream mute + local-device mute；remotesubmix → **不**静音（三星上 device mute 会采成全零）。
+- AudioPolicy 不可用时 speech 保持静音（导航提示缺席优于重音）；MediaProjection 采不到 NAVIGATION / 通话。
+- Mute：仅 playback-capture → stream mute（含 VOICE_CALL/RING）+ local-device mute；`audio-policy-render` → **不** mute；remotesubmix 回退 → **不**静音。
+- 范围：手机→车机 **播放**（含通话下行）；车机麦上行 / 完整 CarPlay 电话协议不在此路径。
 - MediaProjection：system_server 内勿走 `BinderService.createProjection`（同进程 `checkCallingPermission` 恒拒）；直接构造服务内 `MediaProjection`（三星无 `createProjectionInternal`）。
 - 采集启停跟 FGS `reportCarPlaySessionLive`；egress `setEnabled(true)` 再断言，会话 live 时 ignore disable。
 
@@ -603,10 +607,10 @@ ClusterLyricMirror（system_server）
 | iAP2 | `protocol/Iap2Framing` + `Iap2Csm` + `Iap2Session`：detect → Link Sync → Ident → Auth(`AA00…05`) → WiFi/`4300`→`4301`；`CarPlayWifiHandoff` 尝试加热点 |
 | 编码 / Host | `CarPlayVideoEncoder`（60fps；1280×720 时 `bitrateFor` 落在 8 Mbit 下限；Surface 优先；`ENCODE_*`=1280×720；`KEY_LOW_LATENCY`/`CAPTURE_RATE`/`REPEAT_PREVIOUS_FRAME_AFTER`；High + `I_FRAME_INTERVAL_SEC=1`）、Host：`CarPlayGlCompositor`（VD→OES→GLES→encoder @60；`carplay/gles/*`）、Host 未就绪临时：`FrameEgressTee` 测试图案；`ScreenStreamEgress` 同步 TCP + 每帧 flush（异步合并 flush 会灌爆 DiPlay） |
 | 帧率自适应 | `CarPlaySourceSession`：8×10s 劣化（<50% 或丢帧 >15%）60→30，6×10s 良好 30→60；不重发 SETUP（DiPlay 忽略 fps，**车机需 设置→显示→帧率=60**） |
-| 音频出站 | system_server `CarPlayAudioCapture`（media：PlaybackCapture MEDIA/GAME/UNKNOWN 或 REMOTE_SUBMIX→48k；speech：**仅** AudioPolicy nav/assistant→16k，失败则静音；内容互斥不镜像；playback-capture stream mute / remotesubmix speaker-device mute；5min 看门狗）。奥迪 MIB3：`CarPlayAacAudioEgress` type-102。其它车机：`CarPlayAudioEgress` type-100 media`0x8000`，speech`0x10` 仅 AudioPolicy 就绪时 SETUP。无采集发静音 |
+| 音频出站 | system_server `CarPlayAudioCapture`（media：优先 AudioPolicy RENDER\|LOOP_BACK→REMOTE_SUBMIX，覆盖娱乐+通知+闹钟+**通话下行/铃声**；否则 PlaybackCapture（无通话）→ REMOTE_SUBMIX；speech：nav/assistant 同 RENDER，失败静音；mute 仅 playback-capture（含 VOICE_CALL/RING）；5min 看门狗）。奥迪 MIB3：仅 type-102 AAC media（通话也走 media）。其它：type-100 media + 条件 speech。无车机麦上行 |
 | NowPlaying | `CarPlayNowPlaying.kt`（观察 `ClusterLyricStore`/`ClusterArtStore` Settings.Global → iAP2 `0x5001` 增量：title=当前歌词行（仪表 8s 字幕）、artist/album/source/duration/elapsed 1s tick；封面走 iAP2 v2 文件传输会话 12：SETUP→START→DATA(FLAG_LAST)→SUCCESS，≤2MiB，`CoreApi.getClusterArtJpeg` 取字节） |
 | iAP2 扩展 | `Iap2Session`：`0x5000` 订阅接收、`sendNowPlaying`、会话 12 路由 + 发送窗口流控（对端 maxOutgoing 累积 ACK，队列封顶）；`Iap2Framing` LSP 含 `(0x0C, kind 1, ver 2)` |
-| 方向盘 | event 通道 HID uuid `2a2a2a2b/c/d` → `CarPlayWheelController`：媒体键短按 `CoreApi.pressKey`、NEXT 长按 `swapSplitPanes`、PREV 长按 Recents、滚轮 `CoreApi.scrollPane`（焦点窗滚动） |
+| 方向盘 | event 通道 HID → `CarPlayWheelController`（与 AA 同 UX）：短按切歌 `pressKey`；**长按右/下一曲=`swapSplitPanes`**；**长按左/上一曲=Recents**；滚轮 `scrollPane`。MIB3 物理右常报 HID PREV → `invertMediaLeftRight` 对调后再按 AA 语义处理 |
 | 仅 CP Host | `CarPlayHostActivity`（无 UI 壳：双 SurfaceTexture → `CarPlayGlCompositor` GLES 合成 + 分隔条/全屏 peel + Recents/Picker 纹理叠加；`LastSplitStore` 快照恢复 + 演示应用兜底） |
 | 触控回传 | `CarPlayInputBridge` → AA 在线 `CoreApi.touchAaDisplay`；仅 CP 按 `primaryRatio` 切窗 → `CoreApi.touchPane`（窗内像素）；分隔条对齐 AA：短按 `swapSplitPanes`、长按 Recents、拖动预览 + UP `setSplitRatio` settle、拖过边缘 `setSplitFullscreen`；空窗短按开 `CarPlayAppPickerOverlay` |
 | Recents | `CarPlayRecentsOverlay.kt`（画布三列对齐 AA `fragment_aa_recent_task`：左 PRIMARY / 中 SECONDARY / 右 phone；无列标题；两道竖分割线；底栏「添加应用」→ Picker；卡片 × → `removeTask`；点卡 `moveTaskToFront` / `startActivityOnPaneForUser`；空白 dismiss） |

@@ -1,10 +1,12 @@
 package io.github.nitsuya.aa.display.carplay
 
+import android.content.Context
 import android.util.Log
 import io.github.nitsuya.aa.display.CoreApi
 import io.github.nitsuya.aa.display.carplay.profile.CarPlayHuProfile
 import io.github.nitsuya.aa.display.carplay.profile.CarPlayProfileRegistry
 import io.github.nitsuya.aa.display.carplay.profile.CarPlaySourceIdentity
+import io.github.nitsuya.aa.display.carplay.protocol.AirPlayIdentityStore
 import io.github.nitsuya.aa.display.carplay.protocol.AirPlayPairVerify
 import io.github.nitsuya.aa.display.carplay.protocol.AirPlayPairing
 import io.github.nitsuya.aa.display.carplay.protocol.BinaryPlist
@@ -17,6 +19,7 @@ import io.github.nitsuya.aa.display.carplay.protocol.ScreenStreamEgress
 import io.github.nitsuya.aa.display.carplay.protocol.WifiIap2Link
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.IOException
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -27,6 +30,7 @@ import java.util.ArrayDeque
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -40,6 +44,7 @@ import kotlin.random.Random
  * and can emit H.264 as RTP/AVP/TCP interleaved frames.
  */
 class CarPlayRtspSession(
+    private val appContext: Context,
     private val onVideoSetup: (width: Int, height: Int) -> Unit,
     private val onSessionReady: () -> Unit,
     private val onTouchEvent: (x: Float, y: Float, action: Int) -> Unit,
@@ -71,7 +76,19 @@ class CarPlayRtspSession(
         CarPlayAacAudioEgress.AUDIO_FORMAT_AAC_LC_48000_STEREO
     private val speechAudioEgress = AtomicReference<CarPlayAudioEgress?>(null)
     private val eventChannel = AtomicReference<CarPlayEventChannel?>(null)
+    /**
+     * Re-POST modesChanged (phone owns MainAudio). Set after announce helper exists;
+     * used by BORROW restore and the post-arm burst only — not cadence-gap / periodic
+     * heartbeat (those latch Audi mute while AAC still flows).
+     */
+    private val modesRestored = AtomicReference<(() -> Unit)?>(null)
+    private val lastModesReclaimMs = AtomicLong(0L)
     private val wifiIap = AtomicReference<WifiIap2Link?>(null)
+
+    private companion object {
+        /** Min gap between non-forced reclaims (BORROW restore path). */
+        private const val MODES_RECLAIM_MIN_GAP_MS = 8_000L
+    }
     /** Phone iAP frames waiting to go out on the RTSP control socket. */
     private val iapTx = ArrayDeque<ByteArray>()
     private val iapTxLock = Any()
@@ -92,6 +109,9 @@ class CarPlayRtspSession(
     @Volatile private var accessoryTouchMaxX = CarPlayConsts.DEFAULT_VIDEO_WIDTH
     @Volatile private var accessoryTouchMaxY = CarPlayConsts.DEFAULT_VIDEO_HEIGHT
     @Volatile private var accessoryDisplayUuid: String? = null
+    /** `/info` hidDevices[].uuid as strings ("0"/"1" on Audi, hex on DiPlay). */
+    private val accessoryHidUuids = CopyOnWriteArrayList<String>()
+    private val identityStore by lazy { AirPlayIdentityStore(appContext.applicationContext) }
 
     val localPort: Int
         get() = serverSocket?.localPort ?: 0
@@ -159,7 +179,7 @@ class CarPlayRtspSession(
             airplaySourceActive.set(true)
             try {
                 val mib3 = huProfile.usesMib3WirelessPath
-                val socket = CarPlayAccessoryNet.openTcp()
+                var socket = CarPlayAccessoryNet.openTcp()
                 socket.connect(InetSocketAddress(host, port), 15_000)
                 socket.soTimeout = 15_000
                 Log.i(
@@ -167,8 +187,8 @@ class CarPlayRtspSession(
                     "AirPlay source dial $host:$port deviceId=$deviceId hu=${huProfile.id}",
                 )
                 peer = socket
-                val input = BufferedInputStream(socket.getInputStream())
-                val out = BufferedOutputStream(socket.getOutputStream())
+                var input = BufferedInputStream(socket.getInputStream())
+                var out = BufferedOutputStream(socket.getOutputStream())
                 output = out
                 var cseq = 1
                 fun exchange(req: RtspMessage): RtspMessage? {
@@ -203,26 +223,61 @@ class CarPlayRtspSession(
                         return provisional.copy(body = body)
                     }
                 }
+                fun reconnectForPairVerify() {
+                    try {
+                        socket.close()
+                    } catch (_: Throwable) {
+                    }
+                    socket = CarPlayAccessoryNet.openTcp()
+                    socket.connect(InetSocketAddress(host, port), 15_000)
+                    socket.soTimeout = 15_000
+                    peer = socket
+                    input = BufferedInputStream(socket.getInputStream())
+                    out = BufferedOutputStream(socket.getOutputStream())
+                    output = out
+                    cseq = 1
+                    Log.i(CarPlayConsts.TAG, "AirPlay reconnected for pair-verify fast path")
+                }
                 val userAgent = huProfile.userAgent
                 val hkp = huProfile.hkp
-                fun post(path: String, body: ByteArray, contentType: String): ByteArray? {
-                    val req = RtspMessage(
-                        "POST $path RTSP/1.0",
-                        linkedMapOf(
-                            "CSeq" to (cseq++).toString(),
-                            "User-Agent" to userAgent,
-                            "X-Apple-HKP" to hkp,
-                            "Content-Type" to contentType,
-                            "Content-Length" to body.size.toString(),
-                        ),
-                        body,
+                fun post(
+                    path: String,
+                    body: ByteArray,
+                    contentType: String,
+                    extraHeaders: Map<String, String> = emptyMap(),
+                ): ByteArray? {
+                    val headers = linkedMapOf(
+                        "CSeq" to (cseq++).toString(),
+                        "User-Agent" to userAgent,
+                        "X-Apple-HKP" to hkp,
+                        "Content-Type" to contentType,
+                        "Content-Length" to body.size.toString(),
                     )
+                    headers.putAll(extraHeaders)
+                    val req = RtspMessage("POST $path RTSP/1.0", headers, body)
                     val resp = exchange(req) ?: return null
                     logAirPlayResponse(path, resp)
                     if (!resp.firstLine.contains("200")) {
                         Log.w(CarPlayConsts.TAG, "AirPlay $path non-200: ${resp.firstLine}")
+                        // Only 403 aborts into the pair-verify fast path; other codes
+                        // let AirPlayPairing try the next M1 variant (DiPlay).
+                        if (resp.firstLine.contains("403")) {
+                            throw IOException("POST $path ${resp.firstLine}")
+                        }
+                        return null
                     }
                     return resp.body
+                }
+
+                fun postPairing(path: String, body: ByteArray, contentType: String): ByteArray? {
+                    // CarDeck / catplay PairingHelperTx: pair-verify needs X-Apple-PD: 1
+                    // or Audi returns HTTP 403 before TLV parsing.
+                    val extra = if (path.contains("pair-verify", ignoreCase = true)) {
+                        mapOf("X-Apple-PD" to "1")
+                    } else {
+                        emptyMap()
+                    }
+                    return post(path, body, contentType, extra)
                 }
 
                 fun fetchInfo() {
@@ -254,7 +309,10 @@ class CarPlayRtspSession(
                     )
                     logAirPlayResponse("options", options)
                 }
-                // MIB3 returns 455 for GET /info until OPTIONS has completed.
+                // Our proven order: MIB3 needs OPTIONS before /info (else 455);
+                // DiPlay accepts /info first. Do not skip preheat — CarDeck's
+                // "info poisons pair-setup" is a hardening concern only if setup
+                // then returns 403 (caught below), not a reason to drop our path.
                 if (mib3) {
                     fetchOptions()
                     fetchInfo()
@@ -263,28 +321,53 @@ class CarPlayRtspSession(
                     fetchOptions()
                 }
 
-                // DiPlay: persistent pair-setup M1–M6 (saves our LTPK), then pair-verify
-                // (X25519 → Control-Salt keys); ControlCipher only after verify M4.
-                val pairing = AirPlayPairing(
-                    controllerId = deviceId ?: "AADisplay",
-                    exchange = { path, body, ct -> post(path, body, ct) },
-                )
-                val setup = pairing.runPairSetup(preferTransient = false)
-                if (setup == null) {
-                    Log.e(CarPlayConsts.TAG, "AirPlay pair-setup failed")
+                val preferredId = deviceId ?: phoneMac ?: "AADisplay"
+                val controller = identityStore.loadOrCreateController(preferredId)
+                val savedAccessory = identityStore.loadAccessory()
+                // Primary: our pair-setup → pair-verify (unchanged).
+                // Hardening only: HTTP 403 → reconnect + verify with persisted controller.
+                var identity: AirPlayPairing.Identity? = null
+                try {
+                    val pairing = AirPlayPairing(
+                        controllerId = controller.pairingId,
+                        exchange = { path, body, ct -> postPairing(path, body, ct) },
+                        persistentController = controller,
+                        onAccessoryPaired = { id, ltpk -> identityStore.saveAccessory(id, ltpk) },
+                    )
+                    val setup = pairing.runPairSetup(preferTransient = false)
+                    identity = setup?.identity
+                    if (identity != null) {
+                        Log.i(
+                            CarPlayConsts.TAG,
+                            "AirPlay pair-setup success transient=${setup?.transient} " +
+                                "accessoryId=${identity.accessoryId} " +
+                                "sessionKey=${setup?.sessionKey?.size ?: 0}B",
+                        )
+                    } else {
+                        Log.e(CarPlayConsts.TAG, "AirPlay pair-setup failed")
+                        return@thread
+                    }
+                } catch (e: IOException) {
+                    val forbidden = e.message?.contains("403") == true
+                    if (!forbidden) {
+                        Log.e(CarPlayConsts.TAG, "AirPlay pair-setup failed", e)
+                        return@thread
+                    }
+                    Log.w(
+                        CarPlayConsts.TAG,
+                        "AirPlay pair-setup 403 → hardening pair-verify fast path " +
+                            "(persisted controller; does not replace primary setup)",
+                    )
+                    reconnectForPairVerify()
+                    identity = identityStore.toPairingIdentity(controller, savedAccessory)
+                }
+                val pairedIdentity = identity
+                if (pairedIdentity == null) {
+                    Log.e(CarPlayConsts.TAG, "AirPlay pairing identity missing")
                     return@thread
                 }
-                val identity = setup.identity
-                if (identity == null) {
-                    Log.e(CarPlayConsts.TAG, "AirPlay pair-setup missing identity (need M6)")
-                    return@thread
-                }
-                Log.i(
-                    CarPlayConsts.TAG,
-                    "AirPlay pair-setup success transient=${setup.transient} " +
-                        "accessoryId=${identity.accessoryId} sessionKey=${setup.sessionKey.size}B",
-                )
-                val verify = AirPlayPairVerify { path, body, ct -> post(path, body, ct) }.run(identity)
+                val verify = AirPlayPairVerify { path, body, ct -> postPairing(path, body, ct) }
+                    .run(pairedIdentity)
                 if (verify == null) {
                     Log.e(CarPlayConsts.TAG, "AirPlay pair-verify failed")
                     return@thread
@@ -379,13 +462,48 @@ class CarPlayRtspSession(
         mediaAacEgress.getAndSet(null)?.stop()
         speechAudioEgress.getAndSet(null)?.stop()
         screenEgress.getAndSet(null)?.close()
-        wifiIap.getAndSet(null)?.close()
+        wifiIap.getAndSet(null)?.also { link ->
+            CarPlayNowPlaying.detachEgress(link)
+            link.close()
+        }
         eventChannel.getAndSet(null)?.close()
         timing.getAndSet(null)?.close()
         keepAlive.getAndSet(null)?.close()
+        modesRestored.set(null)
         CarPlayWheelController.setEnabled(false)
         CarPlayMediaClock.clear()
         Log.i(CarPlayConsts.TAG, "releaseMediaStreams reason=$reason")
+    }
+
+    /** MIB3 Wi‑Fi iAP2 NowPlaying transport, or null when DiPlay / not yet armed. */
+    fun mib3NowPlayingEgress(): WifiIap2Link? =
+        wifiIap.get()?.takeIf { it.isMib3NowPlayingEgress }
+
+    /**
+     * Re-assert phone owns MainAudio on a **background** thread.
+     * Must never run on the AAC RTP pacer — [exchangeEncrypted] waits for the control
+     * pump and will freeze TX (pulledMedia stall + Audi mixer latch).
+     */
+    private fun scheduleModesReclaimAsync(reason: String, force: Boolean = false) {
+        val ev = eventChannel.get()
+        if (ev != null && !ev.isPhoneOwningMainAudio()) {
+            Log.i(CarPlayConsts.TAG, "modesChanged skip ($reason) — HU owns MainAudio")
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (!force) {
+            val prev = lastModesReclaimMs.get()
+            if (now - prev < MODES_RECLAIM_MIN_GAP_MS) return
+            if (!lastModesReclaimMs.compareAndSet(prev, now)) return
+        } else {
+            lastModesReclaimMs.set(now)
+        }
+        thread(name = "carplay-modes-reclaim", isDaemon = true) {
+            if (!running.get() || !streaming.get()) return@thread
+            Log.i(CarPlayConsts.TAG, "modesChanged reclaim async ($reason)")
+            runCatching { modesRestored.get()?.invoke() }
+                .onFailure { e -> Log.w(CarPlayConsts.TAG, "modesChanged reclaim failed", e) }
+        }
     }
 
     /**
@@ -748,6 +866,9 @@ class CarPlayRtspSession(
                 Log.w(CarPlayConsts.TAG, "encrypted /info ${info?.firstLine ?: "no response"}")
             }
         }
+        // modesRestored filled once announcePhoneModesChanged exists (below).
+        // Event BORROW/UNBORROW restores call it — never reclaim mid-borrow.
+        modesRestored.set(null)
         if (eventPort != null && eventPort > 0) {
             // DiPlay acceptEvent arms Events-* cipher on connect — open before RECORD/screen.
             val lsp = linkSyncBytes()
@@ -756,6 +877,8 @@ class CarPlayRtspSession(
                 WifiIap2Link(
                     linkSync = lsp ?: ByteArray(0),
                     mib3Style = mib3,
+                    onNowPlayingUpdates = { CarPlayNowPlaying.onUpdatesRequested() },
+                    onFileTransferDatagram = { dg -> CarPlayNowPlaying.onFileTransferDatagram(dg) },
                 ) { frame ->
                     postControlIap(frame)
                 }
@@ -775,17 +898,50 @@ class CarPlayRtspSession(
                     CarPlayWheelController.onHidKey(dev, code, pressed, extra)
                 },
                 onIapMessage = { frame -> wifi?.onInbound(frame) },
+                onModesRestoredToPhone = {
+                    thread(name = "carplay-modes-restored", isDaemon = true) {
+                        try {
+                            Thread.sleep(80L)
+                        } catch (_: InterruptedException) {
+                            return@thread
+                        }
+                        if (!running.get() || !streaming.get()) return@thread
+                        modesRestored.get()?.invoke()
+                    }
+                },
             )
             if (ev != null) {
-                CarPlayWheelController.setEnabled(true)
+                // MIB3 reports physical right as HID PREV (and left as NEXT); invert so
+                // long-right=swap / long-left=recents matches AA.
+                CarPlayWheelController.setEnabled(
+                    true,
+                    invertMediaLeftRight = mib3,
+                    context = appContext,
+                )
                 evHolder.set(ev)
                 eventChannel.getAndSet(ev)?.close()
                 wifi?.let {
-                    wifiIap.getAndSet(it)?.close()
+                    wifiIap.getAndSet(it)?.also { old ->
+                        CarPlayNowPlaying.detachEgress(old)
+                        old.close()
+                    }
                     wifiIap.set(it)
                     it.start()
+                    // Rebind on soft re-SETUP once the observer is already live.
+                    if (it.isMib3NowPlayingEgress && CarPlayNowPlaying.isStarted()) {
+                        CarPlayNowPlaying.attachEgress(it)
+                    }
                 }
                 ev.start()
+                // Hardening only: arm HID when /info listed devices. Our touch path
+                // already works via inbound hidSendReport without this; do not invent
+                // uuid "0"/"1" when the HU omitted hidDevices (would replace nothing
+                // useful and can confuse some receivers).
+                val hidUuids = accessoryHidUuids.toList()
+                if (hidUuids.isNotEmpty()) {
+                    val armed = ev.armHidInputModes(hidUuids)
+                    Log.i(CarPlayConsts.TAG, "event hidSetInputMode armed=$armed/${hidUuids.size}")
+                }
             } else {
                 wifi?.close()
             }
@@ -923,6 +1079,7 @@ class CarPlayRtspSession(
             ),
             "modesChanged phone-owns-screen+audio",
         )
+        modesRestored.set { announcePhoneModesChanged() }
         val setup2 = if (mib3) {
             if (!sendRecord()) return false
             // iPhone: answer event commands, then screen SETUP, then control-socket detect.
@@ -1055,17 +1212,20 @@ class CarPlayRtspSession(
                     return@thread
                 }
                 if (!running.get() || !streaming.get()) return@thread
-                // Audi can drop MainAudio after the first claim while AAC still flows
-                // (volume UI live, speakers silent). Re-claim a few times like CSM.
+                // Audi can drop MainAudio after the first claim / RTP underrun while AAC
+                // still flows. Re-claim on this dedicated thread only (never AAC TX).
+                // One-shot burst only — a forever 30s heartbeat POST modesChanged made the
+                // HU mixer muddy every half-minute; cadence-gap reclaim during track-change
+                // underrun latched mute while RTP kept flowing.
                 announcePhoneModesChanged()
-                for (delayMs in longArrayOf(4_000L, 12_000L)) {
+                for (delayMs in longArrayOf(4_000L, 12_000L, 30_000L)) {
                     try {
                         Thread.sleep(delayMs)
                     } catch (_: InterruptedException) {
                         return@thread
                     }
                     if (!running.get() || !streaming.get()) return@thread
-                    announcePhoneModesChanged()
+                    scheduleModesReclaimAsync("burst+$delayMs", force = true)
                 }
             }
         }
@@ -1141,6 +1301,10 @@ class CarPlayRtspSession(
                 rate,
                 formatBit,
             )
+            // Cadence realign only snaps the RTP pacer clock (in AacAudioEgress). Do NOT
+            // POST modesChanged here: Audi often underruns during track-skip / pane-swap
+            // (playback=[] / PAUSED); reclaim then latches the mixer mute while AAC continues.
+            egress?.onCadenceGap = null
             // Keep local control socket open so HU RTCP has a peer (CSM does the same).
             thread(name = "carplay-audio-rtcp", isDaemon = true) {
                 val buf = ByteArray(2048)
@@ -1641,6 +1805,27 @@ class CarPlayRtspSession(
                 accessoryDisplayUuid = uuid
                 Log.i(CarPlayConsts.TAG, "accessory display uuid=$uuid (nested)")
             }
+        }
+        // Audi: uuid is String "0"/"1"; DiPlay: integer. Keep wire form for hidSetInputMode.
+        val hidUuids = ArrayList<String>()
+        for (hidKey in listOf("hidDevices", "hids", "hid")) {
+            val list = root[hidKey] as? List<*> ?: continue
+            for (item in list) {
+                val dict = BinaryPlist.asDict(item) ?: continue
+                val raw = dict["uuid"] ?: continue
+                val uuid = when (raw) {
+                    is String -> raw
+                    is Number -> raw.toInt().toString()
+                    is ByteArray -> raw.toString(Charsets.UTF_8).trim('\u0000')
+                    else -> raw.toString()
+                }
+                if (uuid.isNotBlank()) hidUuids += uuid
+            }
+        }
+        if (hidUuids.isNotEmpty()) {
+            accessoryHidUuids.clear()
+            accessoryHidUuids.addAll(hidUuids.distinct())
+            Log.i(CarPlayConsts.TAG, "accessory /info hidDevices uuids=$accessoryHidUuids")
         }
         // Prefer 48 kHz AAC (matches our capture); fall back to 44.1 if that is all
         // the HU advertises under type=102 media.

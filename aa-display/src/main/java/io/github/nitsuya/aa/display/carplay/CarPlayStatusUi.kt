@@ -36,12 +36,12 @@ object CarPlayStatusUi {
                 // Exclusive: CP uses Host only — never AA-shell tee.
                 CarPlayProjectionService.start(activity)
                 CarPlayHostActivity.launch(activity)
-                toast(activity, "CarPlay 通道已启用（Host 出画）")
+                toast(activity, "已切换到 CarPlay")
             } else {
                 CarPlayProjectionService.stop(activity)
                 CarPlayHostActivity.current?.finish()
                 // Runtime teardown is owned by FGS tearDown; finish trampoline only.
-                toast(activity, "已切回 Android Auto 通道")
+                toast(activity, "已切回 Android Auto")
             }
             refresh(activity, binding)
         }
@@ -67,12 +67,12 @@ object CarPlayStatusUi {
                     CarPlayHostActivity.launch(activity)
                 }
                 refresh(activity, binding)
-                toast(activity, "CarPlay Source 已启动")
+                toast(activity, "CarPlay 已启动")
             }
             CarPlayConsts.ACTION_STOP -> {
                 CarPlayProjectionService.stop(activity)
                 refresh(activity, binding)
-                toast(activity, "CarPlay Source 已停止")
+                toast(activity, "CarPlay 已停止")
             }
         }
     }
@@ -105,15 +105,21 @@ object CarPlayStatusUi {
         val channel = CarPlayChannel.get(activity)
         val carPlay = channel == CarPlayChannel.CHANNEL_CARPLAY
         val hostUp = CarPlayHostRuntime.isRunning()
+        // `live` = FGS / SourceSession armed, not "HU already linked".
+        val service = when {
+            !carPlay -> "—"
+            live -> "已就绪（等车机）"
+            else -> "未启动"
+        }
         val content = when {
             !carPlay -> "Android Auto"
-            hostUp -> "CarPlay Host"
+            hostUp -> "分屏投屏"
             live -> "测试图（Host 未就绪）"
             else -> "—"
         }
         binding.tvCarplayStatus.text =
-            "会话：" + (if (live) "已连接" else "未连接") +
-                "\n内容源：$content" +
+            "服务：$service" +
+                "\n画面：$content" +
                 "\nHost：" + (if (hostUp) "运行中" else "未启动") +
                 "\n提示：DiPlay 帧率设 60；通话留手机，其余音频出车机"
 

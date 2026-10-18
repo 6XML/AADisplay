@@ -62,13 +62,20 @@ class CarPlaySourceSession(
     private var rtsp: CarPlayRtspSession? = null
     private var iap2: Iap2Session? = null
     private var wifiHandoff: CarPlayWifiHandoff? = null
+    /** True once we dialed AirPlay (0x4301 or `_airplay._tcp` / gateway fallback). */
+    private val airplayDialed = AtomicBoolean(false)
+    @Volatile private var lastWifiSsid: String? = null
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
         Log.i(CarPlayConsts.TAG, "CarPlaySourceSession start")
         ProjectionSessionGate.setCarPlayLive(true)
+        airplayDialed.set(false)
         wifiHandoff = CarPlayWifiHandoff(appContext).also { handoff ->
-            handoff.onBound = { mac -> iap2?.noteAccessoryWifiBound(mac) }
+            handoff.onBound = { mac ->
+                iap2?.noteAccessoryWifiBound(mac)
+                onAccessoryWifiBound(mac)
+            }
         }
 
         supplyFps = CarPlayConsts.DEFAULT_VIDEO_FPS
@@ -80,6 +87,7 @@ class CarPlaySourceSession(
         glCompositor?.onRateReport = rateCb
 
         val rtspSession = CarPlayRtspSession(
+            appContext = appContext,
             // Screen SETUP (incl. DiPlay re-SETUP after TCP reset): always mint a fresh
             // MediaCodec input Surface. Keeping a wedged GL→encoder Surface leaves the
             // codec at in=0 while GlCompositor still reports ~60fps — DiPlay freezes.
@@ -93,9 +101,15 @@ class CarPlaySourceSession(
                 // Do not ensureEncoder here — a second bindGl/forceFreshSurface mid-stream
                 // re-sends CONFIG and Audi drops control within ~3s.
                 encoder.requestKeyFrame()
-                // CarPlay session live on the car → drive NowPlaying (cluster card) from the
-                // shared lyric store; the host re-triggers its caption per title change.
-                iap2?.let { CarPlayNowPlaying.start(appContext, it) }
+                // Store observer + egress: MIB3 Wi‑Fi iAP2 (Audi cluster), else BT (DiPlay).
+                // [rtsp] is assigned before SETUP invokes this callback.
+                CarPlayNowPlaying.start(appContext)
+                val wifiNp = rtsp?.mib3NowPlayingEgress()
+                if (wifiNp != null) {
+                    CarPlayNowPlaying.attachEgress(wifiNp)
+                } else {
+                    iap2?.let { CarPlayNowPlaying.attachEgress(it) }
+                }
             },
             onTouchEvent = { x, y, action -> CarPlayInputBridge.injectNormalized(x, y, action) },
             onForceKeyFrame = { encoder.requestKeyFrame() },
@@ -104,7 +118,11 @@ class CarPlaySourceSession(
         rtsp = rtspSession
         rtspSession.startServer()
 
-        val bj = CarPlayBonjour(appContext) { info -> onBonjourResolved(info) }
+        val bj = CarPlayBonjour(
+            appContext,
+            onCtrlResolved = { info -> onBonjourResolved(info) },
+            onAirPlayResolved = { info -> onAirPlayEndpoint(info) },
+        )
         bonjour = bj
         Thread {
             var waits = 0
@@ -114,9 +132,10 @@ class CarPlaySourceSession(
             }
             val port = rtspSession.localPort
             if (port > 0) {
-                bj.registerControl(port)
+                val mac = bluetooth?.localAddress().orEmpty()
+                bj.registerControl(port, mac)
             }
-            bj.startDiscovery()
+            bj.startCtrlDiscovery()
         }.start()
 
         val sourceIdentity = CarPlayProfileRegistry.defaultSource()
@@ -125,15 +144,20 @@ class CarPlaySourceSession(
             onConnected = { iap2?.onTransportConnected() },
             onDisconnected = disconnect@{
                 if (iap2?.onTransportClosed() == false) return@disconnect
-                // Stop zombie UDP audio / screen / NowPlaying so DiPlay can re-Auth.
+                // MIB3 NowPlaying rides Wi‑Fi iAP2 after handoff — RFCOMM drop must not
+                // tear media or the cluster card. DiPlay still needs a full reset to re-Auth.
+                if (rtsp?.mib3NowPlayingEgress() != null) {
+                    Log.i(CarPlayConsts.TAG, "iAP RFCOMM closed — keep media/NowPlaying (Wi-Fi iAP)")
+                    return@disconnect
+                }
                 rtsp?.releaseMediaStreams("iap-rfcomm-closed")
                 CarPlayNowPlaying.stop()
+                airplayDialed.set(false)
             },
             onBytes = { bytes -> iap2?.onBytes(bytes) },
             // Detect/SYN/auth all count as live — mid-negotiate must not be replaced.
             sessionLive = { iap2?.isNegotiatingOrLive() == true },
             onPeer = { name, address -> iap2?.notePeer(name, address) },
-            sourceIdentity = sourceIdentity,
         )
         bluetooth = link
         iap2 = Iap2Session(
@@ -149,13 +173,15 @@ class CarPlaySourceSession(
                 Log.i(CarPlayConsts.TAG, "iAP auth done → WiFi / CarPlayStartSession")
             },
             onWifiConfig = { wifi ->
+                lastWifiSsid = wifi.ssid
                 // Before join: disable saved-STA autojoin so accessory AP cannot
                 // become ACCEPT_UNVALIDATED default and kill cellular.
                 try {
                     CoreApi.preferCellularOverUnvalidatedWifi()
                 } catch (_: Throwable) {
                 }
-                // Join only; dial waits for CarPlayStartSession + network ready.
+                // Join only; dial waits for CarPlayStartSession + network ready,
+                // or `_airplay._tcp` fallback when MIB3 never sends 0x4301.
                 wifiHandoff?.ensureAccessoryWifi(wifi.ssid, wifi.passphrase, wifi.channel) {}
             },
             onCarPlayStart = { start ->
@@ -177,6 +203,84 @@ class CarPlaySourceSession(
         ensureEncoder(CarPlayConsts.DEFAULT_VIDEO_WIDTH, CarPlayConsts.DEFAULT_VIDEO_HEIGHT)
     }
 
+    /**
+     * After accessory AP bind: harden ctrl advertisement (real BT MAC on the
+     * bound network) and warm `_airplay._tcp` cache. Primary dial stays
+     * [dialCarPlayControl] from `0x4301` — mDNS/gateway only if StartSession never arrives.
+     */
+    private fun onAccessoryWifiBound(staMac: String?) {
+        val bj = bonjour ?: return
+        val port = rtsp?.localPort ?: 0
+        val btMac = bluetooth?.localAddress().orEmpty()
+        if (port > 0) {
+            bj.registerControl(port, btMac.ifBlank { staMac.orEmpty() }, force = true)
+        }
+        val localIp = wifiHandoff?.localIpv4OnAccessory(lastWifiSsid)
+        bj.airplaySubnetPrefix24 = CarPlayBonjour.prefix24(localIp)
+        bj.resetAirPlayCache()
+        bj.startAirPlayDiscovery()
+        Log.i(
+            CarPlayConsts.TAG,
+            "WiFi bound → ctrl re-register mac=$btMac airplay /24=${bj.airplaySubnetPrefix24}",
+        )
+        // Late fallback only: never race StartSession (our proven primary dial).
+        Thread({
+            try {
+                Thread.sleep(8_000)
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+            if (!running.get() || airplayDialed.get()) return@Thread
+            if (iap2?.hasSeenStartSession() == true) return@Thread
+            dialAirPlayFallback("no-0x4301-after-wifi")
+        }, "carplay-airplay-fallback").apply { isDaemon = true }.start()
+    }
+
+    /** Cache only — do not dial here (would steal StartSession primary path). */
+    private fun onAirPlayEndpoint(info: NsdServiceInfo) {
+        Log.i(
+            CarPlayConsts.TAG,
+            "AirPlay mDNS cached ${info.serviceName} ${info.host}:${info.port} (fallback only)",
+        )
+    }
+
+    private fun dialAirPlayFallback(reason: String) {
+        if (!running.get() || airplayDialed.get()) return
+        if (iap2?.hasSeenStartSession() == true) return
+        val cached = bonjour?.cachedAirPlayEndpoint()
+            ?: bonjour?.awaitAirPlayEndpoint(2_000L)
+        if (cached?.host != null && cached.port > 0) {
+            dialAirPlayHost(cached.host, cached.port, reason)
+            return
+        }
+        val gw = wifiHandoff?.accessoryIpv4Hint(lastWifiSsid)
+        if (gw.isNullOrBlank()) {
+            Log.w(CarPlayConsts.TAG, "AirPlay fallback: no mDNS endpoint and no gateway ($reason)")
+            return
+        }
+        try {
+            dialAirPlayHost(InetAddress.getByName(gw), 7000, "$reason-gw7000")
+        } catch (e: Throwable) {
+            Log.e(CarPlayConsts.TAG, "AirPlay fallback resolve failed $gw", e)
+        }
+    }
+
+    private fun dialAirPlayHost(host: InetAddress?, port: Int, reason: String) {
+        if (host == null || port <= 0 || port > 65535) return
+        if (!airplayDialed.compareAndSet(false, true)) return
+        Log.i(CarPlayConsts.TAG, "AirPlay dial $host:$port ($reason) [fallback]")
+        val hu = iap2?.currentHuProfile() ?: CarPlayProfileRegistry.defaultHu()
+        rtsp?.connectAsAirPlaySource(
+            host = host,
+            port = port,
+            deviceId = null,
+            huProfile = hu,
+            sourceIdentity = CarPlayProfileRegistry.defaultSource(),
+            phoneMac = bluetooth?.localAddress(),
+            wifiMac = wifiHandoff?.staMacForAnnounce(),
+        )
+    }
+
     private fun dialCarPlayControl(start: Iap2Csm.CarPlayStart) {
         val port = start.port ?: return
         if (port <= 0 || port > 65535) return
@@ -193,6 +297,13 @@ class CarPlaySourceSession(
             )
             return
         }
+        // StartSession is the primary dial. If a late mDNS fallback already
+        // reached streaming, keep it; otherwise always prefer 0x4301.
+        if (airplayDialed.get() && rtsp?.isStreaming() == true) {
+            Log.i(CarPlayConsts.TAG, "StartSession after fallback already streaming — keep")
+            return
+        }
+        airplayDialed.set(true)
         if (host.startsWith("fe80:", ignoreCase = true)) {
             Log.w(
                 CarPlayConsts.TAG,
@@ -211,6 +322,15 @@ class CarPlaySourceSession(
             for (attempt in 1..12) {
                 if (!running.get()) return@Thread
                 try {
+                    // Specifier Network handles die while wlan0 stays associated;
+                    // refresh AccessoryNet before every probe or dial hits LTE/null.
+                    val ssidForBind = start.ssid ?: lastWifiSsid
+                    if (!ssidForBind.isNullOrBlank()) {
+                        wifiHandoff?.rebindForDial(ssidForBind)
+                    }
+                    if (!CarPlayAccessoryNet.hasNetwork()) {
+                        throw IllegalStateException("accessory Wi-Fi Network not bound")
+                    }
                     Log.i(
                         CarPlayConsts.TAG,
                         "AirPlay source dial from StartSession $host:$port " +

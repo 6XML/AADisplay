@@ -11,11 +11,13 @@ import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import io.github.nitsuya.aa.display.CoreApi
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -36,6 +38,11 @@ import java.util.concurrent.atomic.AtomicReference
  *   Adopt that STA and hold it with a listen callback instead.
  * - Specifier [onUnavailable] must not leave a zombie [callbackRef] (dial forever
  *   "already pending"), nor abandon the session without a holding re-request.
+ * - Specifier [onAvailable] Network handles often die within ~0.5s on One UI
+ *   (`activeRequest: null` while wlan0 stays up). Never treat that as "leave the
+ *   AP"; re-adopt from [ConnectivityManager.getAllNetworks] and keep dialing.
+ * - A live specifier callback with **no** WIFI [Network] (agent already gone)
+ *   never reaches onAvailable again. Re-request; do not sit on "already pending".
  */
 class CarPlayWifiHandoff(context: Context) {
     private val app = context.applicationContext
@@ -56,6 +63,7 @@ class CarPlayWifiHandoff(context: Context) {
     private val holding = AtomicBoolean(false)
     private val callbackIsSpecifier = AtomicBoolean(false)
     private val radioEnableTried = AtomicBoolean(false)
+    private val specifierRequestedAtMs = AtomicLong(0L)
 
     /**
      * Fired once the process is bound to the accessory AP (not on a failed specifier).
@@ -101,9 +109,23 @@ class CarPlayWifiHandoff(context: Context) {
         if (liveCb != null && existing?.equals(ssid, ignoreCase = true) == true) {
             Log.i(CarPlayConsts.TAG, "WiFi handoff already pending ssid=$ssid — queue dial")
             pendingReady.add(onReady)
-            if (readyFired.get() || adoptIfAssociated(ssid, reason = "pending-flush")) {
+            // Specifier callback can outlive a usable Network handle (Samsung).
+            // Re-adopt from allNetworks before giving up to the watch loop.
+            if (rebindForDial(ssid) || adoptIfAssociated(ssid, reason = "pending-flush")) {
                 fireReady()
                 ensureHoldingSpecifier(ssid)
+            } else if (shouldRerequestSpecifier(ssid)) {
+                Log.w(
+                    CarPlayConsts.TAG,
+                    "WiFi handoff zombie pending ssid=$ssid — re-request Specifier",
+                )
+                startSpecifierRequest(
+                    ssid = ssid,
+                    passphrase = passphrase ?: cachedPassphrase.get(),
+                    channel = channel ?: cachedChannel.get(),
+                    onReady = onReady,
+                    preserveBind = false,
+                )
             } else {
                 scheduleAssociationWatch(ssid)
             }
@@ -287,6 +309,7 @@ class CarPlayWifiHandoff(context: Context) {
             }
             callbackRef.set(cb)
             callbackIsSpecifier.set(true)
+            specifierRequestedAtMs.set(SystemClock.elapsedRealtime())
             cm.requestNetwork(request, cb)
             Log.i(
                 CarPlayConsts.TAG,
@@ -418,15 +441,72 @@ class CarPlayWifiHandoff(context: Context) {
         mainHandler.postDelayed({
             if (!wantJoin.get()) return@postDelayed
             if (gen != rejoinGeneration.get()) return@postDelayed
-            if (readyFired.get() && pendingReady.isEmpty() && holding.get()) return@postDelayed
-            if (isBoundTo(ssid) && holding.get() && !callbackIsSpecifier.get()) return@postDelayed
-            if (adoptIfAssociated(ssid, reason = "watch")) {
+            // readyFired alone is not enough: Specifier Network can go stale after
+            // the first fireReady, leaving dial with "accessory Wi-Fi Network not bound".
+            val boundLive = CarPlayAccessoryNet.hasNetwork() && isBoundTo(ssid)
+            if (readyFired.get() && pendingReady.isEmpty() && holding.get() && boundLive) {
+                return@postDelayed
+            }
+            if (isBoundTo(ssid) && holding.get() && !callbackIsSpecifier.get() && boundLive) {
+                return@postDelayed
+            }
+            if (rebindForDial(ssid) || adoptIfAssociated(ssid, reason = "watch")) {
                 fireReady()
                 keepSpecifierHold(ssid)
                 return@postDelayed
             }
+            if (shouldRerequestSpecifier(ssid)) {
+                Log.w(
+                    CarPlayConsts.TAG,
+                    "WiFi handoff specifier without Network ssid=$ssid — re-request",
+                )
+                startSpecifierRequest(
+                    ssid = ssid,
+                    passphrase = cachedPassphrase.get(),
+                    channel = cachedChannel.get(),
+                    onReady = null,
+                    preserveBind = false,
+                )
+                return@postDelayed
+            }
             scheduleAssociationWatch(ssid)
         }, ASSOCIATION_WATCH_MS)
+    }
+
+    /**
+     * Specifier callback still registered, but ConnectivityService has no WIFI
+     * [Network] to bind. Happens after the agent is dropped while wlan0 stays
+     * associated: onAvailable will not fire again on that callback.
+     */
+    private fun shouldRerequestSpecifier(ssid: String): Boolean {
+        if (!callbackIsSpecifier.get() || callbackRef.get() == null) return false
+        if (CarPlayAccessoryNet.hasNetwork() && isBoundTo(ssid)) return false
+        if (findWifiNetwork(ssid) != null) return false
+        val age = SystemClock.elapsedRealtime() - specifierRequestedAtMs.get()
+        if (age < SPECIFIER_REREQUEST_MS) return false
+        val staUp = isCurrentSsid(ssid) || isCurrentFrequency()
+        return staUp || age >= SPECIFIER_GIVE_UP_MS
+    }
+
+    /**
+     * Refresh [CarPlayAccessoryNet] from a live WIFI [Network] for [ssid].
+     * Call before each AirPlay TCP probe — Specifier handles go stale while STA stays up.
+     */
+    @SuppressLint("MissingPermission")
+    fun rebindForDial(ssidRaw: String?): Boolean {
+        val ssid = ssidRaw?.trim().orEmpty()
+        if (ssid.isEmpty()) return CarPlayAccessoryNet.hasNetwork()
+        if (isBoundTo(ssid)) {
+            boundNetwork.get()?.let { CarPlayAccessoryNet.set(it) }
+            return CarPlayAccessoryNet.hasNetwork()
+        }
+        val network = findWifiNetwork(ssid) ?: return false
+        if (!networkStillUsable(network) && !isCurrentSsid(ssid) && !isCurrentFrequency()) {
+            return false
+        }
+        bindNetwork(ssid, network)
+        Log.i(CarPlayConsts.TAG, "WiFi handoff rebind-for-dial ssid=$ssid")
+        return CarPlayAccessoryNet.hasNetwork()
     }
 
     private fun fireReady() {
@@ -606,8 +686,32 @@ class CarPlayWifiHandoff(context: Context) {
         if (!bound.equals(ssid, ignoreCase = true)) return false
         val network = boundNetwork.get() ?: return false
         // Specifier RELEASE / NetworkAgent recycle leaves a non-null handle that
-        // bindSocket rejects with EPERM — treat as unbound so adopt/rejoin can run.
+        // bindSocket rejects with EPERM. If STA is still on this SSID, swap in a
+        // fresh allNetworks handle instead of clearing — clearing races dial and
+        // leaves "already pending" with no AccessoryNet forever.
         if (!networkStillUsable(network)) {
+            val fresh = findWifiNetwork(ssid)
+            if (fresh != null && fresh !== network) {
+                Log.w(
+                    CarPlayConsts.TAG,
+                    "WiFi handoff stale Network for ssid=$ssid — refresh handle",
+                )
+                bindNetwork(ssid, fresh)
+                return true
+            }
+            if (isCurrentSsid(ssid) || isCurrentFrequency()) {
+                // L2 still up; keep ssid marker, drop only the corpse handle.
+                if (boundNetwork.compareAndSet(network, null)) {
+                    if (CarPlayAccessoryNet.get() === network) {
+                        CarPlayAccessoryNet.clear()
+                    }
+                }
+                Log.w(
+                    CarPlayConsts.TAG,
+                    "WiFi handoff stale Network for ssid=$ssid — STA still up, await rebind",
+                )
+                return false
+            }
             if (boundNetwork.compareAndSet(network, null)) {
                 CarPlayAccessoryNet.clear()
             }
@@ -620,7 +724,10 @@ class CarPlayWifiHandoff(context: Context) {
 
     private fun networkStillUsable(network: Network): Boolean {
         return try {
-            cm.getNetworkCapabilities(network) != null
+            if (cm.getNetworkCapabilities(network) != null) return true
+            // One UI: Specifier Network can lose capabilities while LinkProperties
+            // still names wlan0 — treat that as usable for socket bind refresh.
+            cm.getLinkProperties(network)?.interfaceName?.isNotBlank() == true
         } catch (_: Throwable) {
             false
         }
@@ -783,17 +890,7 @@ class CarPlayWifiHandoff(context: Context) {
      */
     @SuppressLint("MissingPermission")
     fun accessoryIpv4Hint(ssid: String?): String? {
-        val target = ssid?.trim().orEmpty()
-        val network = when {
-            target.isNotEmpty() && isBoundTo(target) -> boundNetwork.get()
-            target.isNotEmpty() -> findWifiNetwork(target)
-            else -> boundNetwork.get()
-        } ?: return null
-        val lp = try {
-            cm.getLinkProperties(network)
-        } catch (_: Throwable) {
-            null
-        } ?: return null
+        val lp = linkPropertiesFor(ssid) ?: return null
         lp.dhcpServerAddress?.hostAddress?.let { return it }
         for (route in lp.routes) {
             if (!route.isDefaultRoute) continue
@@ -802,6 +899,33 @@ class CarPlayWifiHandoff(context: Context) {
             return gw
         }
         return null
+    }
+
+    /** Our STA IPv4 on the accessory AP — used to /24-filter `_airplay._tcp` results. */
+    @SuppressLint("MissingPermission")
+    fun localIpv4OnAccessory(ssid: String?): String? {
+        val lp = linkPropertiesFor(ssid) ?: return null
+        for (link in lp.linkAddresses) {
+            val addr = link.address?.hostAddress ?: continue
+            if (addr.contains(':')) continue
+            return addr
+        }
+        return null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun linkPropertiesFor(ssid: String?): android.net.LinkProperties? {
+        val target = ssid?.trim().orEmpty()
+        val network = when {
+            target.isNotEmpty() && isBoundTo(target) -> boundNetwork.get()
+            target.isNotEmpty() -> findWifiNetwork(target)
+            else -> boundNetwork.get()
+        } ?: return null
+        return try {
+            cm.getLinkProperties(network)
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     fun release() {
@@ -827,5 +951,10 @@ class CarPlayWifiHandoff(context: Context) {
         private const val REJOIN_DELAY_MS = 400L
         private const val ASSOCIATION_WATCH_MS = 1_200L
         private const val HOLDING_RETRY_MS = 1_500L
+        /** Min gap between specifier re-requests once the agent is already gone. */
+        /** Min gap between specifier re-requests once the agent is already gone. */
+        private const val SPECIFIER_REREQUEST_MS = 2_500L
+        /** No STA and no Network: let a scan finish before tearing the request. */
+        private const val SPECIFIER_GIVE_UP_MS = 8_000L
     }
 }

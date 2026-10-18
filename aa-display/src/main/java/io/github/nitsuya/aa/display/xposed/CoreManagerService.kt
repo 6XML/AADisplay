@@ -33,6 +33,7 @@ import android.graphics.Point
 import android.view.Display
 import android.view.KeyEvent
 import io.github.nitsuya.aa.display.xposed.carplay.CarPlayAudioCapture
+import io.github.nitsuya.aa.display.xposed.carplay.CarPlayBootArm
 import io.github.nitsuya.aa.display.xposed.carplay.CarPlayProcessBoost
 import io.github.nitsuya.aa.display.xposed.hook.PanePresentationGuard
 import io.github.nitsuya.aa.display.xposed.hook.PaneDisplayGroupForce
@@ -463,6 +464,8 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
                 .onFailure { log(TAG, "CarPlayAudioCapture.install failed", it) }
             runCatching { CarPlayProcessBoost.install(systemContext) }
                 .onFailure { log(TAG, "CarPlayProcessBoost.install failed", it) }
+            runCatching { CarPlayBootArm.install(systemContext) }
+                .onFailure { log(TAG, "CarPlayBootArm.install failed", it) }
         }
 
         private fun registerAaUiBroadcastReceivers() {
@@ -1321,8 +1324,10 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
      * Samsung keeps an unvalidated car hotspot as Active default when the user
      * once chose "stay connected" (ACCEPT_UNVALIDATED). That installs a wlan0
      * policy route with no default gateway → whole-phone "no network" while LTE
-     * is still up. Clear the flag (do **not** setAvoidUnvalidated — that tears
-     * the association). Also sticky network_avoid_bad_wifi + noInternetExpected.
+     * is still up. Prefer cellular via network_avoid_bad_wifi + noInternetExpected
+     * + allowAutojoin(false). Do **not** call setAcceptUnvalidated(false) or
+     * setAvoidUnvalidated: both drop the WIFI NetworkAgent while wlan0 may stay
+     * associated, leaving AirPlay with nothing to bindSocket.
      */
     @SuppressLint("MissingPermission")
     override fun preferCellularOverUnvalidatedWifi() {
@@ -1377,31 +1382,6 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
         } catch (e: Throwable) {
             log(TAG, "wifi config mark failed", e)
         }
-        val cm = systemContext.getSystemService(android.net.ConnectivityManager::class.java) ?: return
-        val networks = runCatching { cm.allNetworks }.getOrNull().orEmpty()
-        for (network in networks) {
-            val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull() ?: continue
-            if (!caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)) continue
-            if (caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)) continue
-            try {
-                android.net.ConnectivityManager::class.java
-                    .getMethod(
-                        "setAcceptUnvalidated",
-                        android.net.Network::class.java,
-                        java.lang.Boolean.TYPE,
-                        java.lang.Boolean.TYPE,
-                    )
-                    .invoke(cm, network, false, true)
-                log(TAG, "setAcceptUnvalidated(false) $network")
-            } catch (e: Throwable) {
-                log(TAG, "setAcceptUnvalidated failed $network", e)
-            }
-            try {
-                cm.reportNetworkConnectivity(network, false)
-            } catch (e: Throwable) {
-                log(TAG, "reportNetworkConnectivity failed $network", e)
-            }
-        }
     }
 
     private fun isCarHotspotSsid(ssid: String): Boolean {
@@ -1425,10 +1405,22 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
             val adapter = systemContext.getSystemService(BluetoothManager::class.java)?.adapter
             if (adapter == null || !adapter.isEnabled) return
             val device = adapter.getRemoteDevice(mac)
+            // Confirm any in-flight SSP here (app has no BLUETOOTH_PRIVILEGED).
+            // Harmless when no pairing is pending; required so PAIRING_REQUEST never
+            // falls through to Settings after prepareHeadUnit from the app watch.
+            val pairOk = try {
+                device.setPairingConfirmation(true)
+            } catch (e: Throwable) {
+                log(TAG, "prepareCarPlayHeadUnit pairingConfirm failed ${e.message}")
+                false
+            }
             val book = setAccess(device, "setPhonebookAccessPermission")
             val msg = setAccess(device, "setMessageAccessPermission")
             val sim = setAccess(device, "setSimAccessPermission")
-            log(TAG, "prepareCarPlayHeadUnit $mac pbap=$book map=$msg sim=$sim")
+            log(
+                TAG,
+                "prepareCarPlayHeadUnit $mac pair=$pairOk pbap=$book map=$msg sim=$sim",
+            )
             forbidProfile(adapter, device, BluetoothProfile.A2DP, "a2dp")
             forbidProfile(adapter, device, PROFILE_PBAP, "pbap")
             forbidProfile(adapter, device, PROFILE_MAP, "map")

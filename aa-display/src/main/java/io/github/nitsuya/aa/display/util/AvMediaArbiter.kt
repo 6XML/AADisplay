@@ -125,6 +125,40 @@ object AvMediaArbiter {
     }
 
     /**
+     * Single entry for global single-sounder: pick winner then pause other PLAYING AvMedia.
+     * Used by [io.github.nitsuya.aa.display.xposed.cluster.ClusterLyricMirror] and
+     * [io.github.nitsuya.aa.display.ui.aa.split.SplitBuriedPlayback] so both share
+     * the same throttle map and winner rule.
+     *
+     * @param force when false, skip pause when ≤1 AvMedia is already PLAYING (avoids
+     *   thrashing auto-resume apps on every MediaSession list churn).
+     */
+    fun enforceSingleSounder(
+        context: Context,
+        sessions: List<MediaController>?,
+        layout: StackLayout?,
+        force: Boolean = true,
+    ): MediaController? {
+        val winner = pickWinner(context, sessions, layout)
+        if (!force && !needsPauseLosers(context, sessions)) {
+            return winner
+        }
+        pauseLosers(context, sessions, winner)
+        return winner
+    }
+
+    /** True when more than one AvMedia session reports PLAYING (needs [pauseLosers]). */
+    fun needsPauseLosers(context: Context, sessions: List<MediaController>?): Boolean {
+        var playing = 0
+        for (c in eligibleControllers(context, sessions)) {
+            if (!isPlayingState(c.playbackState?.state ?: PlaybackState.STATE_NONE)) continue
+            playing++
+            if (playing > 1) return true
+        }
+        return false
+    }
+
+    /**
      * Pause other PLAYING AvMedia sessions so only [winner] keeps sounding.
      * Best-effort — some short-video apps ignore [MediaController.TransportControls.pause].
      */

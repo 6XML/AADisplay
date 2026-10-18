@@ -26,3 +26,8 @@ jadx-*.zip
 # Local reverse-engineering / agent scratch (do not ship)
 .tmp/
 .cursor/debug-*.log
+# Device log dumps / decompile scratch / local APKs (do not ship)
+/docs/capture/
+/tmp_mp_probe/
+/frida/iphone-event*.txt
+/*.apk

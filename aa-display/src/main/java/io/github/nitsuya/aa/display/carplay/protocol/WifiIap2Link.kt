@@ -5,6 +5,7 @@ import io.github.nitsuya.aa.display.carplay.CarPlayConsts
 import io.github.nitsuya.aa.display.carplay.protocol.Iap2Framing.CONTROL_ACK
 import io.github.nitsuya.aa.display.carplay.protocol.Iap2Framing.CONTROL_SYN
 import io.github.nitsuya.aa.display.carplay.protocol.Iap2Framing.LinkSyncPayload
+import io.github.nitsuya.aa.display.carplay.protocol.Iap2Framing.SESSION_TYPE_FILE_TRANSFER
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -26,20 +27,24 @@ import java.util.concurrent.atomic.AtomicBoolean
  * the HU then asks for NowPlaying / telephony / lists. Empty ACK alone makes
  * MIB3 tear AirPlay control down in ~12s with no picture.
  *
- * DiPlay keeps the previous behavior: echo a detect, and SYN|ACK the Bluetooth LSP.
+ * MIB3 NowPlaying / artwork ride this link ([NowPlayingEgress]); DiPlay keeps
+ * Bluetooth [Iap2Session] for the same CSMs and only uses Wi‑Fi for detect/SYN echo.
  */
 class WifiIap2Link(
     private val linkSync: ByteArray = ByteArray(0),
     /** Former Audi CSM Wi‑Fi iAP path ([CarPlayHuProfile.usesMib3WirelessPath]). */
     private val mib3Style: Boolean = false,
+    private val onNowPlayingUpdates: (() -> Unit)? = null,
+    private val onFileTransferDatagram: ((ByteArray) -> Unit)? = null,
     private val sendFrame: (ByteArray) -> Boolean,
-) {
+) : NowPlayingEgress {
     private val running = AtomicBoolean(true)
     private val lock = Any()
     private val pending = ByteArrayOutputStream()
     private var seq = 0
     private var peerSeq = 0
     private var controlSessionId = 1
+    private var fileTransferSessionId = 0x0C
     private var synAck: ByteArray? = null
     private var linkUp = false
     private var detectArmed = false
@@ -48,6 +53,15 @@ class WifiIap2Link(
     private var identAccepted = false
     /** 0 idle, 1 waiting for 0xAA06, 2 waiting for 0xAA01, 3 waiting for 0xAA03, 4 done. */
     private var authStage = 0
+
+    private val fileTransferQueue = ArrayDeque<ByteArray>()
+    private var peerMaxOutgoing = PHONE_MAX_OUTSTANDING
+    private var lastPeerAck: Int? = null
+    private var unackedCount = 0
+
+    /** True when this link is the MIB3 NowPlaying transport (not DiPlay echo-only). */
+    val isMib3NowPlayingEgress: Boolean
+        get() = mib3Style
 
     fun start() {
         Log.i(
@@ -79,6 +93,9 @@ class WifiIap2Link(
 
     fun close() {
         running.set(false)
+        synchronized(lock) {
+            fileTransferQueue.clear()
+        }
     }
 
     fun onInbound(frame: ByteArray) {
@@ -98,6 +115,41 @@ class WifiIap2Link(
             }
             pending.reset()
             if (off < buf.size) pending.write(buf, off, buf.size - off)
+        }
+    }
+
+    override fun sendNowPlaying(mediaItem: Map<Int, ByteArray>, playback: Map<Int, ByteArray>) {
+        if (!mib3Style || !running.get()) return
+        val params = linkedMapOf<Int, ByteArray>()
+        if (mediaItem.isNotEmpty()) params[0] = Iap2Csm.encodeGroup(mediaItem)
+        if (playback.isNotEmpty()) params[1] = Iap2Csm.encodeGroup(playback)
+        if (params.isEmpty()) return
+        synchronized(lock) {
+            if (!synHandled) return
+            sendControl(Iap2Framing.encodeCsm(Iap2Csm.NOW_PLAYING_UPDATE, params))
+        }
+    }
+
+    override fun sendFileTransfer(datagram: ByteArray) {
+        if (!mib3Style || !running.get()) return
+        synchronized(lock) {
+            if (!synHandled) return
+            if (fileTransferQueue.isNotEmpty()) {
+                if (fileTransferQueue.size < FILE_TRANSFER_QUEUE_CAP) {
+                    fileTransferQueue += datagram
+                } else {
+                    Log.w(
+                        CarPlayConsts.TAG,
+                        "Wi-Fi iAP file-transfer queue full (${fileTransferQueue.size}) — dropping ${datagram.size}B",
+                    )
+                }
+                return
+            }
+            if (unackedCount >= peerMaxOutgoing) {
+                fileTransferQueue += datagram
+                return
+            }
+            sendFileTransferLocked(datagram)
         }
     }
 
@@ -133,10 +185,21 @@ class WifiIap2Link(
             }
             return
         }
-        if (!synHandled || packet.payload.isEmpty()) return
+        if (!synHandled) return
+        if (packet.hasAck) {
+            trackPeerAckLocked(packet.ack)
+        }
+        if (packet.payload.isEmpty()) return
         peerSeq = packet.seq
+        if (packet.sessionId == fileTransferSessionId) {
+            onFileTransferDatagram?.invoke(packet.payload)
+            flushFileTransferQueueLocked()
+            sendAckOnly()
+            return
+        }
         val replied = packet.sessionId == controlSessionId && handleAudiControl(packet.payload)
         if (!replied) sendAckOnly()
+        flushFileTransferQueueLocked()
     }
 
     private fun handleEchoSyn(packet: Iap2Framing.LinkPacket) {
@@ -162,8 +225,22 @@ class WifiIap2Link(
             Log.w(CarPlayConsts.TAG, "Wi-Fi iAP2 SYN unparseable (${packet.payload.size}B)")
             return
         }
-        val phone = peer.copy(maxOutgoing = PHONE_MAX_OUTSTANDING, maxPacketLength = PHONE_MAX_PACKET)
+        // Ensure a file-transfer session exists for NowPlaying artwork. Some HUs omit it
+        // from SYN; without a negotiated FT id, SETUP is ignored / cancelled.
+        val sessions = peer.sessions.toMutableList()
+        if (sessions.none { it.second == SESSION_TYPE_FILE_TRANSFER }) {
+            sessions += Triple(0x0C, SESSION_TYPE_FILE_TRANSFER, 2)
+        }
+        val phone = peer.copy(
+            maxOutgoing = PHONE_MAX_OUTSTANDING,
+            maxPacketLength = PHONE_MAX_PACKET,
+            sessions = sessions,
+        )
         controlSessionId = phone.controlSessionId()
+        fileTransferSessionId =
+            phone.sessions.firstOrNull { it.second == SESSION_TYPE_FILE_TRANSFER }?.first
+                ?: 0x0C
+        peerMaxOutgoing = phone.maxOutgoing.coerceIn(1, 255)
         seq = SecureRandom().nextInt(255) + 1
         val reply = Iap2Framing.encodeLinkPacket(
             CONTROL_SYN or CONTROL_ACK,
@@ -178,7 +255,8 @@ class WifiIap2Link(
         Log.i(
             CarPlayConsts.TAG,
             "Wi-Fi iAP2 SYN|ACK ${reply.size}B seq=$seq ack=${packet.seq} " +
-                "sessions=${phone.sessions} maxOut=${phone.maxOutgoing} maxPkt=${phone.maxPacketLength}",
+                "sessions=${phone.sessions} ctrl=$controlSessionId ft=$fileTransferSessionId " +
+                "maxOut=${phone.maxOutgoing} maxPkt=${phone.maxPacketLength}",
         )
         sendControl(Iap2Csm.empty(Iap2Csm.START_IDENTIFICATION))
         Log.i(CarPlayConsts.TAG, "Wi-Fi iAP2 StartIdentification (0x1D00) sess=$controlSessionId")
@@ -261,8 +339,10 @@ class WifiIap2Link(
                 Log.i(CarPlayConsts.TAG, "Wi-Fi iAP2 0x4170 → 0x4171")
             }
             Iap2Csm.START_NOW_PLAYING_UPDATES -> {
+                // Idle first (Frida iPhone), then arm Store-driven incremental updates.
                 sendControl(NOW_PLAYING_UPDATE_IDLE)
-                Log.i(CarPlayConsts.TAG, "Wi-Fi iAP2 0x5000 → 0x5001")
+                Log.i(CarPlayConsts.TAG, "Wi-Fi iAP2 0x5000 → 0x5001 idle + arm")
+                onNowPlayingUpdates?.invoke()
             }
             // VehicleStatusUpdate from the HU — ack only.
             0xA101 -> {
@@ -340,6 +420,43 @@ class WifiIap2Link(
         )
     }
 
+    private fun sendFileTransferLocked(datagram: ByteArray) {
+        seq = (seq + 1) and 0xFF
+        unackedCount++
+        sendFrame(
+            Iap2Framing.encodeLinkPacket(
+                CONTROL_ACK,
+                seq,
+                peerSeq,
+                fileTransferSessionId,
+                datagram,
+            ),
+        )
+    }
+
+    private fun flushFileTransferQueueLocked() {
+        if (fileTransferQueue.isEmpty() || !synHandled) return
+        while (unackedCount < peerMaxOutgoing && fileTransferQueue.isNotEmpty()) {
+            sendFileTransferLocked(fileTransferQueue.removeFirst())
+        }
+    }
+
+    private fun trackPeerAckLocked(ack: Int) {
+        val last = lastPeerAck
+        if (last == null || ack == last) {
+            if (last == null) {
+                lastPeerAck = ack
+                unackedCount = 0
+            }
+            return
+        }
+        val delta = (ack - last + 256) % 256
+        if (delta in 1 until 128) {
+            unackedCount = (unackedCount - delta).coerceAtLeast(0)
+            lastPeerAck = ack
+        }
+    }
+
     private fun sendAckOnly() {
         sendFrame(
             Iap2Framing.encodeLinkPacket(
@@ -355,6 +472,7 @@ class WifiIap2Link(
     private companion object {
         const val PHONE_MAX_OUTSTANDING = 0x7F
         const val PHONE_MAX_PACKET = 0xFFFF
+        const val FILE_TRANSFER_QUEUE_CAP = 4_096
 
         /** iPhone Frida mediaserverd → Audi MMI after 0xAA05. */
         private val START_LOCATION_INFORMATION: ByteArray =

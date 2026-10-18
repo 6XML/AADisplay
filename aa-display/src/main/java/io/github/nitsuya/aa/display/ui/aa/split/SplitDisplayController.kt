@@ -930,9 +930,10 @@ class SplitDisplayController(
             val up = input.createKeyEvent(KeyEvent.ACTION_UP, action)
             input.injectInputEvent(displayId, down)
             input.injectInputEvent(displayId, up)
-            // Live UI often ignores injected MEDIA_* (FeedPlayerSession is torn down);
-            // play/pause etc. may still reach the active media-button session.
-            if (live && input.isMediaKeyCode(action)) {
+            // Map / browser often holds focus while music plays on the other pane —
+            // VD inject alone is ignored. Always also dispatch to the active media
+            // session (QQ 车载 etc.). Live next/prev already returned via swipe above.
+            if (input.isMediaKeyCode(action)) {
                 input.dispatchMediaKeyFallback(action)
             }
             true
@@ -1156,6 +1157,11 @@ class SplitDisplayController(
             }
         } else {
             mFocusedPane = pane
+            // User put this package on top — AvMedia must claim speaker (QQ→抖音).
+            // promoteStackFronts(settleAv) is skipped on this path; without claim,
+            // sticky music + Douyin paused-by-us deadlocks into CarPlay silence.
+            buriedPlayback.claimSpeakerForFront(packageName)
+            buriedPlayback.scheduleEnforceSingleSounder("launch")
         }
         mPanePackages[pane] = packageName
         mExplicitlyClosedPackages.remove(packageName.trim())
@@ -1328,6 +1334,8 @@ class SplitDisplayController(
                 ownership.markOwnership(packageName, targetDisplayId)
                 VdDensityPin.markPackageOnVirtualDisplay(packageName, targetDisplayId)
                 ownership.enforceStackFrontAudio(pane)
+                buriedPlayback.claimSpeakerForFront(packageName)
+                buriedPlayback.scheduleEnforceSingleSounder("moveTask")
             }
             mFocusedPane = pane
         } else {
@@ -1372,6 +1380,8 @@ class SplitDisplayController(
                 }
                 ownership.enforceStackFrontAudio(pane)
                 mFocusedPane = pane
+                buriedPlayback.claimSpeakerForFront(packageName)
+                buriedPlayback.scheduleEnforceSingleSounder("moveFront")
                 launch.schedulePersistSnapshot()
                 notifySplitStateChanged()
             }

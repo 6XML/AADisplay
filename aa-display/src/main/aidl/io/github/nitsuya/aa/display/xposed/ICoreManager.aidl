@@ -210,8 +210,9 @@ interface ICoreManager {
     String localBluetoothMac();
 
     /**
-     * Audi just paired. Forbid A2DP (a timeout shows "cannot establish Bluetooth")
-     * and reject PBAP/MAP so the contacts permission dialog does not appear.
+     * Register a CarPlay head-unit MAC: confirm any in-flight SSP pairing
+     * (app lacks BLUETOOTH_PRIVILEGED), forbid A2DP (timeout → "cannot establish
+     * Bluetooth"), and reject PBAP/MAP so contacts dialogs do not appear.
      * Appended at end for Stub ordinals.
      */
     void prepareCarPlayHeadUnit(String address);

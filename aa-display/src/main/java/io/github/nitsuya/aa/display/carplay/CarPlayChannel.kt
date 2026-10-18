@@ -1,6 +1,7 @@
 package io.github.nitsuya.aa.display.carplay
 
 import android.content.Context
+import android.provider.Settings
 import android.util.Log
 import java.io.File
 
@@ -23,6 +24,8 @@ object CarPlayChannel {
     const val CHANNEL_CARPLAY = 1
 
     private const val FILE_NAME = "aadisplay_carplay_channel"
+    /** Mirrored for system_server [io.github.nitsuya.aa.display.xposed.carplay.CarPlayBootArm]. */
+    const val SETTINGS_CHANNEL = "aadisplay_carplay_channel"
     private const val LEGACY_PREFS = "aadisplay_carplay"
     private const val LEGACY_KEY = "channel"
 
@@ -93,10 +96,24 @@ object CarPlayChannel {
                 tmp.delete()
             }
             Log.i(CarPlayConsts.TAG, "CarPlayChannel persisted channel=$channel path=${f.absolutePath}")
+            mirrorSettings(app, channel)
             true
         } catch (e: Throwable) {
             Log.e(CarPlayConsts.TAG, "CarPlayChannel write failed", e)
             false
+        }
+    }
+
+    /** Best-effort Settings.Global so system_server BootArm can read without CE files. */
+    private fun mirrorSettings(app: Context, channel: Int) {
+        try {
+            Settings.Global.putInt(app.contentResolver, SETTINGS_CHANNEL, channel)
+        } catch (e: Throwable) {
+            // App uid lacks WRITE_SECURE_SETTINGS; BootArm also reads the CE file.
+            Log.w(
+                CarPlayConsts.TAG,
+                "CarPlayChannel Settings.Global mirror skipped: ${e.message}",
+            )
         }
     }
 }

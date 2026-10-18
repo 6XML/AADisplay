@@ -1,6 +1,12 @@
 package io.github.nitsuya.aa.display.carplay
 
+import android.content.Context
+import android.media.AudioManager
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
+import android.view.KeyEvent
 import io.github.nitsuya.aa.display.CoreApi
 import io.github.nitsuya.aa.display.ui.aa.split.SplitPane
 import java.util.concurrent.ConcurrentHashMap
@@ -9,17 +15,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * CarPlay steering wheel (HID reports on the AirPlay event channel) → AADisplay actions.
  *
- * Same semantics the Android Auto path uses for `STEERING_WHEEL_CONTROL` broadcasts
- * ([io.github.nitsuya.aa.display.ui.aa.fragment.AaMainFragment]):
- *  - media button SHORT: play / pause / play-pause / next / previous → [CoreApi.pressKey]
- *  - media NEXT long-press: swap the split panes ([CoreApi.swapSplitPanes])
- *  - media PREVIOUS long-press: recents toggle (CarPlay-only; AA shows its own recents)
- *  - knob wheel tick: scroll the focused pane (map zoom etc.)
- *  - telephony: logged only in v1 (calls ring on the phone by design)
+ * Same UX as Android Auto ([AaMainFragment] `STEERING_WHEEL_CONTROL`):
+ *  - 短按下一曲/上一曲 → [CoreApi.pressKey]
+ *  - **长按右（下一曲/快进）→ 交换分屏** ([CoreApi.swapSplitPanes])
+ *  - **长按左（上一曲/快退）→ 应用栈 / Recents**
+ *  - knob wheel tick → scroll focused pane
  *
- * Works in both modes: in dual-track mode [CoreApi.pressKey] / [CoreApi.swapSplitPanes]
- * inject into the same system_server panes the AA shell renders; in CarPlay-only mode
- * they drive the split display directly.
+ * Long-press fires at the hold threshold (not on release) so a deliberate hold cannot
+ * also emit a short skip. MIB3 / Audi: physical right rocker often reports HID PREV
+ * (invert → NEXT); left often reports REWIND(6). [invertMediaLeftRight] only swaps
+ * NEXT↔PREV; REWIND/FF stay side-accurate (left=prev/recents, right=next/swap).
  */
 object CarPlayWheelController {
     private val TAG = CarPlayConsts.TAG
@@ -29,12 +34,15 @@ object CarPlayWheelController {
     const val DEV_MEDIA = 1
     const val DEV_TELEPHONY = 2
 
-    // DiPlay AirPlayHid media usages.
+    // DiPlay / CSM AirPlayHid media usages (1-byte report).
     private const val MEDIA_PLAY = 1
     private const val MEDIA_PAUSE = 2
     private const val MEDIA_PLAY_PAUSE = 3
     private const val MEDIA_NEXT = 4
     private const val MEDIA_PREV = 5
+    /** Audi MMI left rocker often reports REWIND (6), not NEXT (4). */
+    private const val MEDIA_REWIND = 6
+    private const val MEDIA_FF = 7
 
     // Knob button bits (DiPlay knob report byte 0); shared with [CarPlayEventChannel].
     const val KNOB_SELECT = 1
@@ -43,30 +51,67 @@ object CarPlayWheelController {
     /** Momentary wheel-tick code; [extra] carries the signed wheel delta. */
     const val KNOB_WHEEL = 16
 
-    private const val LONG_PRESS_MS = 400L
+    /** Align with AA divider long-press floor ([SplitPane.DIVIDER_TAP_STACK_MIN_MS]). */
+    private const val LONG_PRESS_MS = 550L
 
     private val enabled = AtomicBoolean(false)
+    private val invertMediaLr = AtomicBoolean(false)
+    private val handler = Handler(Looper.getMainLooper())
+
+    /** App context for short-press [AudioManager.dispatchMediaKeyEvent] (no system_server reboot). */
+    @Volatile
+    private var appContext: Context? = null
 
     /** CarPlay Host recents overlay hook (set by [CarPlayHostActivity]). */
     @Volatile
     var onRecentsToggle: (() -> Unit)? = null
 
     private val pressStartMs = ConcurrentHashMap<Int, Long>()
+    /** Raw HID usage whose long-press action already ran (suppress short on release). */
+    private val longFired = ConcurrentHashMap.newKeySet<Int>()
+    private val longRunnables = ConcurrentHashMap<Int, Runnable>()
 
     /** Last media usage seen on press; release reports arrive with [code]/[extra] = 0. */
     @Volatile
     private var lastMediaUsage = 0
 
-    fun setEnabled(live: Boolean) {
+    fun setEnabled(
+        live: Boolean,
+        invertMediaLeftRight: Boolean = false,
+        context: Context? = null,
+    ) {
         enabled.set(live)
+        invertMediaLr.set(if (live) invertMediaLeftRight else false)
+        appContext = if (live) context?.applicationContext else null
         if (!live) {
-            pressStartMs.clear()
-            lastMediaUsage = 0
+            clearPressState()
+        }
+    }
+
+    private fun clearPressState() {
+        for (r in longRunnables.values) handler.removeCallbacks(r)
+        longRunnables.clear()
+        pressStartMs.clear()
+        longFired.clear()
+        lastMediaUsage = 0
+    }
+
+    /** VD inject + active media-session dispatch (map-focused pane otherwise eats keys). */
+    private fun pressMediaKey(keyCode: Int) {
+        runCatching { CoreApi.pressKey(keyCode) }
+        val ctx = appContext ?: return
+        runCatching {
+            val am = ctx.getSystemService(AudioManager::class.java) ?: return@runCatching
+            val now = SystemClock.uptimeMillis()
+            am.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0))
+            am.dispatchMediaKeyEvent(KeyEvent(now, now, KeyEvent.ACTION_UP, keyCode, 0))
+        }.onFailure { e ->
+            Log.w(TAG, "dispatchMediaKeyEvent($keyCode) failed", e)
         }
     }
 
     /**
-     * Event-channel HID report: [code] is the key (media 1..5, telephony usages, knob
+     * Event-channel HID report: [code] is the key (media usages, telephony, knob
      * bits / wheel), [pressed] its state, [extra] the raw value (wheel delta for
      * [KNOB_WHEEL]). Release reports arrive with [code] = 0 and [extra] = 0 — recover
      * the usage from [lastMediaUsage].
@@ -86,12 +131,33 @@ object CarPlayWheelController {
         }
     }
 
+    /**
+     * Map Audi-inverted HID NEXT/PREV onto AA logical next/prev.
+     * REWIND/FF are already side-accurate on MMI (left=6, right stays PREV→NEXT via invert)
+     * — do not swap them.
+     */
+    private fun logicalMedia(raw: Int): Int {
+        if (!invertMediaLr.get()) return raw
+        return when (raw) {
+            MEDIA_NEXT -> MEDIA_PREV
+            MEDIA_PREV -> MEDIA_NEXT
+            else -> raw
+        }
+    }
+
+    private fun isNextSide(key: Int): Boolean =
+        key == MEDIA_NEXT || key == MEDIA_FF
+
+    private fun isPrevSide(key: Int): Boolean =
+        key == MEDIA_PREV || key == MEDIA_REWIND
+
     private fun mediaKeyCode(code: Int): Int = when (code) {
-        MEDIA_PLAY -> 126 // KEYCODE_MEDIA_PLAY
-        MEDIA_PAUSE -> 127 // KEYCODE_MEDIA_PAUSE
-        MEDIA_PLAY_PAUSE -> 165 // KEYCODE_MEDIA_PLAY_PAUSE
-        MEDIA_NEXT -> 130 // KEYCODE_MEDIA_NEXT
-        MEDIA_PREV -> 129 // KEYCODE_MEDIA_PREVIOUS
+        MEDIA_PLAY -> KeyEvent.KEYCODE_MEDIA_PLAY
+        MEDIA_PAUSE -> KeyEvent.KEYCODE_MEDIA_PAUSE
+        MEDIA_PLAY_PAUSE -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+        // Was hardcoded 130/129 (= RECORD/EJECT) — short press never skipped tracks.
+        MEDIA_NEXT, MEDIA_FF -> KeyEvent.KEYCODE_MEDIA_NEXT
+        MEDIA_PREV, MEDIA_REWIND -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
         else -> 0
     }
 
@@ -101,46 +167,83 @@ object CarPlayWheelController {
             if (key == 0) return
             lastMediaUsage = key
             pressStartMs[key] = System.currentTimeMillis()
+            longFired.remove(key)
+            longRunnables.remove(key)?.let { handler.removeCallbacks(it) }
+            val logical = logicalMedia(key)
+            // Fire long action while held so release cannot also emit a short skip.
+            if (isNextSide(logical) || isPrevSide(logical)) {
+                val r = Runnable {
+                    if (!enabled.get()) return@Runnable
+                    if (pressStartMs[key] == null) return@Runnable
+                    if (!longFired.add(key)) return@Runnable
+                    fireLongAction(key, logical, System.currentTimeMillis() - (pressStartMs[key] ?: 0L))
+                }
+                longRunnables[key] = r
+                handler.postDelayed(r, LONG_PRESS_MS)
+            }
             return
         }
         // Release: DiPlay sends usage=0; use the last pressed usage.
-        val key = when {
+        val raw = when {
             extra != 0 -> extra
             code != 0 -> code
             lastMediaUsage != 0 -> lastMediaUsage
             else -> return
         }
-        val start = pressStartMs.remove(key) ?: return
-        if (lastMediaUsage == key) lastMediaUsage = 0
+        longRunnables.remove(raw)?.let { handler.removeCallbacks(it) }
+        val start = pressStartMs.remove(raw) ?: return
+        if (lastMediaUsage == raw) lastMediaUsage = 0
+        val alreadyLong = longFired.remove(raw)
+        if (alreadyLong) return
+        val key = logicalMedia(raw)
         val heldMs = System.currentTimeMillis() - start
         if (heldMs < LONG_PRESS_MS) {
             val keyCode = mediaKeyCode(key)
             if (keyCode != 0) {
-                runCatching { CoreApi.pressKey(keyCode) }
-                Log.i(TAG, "wheel media short code=$key → pressKey($keyCode) held=${heldMs}ms")
+                pressMediaKey(keyCode)
+                Log.i(
+                    TAG,
+                    "wheel media short raw=$raw logical=$key → pressKey($keyCode) " +
+                        "held=${heldMs}ms invert=${invertMediaLr.get()}",
+                )
+            } else {
+                Log.i(TAG, "wheel media short raw=$raw logical=$key ignored (no keycode)")
             }
         } else {
-            when (key) {
-                MEDIA_NEXT -> {
-                    runCatching { CoreApi.swapSplitPanes() }
-                    // Keep Host ratio in sync with server invert.
-                    CarPlayInputBridge.primaryRatio =
-                        SplitPane.clampRatio(1f - CarPlayInputBridge.primaryRatio)
-                    Log.i(TAG, "wheel media next long → swap panes (held=${heldMs}ms)")
-                }
-                MEDIA_PREV -> {
-                    val cb = onRecentsToggle
-                    if (cb != null) {
-                        runCatching { cb() }
-                    } else {
-                        CarPlayRecentsOverlay.toggle()
-                    }
-                    Log.i(TAG, "wheel media prev long → recents toggle (held=${heldMs}ms)")
-                }
-                else -> {
-                    val keyCode = mediaKeyCode(key)
-                    if (keyCode != 0) runCatching { CoreApi.pressKey(keyCode) }
-                }
+            // Threshold passed but runnable missed (looper stall) — fire on release.
+            fireLongAction(raw, key, heldMs)
+        }
+    }
+
+    private fun fireLongAction(raw: Int, key: Int, heldMs: Long) {
+        if (isNextSide(key)) {
+            runCatching { CoreApi.swapSplitPanes() }
+            CarPlayInputBridge.primaryRatio =
+                SplitPane.clampRatio(1f - CarPlayInputBridge.primaryRatio)
+            Log.i(
+                TAG,
+                "wheel media next long → swap panes " +
+                    "(raw=$raw logical=$key held=${heldMs}ms invert=${invertMediaLr.get()})",
+            )
+        } else if (isPrevSide(key)) {
+            val cb = onRecentsToggle
+            if (cb != null) {
+                runCatching { cb() }
+            } else {
+                CarPlayRecentsOverlay.toggle()
+            }
+            Log.i(
+                TAG,
+                "wheel media prev long → recents toggle " +
+                    "(raw=$raw logical=$key held=${heldMs}ms invert=${invertMediaLr.get()})",
+            )
+        } else {
+            val keyCode = mediaKeyCode(key)
+            if (keyCode != 0) {
+                pressMediaKey(keyCode)
+                Log.i(TAG, "wheel media long other raw=$raw → pressKey($keyCode)")
+            } else {
+                Log.i(TAG, "wheel media long raw=$raw logical=$key ignored")
             }
         }
     }

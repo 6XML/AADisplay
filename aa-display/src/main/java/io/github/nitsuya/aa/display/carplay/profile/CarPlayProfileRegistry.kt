@@ -10,7 +10,6 @@ package io.github.nitsuya.aa.display.carplay.profile
 object CarPlayProfileRegistry {
     val iphone14_2: CarPlaySourceIdentity = CarPlaySourceIdentity(
         id = "iphone14_2",
-        btAdvertiseName = "iPhone",
         iapName = "iPhone",
         iapModel = "iPhone14,2",
         iapManufacturer = "Apple",

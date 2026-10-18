@@ -15,6 +15,10 @@ import io.github.nitsuya.aa.display.xposed.util.logDebug
  * Sticky AvMedia: pause buried only when this pane's front AvMedia is PLAYING.
  * Non-Av / idle Av fronts never steal focus — but [enforceSingleSounder] still
  * keeps only one AvMedia sounding across both panes (restore / cross-pane).
+ *
+ * User-driven Av→Av (QQ → 抖音): [claimSpeakerForFront] overrides sticky so a
+ * front we previously paused (or that stayed idle) can take the speaker; otherwise
+ * resumeFront skips while the buried sounder is still PLAYING → CarPlay silence.
  */
 internal class SplitBuriedPlayback(private val c: SplitDisplayController) {
 
@@ -30,34 +34,15 @@ internal class SplitBuriedPlayback(private val c: SplitDisplayController) {
         if (buried.isEmpty()) return
         if (!MusicAppClassifier.isAvMediaPackage(c.context, frontPkg)) return
 
-        val msm = c.context.getSystemService(MediaSessionManager::class.java) ?: return
-        val sessions = try {
-            msm.getActiveSessions(null)
-        } catch (e: Throwable) {
-            logDebug(SplitDisplayController.TAG, "pauseBuried getActiveSessions failed: ${e.message}")
-            return
-        }
+        val sessions = activeSessions() ?: return
         if (!isPackagePlaying(sessions, frontPkg)) return
 
-        val buriedSet = buried.toSet()
-        val now = SystemClock.uptimeMillis()
-        for (controller in sessions) {
-            val pkg = controller.packageName?.trim()?.takeIf { it.isNotEmpty() } ?: continue
-            if (pkg !in buriedSet) continue
-            if (!MusicAppClassifier.isAvMediaSession(c.context, controller)) continue
-            val state = controller.playbackState?.state ?: PlaybackState.STATE_NONE
-            if (!AvMediaArbiter.isPlayingState(state)) continue
-            val last = lastPauseAtMs[pkg] ?: 0L
-            if (now - last < PAUSE_THROTTLE_MS) continue
-            try {
-                controller.transportControls.pause()
-                pausedByAADisplay += pkg
-                lastPauseAtMs[pkg] = now
-                logDebug(SplitDisplayController.TAG, "pauseBuried pkg=$pkg pane=$pane front=$frontPkg")
-            } catch (e: Throwable) {
-                logDebug(SplitDisplayController.TAG, "pauseBuried failed pkg=$pkg: ${e.message}")
-            }
-        }
+        pausePlayingPackages(
+            sessions = sessions,
+            packages = buried.toSet(),
+            reason = "pauseBuried",
+            detail = "pane=$pane front=$frontPkg",
+        )
     }
 
     /**
@@ -66,16 +51,10 @@ internal class SplitBuriedPlayback(private val c: SplitDisplayController) {
      */
     fun enforceSingleSounder(reason: String) {
         if (c.mIsDestroying) return
-        val msm = c.context.getSystemService(MediaSessionManager::class.java) ?: return
-        val sessions = try {
-            msm.getActiveSessions(null)
-        } catch (e: Throwable) {
-            logDebug(SplitDisplayController.TAG, "enforceSingle getActiveSessions failed: ${e.message}")
-            return
-        }
+        val sessions = activeSessions() ?: return
         val layout = c.avStackLayout()
-        val winner = AvMediaArbiter.pickWinner(c.context, sessions, layout)
-        AvMediaArbiter.pauseLosers(c.context, sessions, winner)
+        // force=true: restore / promote often flips several Av to PLAYING together.
+        val winner = AvMediaArbiter.enforceSingleSounder(c.context, sessions, layout, force = true)
         val winnerPkg = winner?.packageName
         if (winnerPkg != null) {
             for (controller in sessions) {
@@ -122,38 +101,86 @@ internal class SplitBuriedPlayback(private val c: SplitDisplayController) {
     }
 
     /**
-     * Resume a front we previously paused — only if it would not break single-sounder
-     * (another AvMedia already PLAYING wins).
+     * Resume a front we previously paused. User re-promote overrides sticky: pause any
+     * other PLAYING AvMedia first, then [play] — otherwise QQ stays winner forever while
+     * Douyin (paused by us) never becomes PLAYING → CarPlay silence.
      */
     fun resumeFrontPlaybackIfPausedByUs(frontPkg: String) {
         val pkg = frontPkg.trim().takeIf { it.isNotEmpty() } ?: return
         if (pkg !in pausedByAADisplay) return
-        val msm = c.context.getSystemService(MediaSessionManager::class.java) ?: return
-        val sessions = try {
-            msm.getActiveSessions(null)
-        } catch (_: Throwable) {
-            return
-        }
-        val layout = c.avStackLayout()
-        val winner = AvMediaArbiter.pickWinner(c.context, sessions, layout)
-        val winnerPkg = winner?.packageName
-        val winnerPlaying = winner != null &&
-            AvMediaArbiter.isPlayingState(winner.playbackState?.state ?: PlaybackState.STATE_NONE)
-        // Another Av already owns the speaker — keep this one paused for later promote.
-        if (winnerPlaying && winnerPkg != null && winnerPkg != pkg) {
-            logDebug(
-                SplitDisplayController.TAG,
-                "resumeFront skip pkg=$pkg winner=$winnerPkg",
-            )
-            return
-        }
+        claimSpeakerForFront(pkg, onlyIfPausedByUs = true)
+    }
+
+    /**
+     * User put [frontPkg] on top (Recent / picker / moveToFront). AvMedia fronts claim
+     * the speaker over sticky buried sounders, then start playback if idle so demoting
+     * QQ Music cannot leave both sides paused.
+     */
+    fun claimSpeakerForFront(frontPkg: String, onlyIfPausedByUs: Boolean = false) {
+        val pkg = frontPkg.trim().takeIf { it.isNotEmpty() } ?: return
+        if (!MusicAppClassifier.isAvMediaPackage(c.context, pkg)) return
+        if (onlyIfPausedByUs && pkg !in pausedByAADisplay) return
+        val sessions = activeSessions() ?: return
+        pausePlayingPackages(
+            sessions = sessions,
+            packages = null,
+            except = pkg,
+            reason = if (onlyIfPausedByUs) "resumeFront" else "claimFront",
+            detail = "front=$pkg",
+        )
         pausedByAADisplay.remove(pkg)
         val controller = sessions.firstOrNull { it.packageName == pkg } ?: return
+        val state = controller.playbackState?.state ?: PlaybackState.STATE_NONE
+        if (AvMediaArbiter.isPlayingState(state)) {
+            logDebug(SplitDisplayController.TAG, "claimFront already playing pkg=$pkg")
+            return
+        }
         try {
             controller.transportControls.play()
-            logDebug(SplitDisplayController.TAG, "resumeFront pkg=$pkg")
+            logDebug(SplitDisplayController.TAG, "claimFront play pkg=$pkg")
         } catch (e: Throwable) {
-            logDebug(SplitDisplayController.TAG, "resumeFront failed pkg=$pkg: ${e.message}")
+            logDebug(SplitDisplayController.TAG, "claimFront play failed pkg=$pkg: ${e.message}")
+        }
+    }
+
+    private fun activeSessions(): List<MediaController>? {
+        val msm = c.context.getSystemService(MediaSessionManager::class.java) ?: return null
+        return try {
+            msm.getActiveSessions(null)
+        } catch (e: Throwable) {
+            logDebug(SplitDisplayController.TAG, "getActiveSessions failed: ${e.message}")
+            null
+        }
+    }
+
+    /**
+     * @param packages if non-null, only pause pkgs in this set; else all AvMedia except [except].
+     */
+    private fun pausePlayingPackages(
+        sessions: List<MediaController>,
+        packages: Set<String>?,
+        except: String? = null,
+        reason: String,
+        detail: String,
+    ) {
+        val now = SystemClock.uptimeMillis()
+        for (controller in sessions) {
+            val pkg = controller.packageName?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+            if (except != null && pkg == except) continue
+            if (packages != null && pkg !in packages) continue
+            if (!MusicAppClassifier.isAvMediaSession(c.context, controller)) continue
+            val state = controller.playbackState?.state ?: PlaybackState.STATE_NONE
+            if (!AvMediaArbiter.isPlayingState(state)) continue
+            val last = lastPauseAtMs[pkg] ?: 0L
+            if (now - last < PAUSE_THROTTLE_MS) continue
+            try {
+                controller.transportControls.pause()
+                pausedByAADisplay += pkg
+                lastPauseAtMs[pkg] = now
+                logDebug(SplitDisplayController.TAG, "$reason pkg=$pkg $detail")
+            } catch (e: Throwable) {
+                logDebug(SplitDisplayController.TAG, "$reason failed pkg=$pkg: ${e.message}")
+            }
         }
     }
 

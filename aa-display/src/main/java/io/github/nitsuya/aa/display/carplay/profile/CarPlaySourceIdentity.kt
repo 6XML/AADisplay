@@ -1,15 +1,14 @@
 package io.github.nitsuya.aa.display.carplay.profile
 
 /**
- * Phone-facing identity advertised over Bluetooth / iAP2 / AirPlay SETUP.
+ * Phone-facing identity advertised over iAP2 / AirPlay SETUP.
  *
  * Add or swap instances in [CarPlayProfileRegistry] for a different handset spoof —
- * do not scatter `"iPhone14,2"` (etc.) in BT / iAP / RTSP call sites.
+ * do not scatter `"iPhone14,2"` (etc.) in iAP / RTSP call sites.
+ * Classic BT adapter name is not spoofed.
  */
 data class CarPlaySourceIdentity(
     val id: String,
-    /** Classic BT adapter EIR name while CarPlay RFCOMM is armed. */
-    val btAdvertiseName: String,
     val iapName: String,
     val iapModel: String,
     val iapManufacturer: String,

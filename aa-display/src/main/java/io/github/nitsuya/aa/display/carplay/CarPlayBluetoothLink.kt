@@ -17,9 +17,7 @@ import android.provider.Settings
 import android.util.Log
 import io.github.nitsuya.aa.display.CoreApi
 import io.github.nitsuya.aa.display.carplay.profile.CarPlayDialPolicy
-import io.github.nitsuya.aa.display.carplay.profile.CarPlayProfileRegistry
 import io.github.nitsuya.aa.display.carplay.profile.CarPlayProfileResolver
-import io.github.nitsuya.aa.display.carplay.profile.CarPlaySourceIdentity
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -32,11 +30,11 @@ import kotlin.concurrent.thread
  * - Listen on **accessory** UUID (`…caff`, "CarPlay Accessory"). Some HUs dial `…cafe` and reject outbound.
  * - Listen on the wireless-CarPlay capability UUID so classic EIR/SDP advertises it
  *   (VAG btstack will not offer CarPlay without that UUID).
- * - Dial bonded peers on `…caff`, and dial again when an inbound-preferred HU ACLs or finishes bonding.
- *   A socket that never reaches iAP link-ready does not block that dial.
+ * - Dial bonded peers on `…caff`. Inbound-preferred HUs get one delayed fallback after bond
+ *   (cafe first); never dial during BOND_BONDING or while a peer is already up.
  *
- * Adapter advertise name and HU dial policy come from [CarPlaySourceIdentity] /
- * [CarPlayProfileResolver] — not hardcoded vendor substrings.
+ * HU dial policy comes from [CarPlayProfileResolver] — not hardcoded vendor substrings.
+ * Adapter name is left alone; RFCOMM UUIDs / iAP identity matter, not EIR rename.
  *
  * After reboot, [CarPlayProjectionService] often starts before the adapter is ON. Previously
  * that path logged "deferred" and permanently gave up — DiPlay SDP then returns `scn=0`.
@@ -50,7 +48,6 @@ class CarPlayBluetoothLink(
     /** True once iAP2 link sync has completed on the current socket. */
     private val sessionLive: () -> Boolean = { false },
     private val onPeer: (name: String?, address: String?) -> Unit = { _, _ -> },
-    private val sourceIdentity: CarPlaySourceIdentity = CarPlayProfileRegistry.defaultSource(),
 ) {
     private val appContext = context.applicationContext
     private val adapter: BluetoothAdapter? =
@@ -65,7 +62,6 @@ class CarPlayBluetoothLink(
     private val dialLock = Any()
     private val listenAlive = AtomicInteger(0)
     private var peerGeneration = 0
-    private var savedAdapterName: String? = null
     private var btStateReceiver: BroadcastReceiver? = null
     private var peerReceiver: BroadcastReceiver? = null
     private var pairingReceiver: BroadcastReceiver? = null
@@ -80,33 +76,11 @@ class CarPlayBluetoothLink(
     private val accessoryUuid: UUID = UUID.fromString(CarPlayConsts.IAP2_ACCESSORY_RFCOMM_UUID)
 
     /**
-     * Some HUs read the adapter name in EIR before they dial. Restore the previous name when
-     * the CarPlay link stops so the phone is not left renamed.
-     */
-    @SuppressLint("MissingPermission")
-    private fun presentSourceName(bt: BluetoothAdapter) {
-        val advertise = sourceIdentity.btAdvertiseName
-        val current = try {
-            bt.name
-        } catch (_: Throwable) {
-            null
-        }
-        if (current != advertise && savedAdapterName == null) {
-            savedAdapterName = current
-        }
-        val ok = try {
-            bt.setName(advertise)
-        } catch (e: Throwable) {
-            Log.w(CarPlayConsts.TAG, "BT adapter setName failed", e)
-            false
-        }
-        Log.i(CarPlayConsts.TAG, "BT adapter name -> $advertise ok=$ok was=$current")
-        armDiscoverable(bt)
-    }
-
-    /**
      * After the HU deletes the phone, inquiry only sees a discoverable adapter.
      * Connectable-only keeps the old bond reconnecting and the new pair times out.
+     *
+     * When an inbound-preferred HU is already bonded, skip the system discoverable
+     * dialog — reconnect uses the existing link key / ACL, not inquiry.
      */
     @SuppressLint("MissingPermission")
     private fun armDiscoverable(bt: BluetoothAdapter) {
@@ -122,6 +96,10 @@ class CarPlayBluetoothLink(
         }
         Log.i(CarPlayConsts.TAG, "BT discoverable ok=$ok scanMode=${bt.scanMode}")
         if (ok || bt.scanMode == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) return
+        if (bondedInboundPreferred(bt) != null) {
+            Log.i(CarPlayConsts.TAG, "BT discoverable dialog skipped; HU already bonded")
+            return
+        }
         // setScanMode needs a privileged uid. The system dialog is the app-visible path.
         try {
             val intent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).apply {
@@ -132,20 +110,6 @@ class CarPlayBluetoothLink(
             Log.i(CarPlayConsts.TAG, "BT discoverable request dialog shown")
         } catch (e: Throwable) {
             Log.w(CarPlayConsts.TAG, "BT discoverable request failed", e)
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun restoreAdapterName() {
-        val prev = savedAdapterName ?: return
-        savedAdapterName = null
-        val bt = adapter ?: return
-        if (!bt.isEnabled || prev == sourceIdentity.btAdvertiseName) return
-        try {
-            bt.setName(prev)
-            Log.i(CarPlayConsts.TAG, "BT adapter name restored $prev")
-        } catch (e: Throwable) {
-            Log.w(CarPlayConsts.TAG, "BT adapter name restore failed", e)
         }
     }
 
@@ -201,7 +165,7 @@ class CarPlayBluetoothLink(
         if (!running.get()) return
         if (!rfcommArmed.compareAndSet(false, true)) return
         disarmBtStateWatch()
-        presentSourceName(bt)
+        armDiscoverable(bt)
         armPairingWatch()
         armPeerWatch()
         val records = listenRecords()
@@ -231,12 +195,17 @@ class CarPlayBluetoothLink(
             // One-shot: the phone still held a key after the HU deleted the device.
             val cleared = clearLeftoverHeadUnitBond(bt)
             if (!cleared) {
-                bondedInboundPreferred(bt)?.let { prepareHeadUnit(it.address) }
+                // Pre-register bonded CarPlay peers so a later PAIRING_REQUEST is
+                // confirmed in system_server before Settings can pop.
+                prepareBondedCarPlayPeers(bt)
                 restoreHeadUnitAudio(bt)
             }
-            if (!sessionLive() && bondedInboundPreferred(bt) != null) {
-                headUnitDialPending = true
-            }
+            // Inbound-preferred HUs (Audi): do NOT arm a continuous …caff dial here.
+            // Cafe listen is the primary path; one-shot fallback after bond/ACL (and
+            // once at start if already bonded — force-stop does not re-fire ACL).
+            // Arming pending at start made dialBonded hit every 4s, racing cafe accept
+            // and cancelling SSP pairing.
+            bondedInboundPreferred(bt)?.let { scheduleHeadUnitDial(it) }
             while (running.get() && rfcommArmed.get()) {
                 armDiscoverable(bt)
                 // Only dial when there is no RFCOMM peer. A connected socket mid-negotiate
@@ -318,6 +287,10 @@ class CarPlayBluetoothLink(
                             if (isInboundPreferredPeer(device) &&
                                 bond == BluetoothDevice.BOND_BONDING
                             ) {
+                                // Cancel any in-flight …caff dial — dial during SSP
+                                // drops the ACL and the car shows "pairing no reaction".
+                                headUnitDialGeneration.incrementAndGet()
+                                headUnitDialPending = false
                                 prepareHeadUnit(device.address)
                             }
                             if (bond != BluetoothDevice.BOND_BONDED) {
@@ -331,6 +304,7 @@ class CarPlayBluetoothLink(
                             if (isInboundPreferredPeer(device)) {
                                 headUnitBondedAtMs = SystemClock.elapsedRealtime()
                                 prepareHeadUnit(device.address)
+                                // One delayed …caff fallback if the HU never dials …cafe.
                                 scheduleHeadUnitDial(device)
                             }
                             Log.i(
@@ -342,7 +316,14 @@ class CarPlayBluetoothLink(
                         BluetoothDevice.ACTION_ACL_CONNECTED -> {
                             if (isInboundPreferredPeer(device)) {
                                 prepareHeadUnit(device.address)
-                                scheduleHeadUnitDial(device)
+                                // Prefer inbound …cafe. ACL alone used to schedule …caff
+                                // immediately and race the cafe accept / mid-Auth pump.
+                                if (device.bondState == BluetoothDevice.BOND_BONDED &&
+                                    clientSocket?.isConnected != true &&
+                                    !sessionLive()
+                                ) {
+                                    scheduleHeadUnitDial(device)
+                                }
                             }
                             Log.i(
                                 CarPlayConsts.TAG,
@@ -462,6 +443,7 @@ class CarPlayBluetoothLink(
      */
     @SuppressLint("MissingPermission")
     private fun shouldOutboundDial(device: BluetoothDevice): Boolean {
+        if (device.bondState == BluetoothDevice.BOND_BONDING) return false
         val profile = CarPlayProfileResolver.matchName(device.name)
         if (profile?.dialPolicy == CarPlayDialPolicy.INBOUND_PREFERRED) {
             return headUnitDialPending && device.bondState == BluetoothDevice.BOND_BONDED
@@ -477,17 +459,33 @@ class CarPlayBluetoothLink(
     @SuppressLint("MissingPermission")
     private fun scheduleHeadUnitDial(device: BluetoothDevice) {
         if (!isInboundPreferredPeer(device)) return
+        if (device.bondState == BluetoothDevice.BOND_BONDING) return
         headUnitDialPending = true
         val gen = headUnitDialGeneration.incrementAndGet()
         thread(name = "carplay-hu-dial", isDaemon = true) {
             try {
-                Thread.sleep(800)
+                // Give the HU time to dial …cafe first (Audi inbound-preferred).
+                Thread.sleep(INBOUND_DIAL_FALLBACK_MS)
             } catch (_: InterruptedException) {
                 return@thread
             }
             if (gen != headUnitDialGeneration.get() || !running.get()) return@thread
+            if (clientSocket?.isConnected == true || sessionLive()) {
+                headUnitDialPending = false
+                Log.i(
+                    CarPlayConsts.TAG,
+                    "RFCOMM …caff fallback skipped; peer already up ${device.address}",
+                )
+                return@thread
+            }
             if (!shouldOutboundDial(device)) return@thread
+            Log.i(
+                CarPlayConsts.TAG,
+                "RFCOMM …caff fallback dial ${device.address} name=${device.name}",
+            )
             dialDevice(device)
+            // One-shot only — do not leave pending for the 4s dialBonded loop.
+            headUnitDialPending = false
         }
     }
 
@@ -523,6 +521,20 @@ class CarPlayBluetoothLink(
             bt.bondedDevices?.firstOrNull { isInboundPreferredPeer(it) }
         } catch (_: Throwable) {
             null
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun prepareBondedCarPlayPeers(bt: BluetoothAdapter) {
+        val bonded = try {
+            bt.bondedDevices?.toList().orEmpty()
+        } catch (_: Throwable) {
+            emptyList()
+        }
+        for (device in bonded) {
+            if (isInboundPreferredPeer(device) || dialScore(device) > 0) {
+                prepareHeadUnit(device.address)
+            }
         }
     }
 
@@ -575,6 +587,12 @@ class CarPlayBluetoothLink(
         }
     }
 
+    /**
+     * App uid cannot call [BluetoothDevice.setPairingConfirmation]. Forward known HU
+     * pairing to system_server via [prepareHeadUnit] (confirms + rejects PBAP/MAP), then
+     * abort so Settings never pops. Already-bonded peers must keep their link key —
+     * never [removeBond] here (that forced a full re-pair on every reconnect).
+     */
     private fun armPairingWatch() {
         synchronized(watchLock) {
             if (pairingReceiver != null || !running.get()) return
@@ -587,36 +605,36 @@ class CarPlayBluetoothLink(
                         BluetoothDevice.EXTRA_PAIRING_VARIANT,
                         BluetoothDevice.ERROR,
                     )
+                    val bonded = device.bondState == BluetoothDevice.BOND_BONDED
+                    // First Audi/MMI pair: name hint while BONDING. Reconnect of a
+                    // bonded CarPlay peer: keep the key and confirm quietly.
+                    // Unrelated bonded devices (headsets) stay on the system dialog.
+                    val knownHu = isInboundPreferredPeer(device) ||
+                        (bonded && dialScore(device) > 0)
                     Log.i(
                         CarPlayConsts.TAG,
                         "BT pairing request ${device.address} name=${device.name} " +
-                            "variant=$variant bond=${device.bondState}",
+                            "variant=$variant bond=${device.bondState} knownHu=$knownHu",
                     )
-                    if (device.bondState == BluetoothDevice.BOND_BONDED) {
-                        removeBond(device)
-                        try {
-                            abortBroadcast()
-                        } catch (_: Throwable) {
-                        }
-                        return
-                    }
-                    val confirmed = try {
-                        device.setPairingConfirmation(true)
-                    } catch (e: Throwable) {
-                        Log.w(CarPlayConsts.TAG, "BT pairing confirm failed", e)
-                        false
-                    }
-                    if (!confirmed) {
+                    if (!knownHu) {
                         Log.i(
                             CarPlayConsts.TAG,
                             "BT pairing left to system dialog ${device.address}",
                         )
                         return
                     }
+                    // system_server confirms (privileged) and remembers the MAC for
+                    // later ACL / access broadcasts. Do not delete an existing bond.
+                    prepareHeadUnit(device.address)
                     try {
                         abortBroadcast()
                     } catch (_: Throwable) {
                     }
+                    Log.i(
+                        CarPlayConsts.TAG,
+                        "BT pairing handed to system_server ${device.address} " +
+                            "(bonded=$bonded)",
+                    )
                 }
             }
             pairingReceiver = rx
@@ -687,6 +705,13 @@ class CarPlayBluetoothLink(
 
     @SuppressLint("MissingPermission")
     private fun dialDevice(device: BluetoothDevice) {
+        if (device.bondState == BluetoothDevice.BOND_BONDING) {
+            Log.i(
+                CarPlayConsts.TAG,
+                "RFCOMM dial skipped; bonding in progress ${device.address}",
+            )
+            return
+        }
         val socket = synchronized(dialLock) { openDialSocket(device) } ?: return
         attachPeer(socket, inbound = false, via = "dial")
     }
@@ -698,6 +723,7 @@ class CarPlayBluetoothLink(
     @SuppressLint("MissingPermission")
     private fun openDialSocket(device: BluetoothDevice): BluetoothSocket? {
         if (!running.get()) return null
+        if (device.bondState == BluetoothDevice.BOND_BONDING) return null
         val current = clientSocket
         if (current?.isConnected == true) {
             val currentAddr = try {
@@ -830,6 +856,11 @@ class CarPlayBluetoothLink(
             "RFCOMM peer ${if (inbound) "accepted" else "connected"} via=$via " +
                 "$address name=$name",
         )
+        // Inbound …cafe won — cancel any pending …caff fallback so Auth is not torn.
+        if (inbound) {
+            headUnitDialGeneration.incrementAndGet()
+            headUnitDialPending = false
+        }
         onPeer(name, address)
         onConnected()
         pump(socket)
@@ -885,7 +916,6 @@ class CarPlayBluetoothLink(
     fun stop() {
         running.set(false)
         rfcommArmed.set(false)
-        restoreAdapterName()
         disarmBtStateWatch()
         disarmPeerWatch()
         disarmPairingWatch()
@@ -904,5 +934,7 @@ class CarPlayBluetoothLink(
 
     private companion object {
         const val DIAL_RETRY_MS = 4_000L
+        /** Wait for inbound …cafe before one …caff attempt (inbound-preferred HUs). */
+        const val INBOUND_DIAL_FALLBACK_MS = 2_500L
     }
 }

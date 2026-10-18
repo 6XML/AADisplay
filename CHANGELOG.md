@@ -2,14 +2,29 @@
 
 ## Unreleased
 
-### Changed
-- **CarPlay Source / HU Profile 化：** BT 名、iAP/AirPlay 身份与 MIB3/Generic 行为收敛到 `carplay/profile/`（`SourceIdentity` + `HuProfile` + Registry/Resolver）；协议 RFCOMM UUID 仍在 `CarPlayConsts`。默认仍为 iPhone14,2 + mib3/generic，行为不变；扩展多手机/多车机改注册表，不再在链路里写死 vendor 名。
-- **Recent 卡片图标美化：** 放大 × 居中盖在图标上（不再独占上方一行）；图标约 72dp（分屏列按槽高放大，`fitCenter` 不形变）；CarPlay Canvas Recents 同几何与命中对齐。
+## 0.24#17.4-r17 — 奥迪无线 CarPlay 音频稳定
 
-### Changed
-- **状态页按出口通道切换配置：** 「出口通道」始终可见；选 Android Auto 只显示 VD DPI 等 AA 配置，选 CarPlay 只显示会话/Host 等 CarPlay 配置。
+versionCode **3077** / versionName **0.24#17.4-r17**。相对 r14：建连可靠、AAC 长播、方控语义、MainAudio 资源管理收口。
+
+### Verify（r17 · Audi MMI + Z Flip）
+- 长播不再每隔约半分钟糊几秒；方控短按切歌后再长按交换分屏，车机仍有声（AAC 仍流时不误 POST `modesChanged`）
+- 开机 / 重装后 `…cafe` listen；bonded 配对不弹框、不掐 Auth
+- Wi‑Fi handoff 不因 `setAcceptUnvalidated(false)` 拆掉 NetworkAgent
+- 倒车 BORROW / 归还后喇叭与方控恢复
 
 ### Fixed
+- **CarPlay 隔一会糊几秒 / 方控切歌后无声：** (1) 去掉 MIB3 每 30s `modesChanged` heartbeat（只保留建连 4/12/30s burst）— 周期性 POST 让奥迪混音器抖；(2) cadence-gap **不再** POST modesChanged — 切歌/交换分屏时源端 PAUSED+RTP 空窗再 reclaim 会闩死喇叭而 AAC 仍在发；(3) 方控长按在按住阈值（550ms）触发，松手不再兼发短按切歌。
+- **车机配对手机无反应 / Auth 中途掉链：** inbound-preferred（Audi）在已 bonded 时每 4s 狂拨 `…caff`，与 `…cafe` accept / SSP 抢 ACL；配对过程被掐、Auth challenge 被记成 20/32 永久拉黑。改为 cafe 优先、bond 后 2.5s 一次性 fallback、BONDING 禁拨；新 RFCOMM 会话清 challenge 黑名单。
+- **开机第一连 CarPlay 不上、再连才好：** app 停着时收不到 `BT STATE_CHANGED`（`Background execution not allowed`），`…cafe` 要等晚到的 `BOOT_COMPLETED`；车机已 SDP 失败退避。改为 system_server `CarPlayBootArm` 在 BT ON / 解锁时直接起 FGS。
+- **Audi 无线 CarPlay 卡在 `WiFi handoff already pending`：** `preferCellularOverUnvalidatedWifi` 调 `setAcceptUnvalidated(false)` 会拆掉 WIFI NetworkAgent，wlan0 仍关联但 `getAllNetworks()` 无 Wi‑Fi，AirPlay 无法 `bindSocket`。去掉该调用；handoff 在 Specifier 无 Network 时主动 re-request。
+- **CarPlay 方控左键短按/长按无效（奥迪 MMI）：** 左摇杆 HID `usage=6`（REWIND），不是 NEXT(4)/PREV(5)；右键 PREV(5)+invert 正常。把 REWIND/FF 并入左/右语义（短按切歌、长按左=应用栈、长按右=交换分屏）。
+- **CarPlay AAC 播一会车机无声：** 根因是 `onCadenceGap` 在 AAC 发送线程里同步 `POST modesChanged`（`exchangeEncrypted` 等 control 回包），RTP 停转→再 realign→死循环；严重时 `pulledMedia` 卡死、`dropMedia` 狂涨。改为异步 reclaim + 8s 节流；空窗用缓存静音 AU；轻度落后只加速补发不 snap 时钟。
+- **CarPlay 方控短按左右切歌无效：** `CarPlayWheelController.mediaKeyCode` 误写 130/129（`KEYCODE_MEDIA_RECORD`/`EJECT`），不是 87/88（`NEXT`/`PREVIOUS`）；日志里已 `pressKey(130)` 但 QQ 不响应。改为 `KeyEvent.KEYCODE_MEDIA_*`。
+- **QQ 音乐播着切到抖音，无线 CarPlay 无声：** 抖音曾被单发声 pause 后，用户置顶时 `finishLaunchOnPane` 不 settle Av，且 `resumeFront` 因粘性 QQ 仍 PLAYING 直接 skip → 两边都停。改为用户置顶 AvMedia 时 `claimSpeakerForFront`（先 pause 其它再 play），`resumeFront` 同样抢权。
+- **CarPlay 方控短按切歌无效 / 左右长按反了：** (1) `pressKey` 只往焦点 VD 注入，地图在前时 QQ 车载收不到 → 媒体键一律再走 `AudioManager.dispatchMediaKeyEvent`；(2) 奥迪 MIB3 物理右键报 HID PREV（左报 NEXT），长按右变成应用栈。MIB3 下 NEXT↔PREV 对调，与 AA 一致：长按右=交换分屏、长按左=应用栈。
+- **CarPlay 倒车 BORROW 后无声+方向盘失效：** `changeModes` 对 `BORROW_CHANGE`（如 `backupCamera` 借 MainScreen）一律回「手机仍持有」，违反资源管理器；车机 RTP 还在收但喇叭/方控死掉。改为按 transferType 授予/归还（3=BORROW→entity=accessory，4=UNBORROW→permanentEntity），仅在资源回到手机后才 POST `modesChanged` 重申（中途抢回仍会打成上次那种 BORROW 死循环）。
+- **音频/媒体加固：** (1) `CarPlayAudioCapture` 增加 session `desired`：MediaProjection `onStop` / 5min 无 pull 在会话仍要采集时 **keep-mute rearm**，不再中途 unmute；(2) `AvMediaArbiter.enforceSingleSounder` 成唯一 pause 入口，Mirror 仅在多路 PLAYING 时 pause（`force=false`），避免与分屏 restore 双 pause 抖；(3) 纠正「视频发声时仪表仍跟三源」的过时注释。
+- **CarPlay 已配对仍每次弹蓝牙配对框：** app 无 `BLUETOOTH_PRIVILEGED`，`setPairingConfirmation` 失败后落到 Settings；更糟的是 `PAIRING_REQUEST` 在已 `BOND_BONDED` 时还会 `removeBond`，逼着重配。改为已知 HU 走 `prepareCarPlayHeadUnit`（system_server 静默确认 + abort）；已 bonded 车机跳过「可被发现」对话框。
 - **状态页有时能滚有时不能：** edge-to-edge 只垫了顶栏 inset，ScrollView 按含导航栏的全高算「能放下」，底栏区域实际被挡且无滚动余量；CarPlay 状态文案变长时又突然能滚。改为四边 + IME inset。
 - **打开状态页就闪一下「CarPlay 通道出画」然后像退出：** 通道已是 CarPlay 时 `ensureArmedIfCarPlay` / FGS 会拉起同 task 的 `CarPlayHostActivity`，800ms 后 `moveTaskToBack` 把整栈（含状态页）压到后台。Host 改独立 `taskAffinity`；状态页 re-arm 只起 FGS/Runtime、不再弹 trampoline。
 - **CarPlay 奥迪 BORROW 之后一直无声：** 车机 `BORROW_CHANGE` 后除了 200 应答，又 POST 一次 `modesChanged` 把主音频抢回。车机立刻再 BORROW，随后 RTP 仍在发、喇叭不再出声。BORROW 只保留声明手机持有屏幕和主音频的 200，不再补发抢回。
@@ -47,14 +62,16 @@
 - **CarPlay 手机仍发声：** `CarPlayAudioCapture` 本地静音 / 还原误写成 `setStreamVolume(0, stream, 0)`（实改 VOICE_CALL），MUSIC 从未静音；改为 `setStreamVolume(stream, index, 0)` + `setStreamMute`。
 - **CarPlay Host 分屏条 / Recents / 选择器未对齐 AA：** 分隔条改为短按交换、长按 Recents、拖动 UP settle、边缘进全屏 peel；`CarPlayRecentsOverlay` 列序/几何与 AA 一致并补「添加应用」；新增 `CarPlayAppPickerOverlay`；方向盘媒体键松手用上次 usage（release `extra=0` 不再丢事件）。
 
-### Added
-- **CarPlay media + speech 双音频通道：** RTSP 恒开 `audioType=media`（`0x8000` 48 kHz stereo）与 `audioType=speech`（`0x10` 16 kHz mono）。speech 采集优先 AudioPolicy loopback（NAVIGATION/ASSISTANT），失败再 remotesubmix；AIDL 追加 `pullCarPlaySpeechAudio`。
-
 ### Changed
+- **CarPlay 真音频出口（AudioPolicy RENDER）：** media 优先 `AudioPolicy` `ROUTE_FLAG_RENDER|LOOP_BACK` 绑 `DEVICE_OUT_REMOTE_SUBMIX`，娱乐/通知/闹钟/**通话下行·铃声** 改道离扬声器再出站（通话走 media，因 MIB3 不开 speech）；speech（nav）同样 RENDER。成功则**不再** mute。失败回退 playback-capture（mute 含 VOICE_CALL/RING；采不到通话）→ remotesubmix。无车机麦上行。排障：`armed: media=audio-policy-render phoneMuted=false`。
+- **CarPlay Source / HU Profile 化：** BT 名、iAP/AirPlay 身份与 MIB3/Generic 行为收敛到 `carplay/profile/`（`SourceIdentity` + `HuProfile` + Registry/Resolver）；协议 RFCOMM UUID 仍在 `CarPlayConsts`。默认仍为 iPhone14,2 + mib3/generic，行为不变；扩展多手机/多车机改注册表，不再在链路里写死 vendor 名。
+- **状态页按出口通道切换配置：** 「出口通道」始终可见；选 Android Auto 只显示 VD DPI 等 AA 配置，选 CarPlay 只显示会话/Host 等 CarPlay 配置。
+- **Recent 卡片图标美化：** 放大 × 居中盖在图标上（不再独占上方一行）；图标约 72dp（分屏列按槽高放大，`fitCenter` 不形变）；CarPlay Canvas Recents 同几何与命中对齐。
 - **出画互斥（AA XOR CarPlay）：** 不再「AA 壳 tee 双通道」。通道单选：AA 停 Source+Host；CarPlay 只走 `CarPlayHostActivity` GL。`ProjectionSessionGate.shouldTeeFromAaShell` 恒 false；FGS/视频 SETUP 无 Host 时自动拉起，避免长期停在测试图。
 - **CarPlay / AA 包边界分离：** AA 车机 UI（`AaMainFragment`）经 `egress/ShellFrameEgress` + `egress/ProjectionSessionGate` 提供壳帧，不再 import carplay 包；状态页 CarPlay 控件抽到 `carplay/CarPlayStatusUi`；system_server 音频采集 / cgroup 提权迁至 `xposed/carplay/`；`DisplaySessionPolicy` 以 `onSecondaryEgressLiveChanged` 表达二次出口（AIDL 名保持不变）。见 [docs/EXECUTION.md](docs/EXECUTION.md) §14.2。
 
 ### Added
+- **CarPlay media + speech 双音频通道：** RTSP 恒开 `audioType=media`（`0x8000` 48 kHz stereo）与 `audioType=speech`（`0x10` 16 kHz mono）。speech 采集优先 AudioPolicy loopback（NAVIGATION/ASSISTANT），失败再 remotesubmix；AIDL 追加 `pullCarPlaySpeechAudio`。
 - **CarPlay Host GPU 零拷贝 60fps：** `CarPlayGlCompositor`（VD → SurfaceTexture OES → GLES 双窗合成 → MediaCodec `createInputSurface`）；去掉 Host ImageReader CPU sticky（原 ≈30Hz 内容上限）；`carplay/gles/` 精简 EGL 栈；编码器 `KEY_LOW_LATENCY`/`CAPTURE_RATE`/`OPERATING_RATE`/`REPEAT_PREVIOUS_FRAME_AFTER`、CBR；GOP 见 Fixed「IDR 峰」；降级窗 4→8×10s。AA 壳 tee 仍走 Canvas。验收：`feed=gl-compositor` + `CarPlayGlCompositor rate ≥55fps`；DiPlay 须设帧率=60。
 - **无线 CarPlay Source 出口（双轨 AA + CarPlay）：** 本模块进程内 `carplay/` — Bonjour `_carplay-ctrl._tcp.`、BT RFCOMM iAP2 骨架、RTSP 控制、AVC 编码、测试图案 / AA 壳 tee、`CarPlayProjectionService` FGS、`CarPlayHostActivity`（仅 CP 时 ImageReader → `CoreApi.onCreateSplitDisplay`）。触控经 `CarPlayInputBridge` → `touchAaDisplay`；音频出站占位。AIDL 追加 `reportCarPlaySessionLive` / `isCarPlaySessionLive`；`DisplaySessionPolicy` 感知 CP 会话。状态页可启停。协议为自研骨架（不 vendor CatPlay）；外参见 [docs/CARPLAY_REFS.md](docs/CARPLAY_REFS.md)（[WirelessCarPlay](https://github.com/45clouds/WirelessCarPlay) MIT：iAP2/CarPlay/认证 PDF 只读对照）。
 - **CarPlay RTP interleaved + 本地 loopback：** `RtpH264Packetizer`（RFC 6184 / FU-A）经 RTSP `$` 通道送 AVC；RECORD 后 `sendVideoAccessUnit`；debug 下 `CarPlayLocalLoopback` 自驱 SETUP/RECORD。FairPlay/HU 强校验仍待真机。

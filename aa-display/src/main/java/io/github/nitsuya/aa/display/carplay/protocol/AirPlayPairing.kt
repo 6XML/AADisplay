@@ -16,6 +16,12 @@ import javax.crypto.spec.SecretKeySpec
 class AirPlayPairing(
     private val controllerId: String,
     private val exchange: (path: String, body: ByteArray, contentType: String) -> ByteArray?,
+    /**
+     * When set, M5/M6 reuse this Ed25519 pair so Audi can re-[pair-verify] after
+     * pair-setup returns HTTP 403 (CarDeck Phase 3-C).
+     */
+    private val persistentController: AirPlayIdentityStore.Controller? = null,
+    private val onAccessoryPaired: ((accessoryId: String, accessoryLtpk: ByteArray) -> Unit)? = null,
 ) {
     data class Identity(
         val controllerId: String,
@@ -149,17 +155,29 @@ class AirPlayPairing(
             "Pair-Setup-Controller-Sign-Info",
             32,
         )
-        val ed = try {
-            AirPlayCurveCrypto.ed25519Generate()
-        } catch (e: Throwable) {
-            Log.e(CarPlayConsts.TAG, "Ed25519 generate failed", e)
-            return null
+        val edPrivate: ByteArray
+        val edPub: ByteArray
+        val idForSign: String
+        val persisted = persistentController
+        if (persisted != null && persisted.edPrivate.size == 32 && persisted.edPublic.size == 32) {
+            edPrivate = persisted.edPrivate
+            edPub = persisted.edPublic
+            idForSign = persisted.pairingId
+        } else {
+            val ed = try {
+                AirPlayCurveCrypto.ed25519Generate()
+            } catch (e: Throwable) {
+                Log.e(CarPlayConsts.TAG, "Ed25519 generate failed", e)
+                return null
+            }
+            edPrivate = ed.privateKey
+            edPub = ed.publicKey
+            idForSign = controllerId
         }
-        val edPub = ed.publicKey
-        val idBytes = controllerId.toByteArray(Charsets.UTF_8)
+        val idBytes = idForSign.toByteArray(Charsets.UTF_8)
         val toSign = signSalt + idBytes + edPub
         val signature = try {
-            AirPlayCurveCrypto.ed25519Sign(ed.privateKey, toSign)
+            AirPlayCurveCrypto.ed25519Sign(edPrivate, toSign)
         } catch (e: Throwable) {
             Log.e(CarPlayConsts.TAG, "Ed25519 sign failed", e)
             return null
@@ -217,14 +235,15 @@ class AirPlayPairing(
             CarPlayConsts.TAG,
             "AirPlay pair-setup persistent M6 ok accessoryId=$accessoryId ltpk=${accessoryLtpk.size}B",
         )
+        onAccessoryPaired?.invoke(accessoryId, accessoryLtpk)
         return Result(
             transient = false,
             sessionKey = sessionKey,
             writeKey = null,
             readKey = null,
             identity = Identity(
-                controllerId = controllerId,
-                edPrivate = ed.privateKey,
+                controllerId = idForSign,
+                edPrivate = edPrivate,
                 edPublic = edPub,
                 accessoryId = accessoryId,
                 accessoryLtpk = accessoryLtpk,

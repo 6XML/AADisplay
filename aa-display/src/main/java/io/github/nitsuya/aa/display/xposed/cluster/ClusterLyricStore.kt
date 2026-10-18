@@ -93,6 +93,12 @@ object ClusterLyricStore {
             Settings.Global.putString(cr, SETTINGS_SUBTITLE, s)
             Settings.Global.putString(cr, SETTINGS_ALBUM, a)
             writeUpdatedMs(cr)
+            // Explicit notify — some OEM SettingsProviders skip observer wake on putString
+            // from system_server; CarPlay NowPlaying listens on these URIs.
+            cr.notifyChange(Settings.Global.getUriFor(SETTINGS_TITLE), null)
+            cr.notifyChange(Settings.Global.getUriFor(SETTINGS_SUBTITLE), null)
+            cr.notifyChange(Settings.Global.getUriFor(SETTINGS_ALBUM), null)
+            cr.notifyChange(Settings.Global.getUriFor(SETTINGS_UPDATED_MS), null)
         }.onFailure { e ->
             log(TAG, "publish Settings.Global failed", e)
         }
@@ -102,6 +108,7 @@ object ClusterLyricStore {
         val id = mediaId.trim()
         runCatching {
             Settings.Global.putString(cr, SETTINGS_TRACK_MEDIA_ID, id)
+            cr.notifyChange(Settings.Global.getUriFor(SETTINGS_TRACK_MEDIA_ID), null)
         }.onFailure { e ->
             log(TAG, "publishTrackMediaId failed", e)
         }
@@ -111,6 +118,7 @@ object ClusterLyricStore {
         val p = pkg.trim()
         runCatching {
             Settings.Global.putString(cr, SETTINGS_SOURCE_PKG, p)
+            cr.notifyChange(Settings.Global.getUriFor(SETTINGS_SOURCE_PKG), null)
         }.onFailure { e ->
             log(TAG, "publishSourcePkg failed", e)
         }

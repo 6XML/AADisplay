@@ -613,13 +613,17 @@ internal class SplitOwnership(private val c: SplitDisplayController) {
         if (!settleAv) return
         // Cross-pane: restore / dual Av fronts must not both sound.
         c.buriedPlayback.enforceSingleSounder("promote")
+        // Focused front first — resume preempts sticky buried sounder (QQ→抖音).
+        val focusedFront = c.stacks.front(c.mFocusedPane)?.trim()
+        if (!focusedFront.isNullOrBlank() && focusedFront in fronts) {
+            c.buriedPlayback.resumeFrontPlaybackIfPausedByUs(focusedFront)
+        }
         for (frontPkg in fronts) {
+            if (frontPkg == focusedFront) continue
             c.buriedPlayback.resumeFrontPlaybackIfPausedByUs(frontPkg)
         }
         // Resume may have started a second player — re-assert single sounder.
-        if (fronts.size > 1) {
-            c.buriedPlayback.enforceSingleSounder("promote-after-resume")
-        }
+        c.buriedPlayback.enforceSingleSounder("promote-after-resume")
     }
 
     /**

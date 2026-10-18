@@ -40,7 +40,7 @@ class Iap2Session(
     private val onFileTransferDatagram: ((ByteArray) -> Unit)? = null,
     private val sourceIdentity: CarPlaySourceIdentity = CarPlayProfileRegistry.defaultSource(),
     private val onHuProfileChanged: ((CarPlayHuProfile) -> Unit)? = null,
-) {
+) : NowPlayingEgress {
     private enum class State {
         Idle,
         Detect,
@@ -86,6 +86,8 @@ class Iap2Session(
     private val startSessionSeen = AtomicBoolean(false)
     private val wifiRetryArmed = AtomicBoolean(false)
     private var mib3TransportAnnounced = false
+    /** True after [onCarPlayStart] has fired for this RFCOMM session. */
+    fun hasSeenStartSession(): Boolean = startSessionSeen.get()
 
     @Volatile
     var linkReady: Boolean = false
@@ -149,6 +151,9 @@ class Iap2Session(
             transportUsers++
             resetLocked()
             state = State.Detect
+            // Race-torn Auth used to blacklist 20/32 for the whole process, so the next
+            // clean cafe/dial session only had 16B left and never finished Auth.
+            rejectedChallengeSizes.clear()
         }
         Log.i(CarPlayConsts.TAG, "iAP transport up → detect")
         // DiPlay may pad RFCOMM reads to 512B of repeated detect; we must speak first.
@@ -193,6 +198,19 @@ class Iap2Session(
     /** @return false when this close belongs to a socket already replaced by a newer peer. */
     fun onTransportClosed(): Boolean {
         val current = synchronized(lock) {
+            // CarDeck: Audi may tear the link ~0.4s after a rejected challenge length.
+            // Remember that size for the rest of the process so the next session skips it.
+            val challenge = pendingChallenge
+            if (challenge != null &&
+                (state == State.Authenticating || state == State.Identified)
+            ) {
+                rejectedChallengeSizes.add(challenge.size)
+                Log.w(
+                    CarPlayConsts.TAG,
+                    "iAP challenge ${challenge.size}B rejected (link drop mid-auth) — " +
+                        "skip next session rejected=$rejectedChallengeSizes",
+                )
+            }
             transportUsers = (transportUsers - 1).coerceAtLeast(0)
             if (transportUsers > 0) {
                 false
@@ -624,13 +642,14 @@ class Iap2Session(
         sendControlLocked(Iap2Csm.empty(Iap2Csm.REQUEST_AUTH_CERTIFICATE))
         Log.i(CarPlayConsts.TAG, "iAP RequestAuthenticationCertificate (0xAA00) sent")
         if (!mib3) return
-        // MIB3 signs the challenge that rides with the cert request. A later 0xAA01
-        // must not be followed by a second 32-byte challenge.
-        val challenge = ByteArray(20).also { SecureRandom().nextBytes(it) }
+        // MIB3 / real iPhone: 20B with the cert request. Prefer 20 even if 32 was
+        // rejected earlier; never send a size already known-bad for this process.
+        val size = firstUsableChallengeSize(prefer20First = true) ?: 20
+        val challenge = ByteArray(size).also { SecureRandom().nextBytes(it) }
         pendingChallenge = challenge
         mib3ChallengeSent = true
         sendControlLocked(Iap2Csm.requestAuthChallenge(challenge))
-        Log.i(CarPlayConsts.TAG, "iAP MIB3 RequestAuthenticationChallenge (0xAA02) sent 20B")
+        Log.i(CarPlayConsts.TAG, "iAP MIB3 RequestAuthenticationChallenge (0xAA02) sent ${size}B")
     }
 
     private fun handleAuthCertificateLocked(msg: Iap2Framing.ControlMessage) {
@@ -639,10 +658,21 @@ class Iap2Session(
             Log.i(CarPlayConsts.TAG, "iAP MIB3 certificate ignored; challenge already sent")
             return
         }
-        val challenge = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        // DiPlay wants 32B first; skip sizes this process already saw tear the link.
+        val size = firstUsableChallengeSize(prefer20First = false) ?: 32
+        val challenge = ByteArray(size).also { SecureRandom().nextBytes(it) }
         pendingChallenge = challenge
         sendControlLocked(Iap2Csm.requestAuthChallenge(challenge))
         Log.i(CarPlayConsts.TAG, "iAP RequestAuthenticationChallenge (0xAA02) sent ${challenge.size}B")
+    }
+
+    private fun firstUsableChallengeSize(prefer20First: Boolean): Int? {
+        val order = if (prefer20First) {
+            listOf(20, 32, 16)
+        } else {
+            listOf(32, 20, 16)
+        }
+        return order.firstOrNull { it !in rejectedChallengeSizes }
     }
 
     private fun handleAuthResponseLocked(msg: Iap2Framing.ControlMessage) {
@@ -783,7 +813,7 @@ class Iap2Session(
      * [Iap2BodyReader.optionalGroup] shape); empty groups are omitted, an omitted field
      * keeps its previous value, and a present empty string clears it. Safe from any thread.
      */
-    fun sendNowPlaying(mediaItem: Map<Int, ByteArray>, playback: Map<Int, ByteArray>) {
+    override fun sendNowPlaying(mediaItem: Map<Int, ByteArray>, playback: Map<Int, ByteArray>) {
         val params = linkedMapOf<Int, ByteArray>()
         if (mediaItem.isNotEmpty()) params[0] = Iap2Csm.encodeGroup(mediaItem)
         if (playback.isNotEmpty()) params[1] = Iap2Csm.encodeGroup(playback)
@@ -799,7 +829,7 @@ class Iap2Session(
      * allows; the remainder flushes on the next peer ack. The caller owns the 2-byte
      * [id, flags|opcode] header + payload layout. Safe from any thread.
      */
-    fun sendFileTransfer(datagram: ByteArray) {
+    override fun sendFileTransfer(datagram: ByteArray) {
         synchronized(lock) {
             if (state == State.Dead || state == State.Idle || !linkReady) return
             if (fileTransferQueue.isNotEmpty()) {
@@ -836,5 +866,7 @@ class Iap2Session(
 
     private companion object {
         const val FILE_TRANSFER_QUEUE_CAP = 4_096
+        /** Process-wide: challenge lengths that tore the RFCOMM link mid-auth. */
+        private val rejectedChallengeSizes = java.util.Collections.synchronizedSet(mutableSetOf<Int>())
     }
 }

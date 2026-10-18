@@ -18,13 +18,13 @@ import java.util.concurrent.atomic.AtomicLong
  * the CarPlay display comes up.
  *
  * Z Flip / Samsung often enable Bluetooth and let DiPlay take A2DP **before**
- * [Intent.ACTION_BOOT_COMPLETED] (delayed by lock-screen). Listening for
- * [BluetoothAdapter.ACTION_STATE_CHANGED] STATE_ON and [Intent.ACTION_USER_UNLOCKED]
- * arms `…cafe` as soon as the stack can accept RFCOMM, instead of waiting on a single
- * late BOOT_COMPLETED + 8s kick.
+ * [Intent.ACTION_BOOT_COMPLETED]. Manifest [BluetoothAdapter.ACTION_STATE_CHANGED]
+ * is blocked while the app is stopped (`Background execution not allowed`); early
+ * arm is done in system_server ([io.github.nitsuya.aa.display.xposed.carplay.CarPlayBootArm]).
+ * This receiver remains the BOOT_COMPLETED / package-replace / unlock fallback ladder.
  *
  * Boot order inside FGS: [CarPlayBluetoothLink] still waits for STATE_ON if the adapter
- * flickers. FGS start from BT-related broadcasts is an Android background-start exemption.
+ * flickers.
  */
 class CarPlayAutoArmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
@@ -92,6 +92,15 @@ class CarPlayAutoArmReceiver : BroadcastReceiver() {
             }
 
         private fun arm(app: Context, action: String, reason: String, debounce: Boolean) {
+            // Boot ladder is 0/3/12/30s — once FGS has a session (cafe listening),
+            // further kicks only recycle the encoder and look like connect failure.
+            if (CarPlayProjectionService.isSessionArmed()) {
+                Log.d(
+                    CarPlayConsts.TAG,
+                    "CarPlayAutoArm skip action=$action reason=$reason — session armed",
+                )
+                return
+            }
             if (debounce) {
                 val now = SystemClock.elapsedRealtime()
                 val prev = lastArmElapsed.get()

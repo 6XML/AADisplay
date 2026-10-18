@@ -13,8 +13,14 @@ object CarPlayConsts {
     const val ACTION_CONNECT = "io.github.nitsuya.aa.display.carplay.CONNECT"
     const val ACTION_STOP = "io.github.nitsuya.aa.display.carplay.STOP"
 
-    /** Bonjour / NSD type used by wireless CarPlay control. */
+    /** Bonjour / NSD type used by wireless CarPlay control (phone advertises). */
     const val BONJOUR_TYPE = "_carplay-ctrl._tcp."
+
+    /**
+     * Accessory AirPlay endpoint (HU advertises). Audi MIB3 often never sends
+     * `0x4301`; dial host:port comes from this discovery instead.
+     */
+    const val AIRPLAY_BONJOUR_TYPE = "_airplay._tcp."
 
     const val NOTIFICATION_CHANNEL_ID = "carplay_projection"
     const val NOTIFICATION_ID = 0x0C01

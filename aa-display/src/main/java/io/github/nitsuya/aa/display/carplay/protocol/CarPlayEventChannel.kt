@@ -14,6 +14,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /**
@@ -34,6 +35,12 @@ class CarPlayEventChannel private constructor(
     private val touchMaxY: Int,
     private val onHidKey: (device: Int, code: Int, pressed: Boolean, extra: Int) -> Unit,
     private val onIapMessage: (ByteArray) -> Unit,
+    /**
+     * After HU UNBORROW/UNTAKE restores MainScreen/MainAudio to the phone, fire so the
+     * control channel can POST `modesChanged` (speakers/HID come back). Never call this
+     * on BORROW/TAKE — reclaiming mid-borrow made Audi silent with RTP still flowing.
+     */
+    private val onModesRestoredToPhone: () -> Unit,
 ) {
     private val closed = AtomicBoolean(false)
     private val writeLock = Any()
@@ -43,6 +50,17 @@ class CarPlayEventChannel private constructor(
     private val out = BufferedOutputStream(socket.getOutputStream(), 16 * 1024)
     @Volatile private var fingerDown = false
     @Volatile private var knobBtns = 0
+
+    // Resource manager state (WWDC16): entity=current owner, permanentEntity=take owner.
+    // 0 = accessory (HU), 1 = controller (phone). resourceID 1=MainScreen, 2=MainAudio.
+    private val modesLock = Any()
+    @Volatile private var screenEntity = ENTITY_PHONE
+    @Volatile private var screenPermanent = ENTITY_PHONE
+    @Volatile private var audioEntity = ENTITY_PHONE
+    @Volatile private var audioPermanent = ENTITY_PHONE
+
+    /** False while HU BORROW/TAKE holds MainAudio — skip phone-owns modesChanged reclaim. */
+    fun isPhoneOwningMainAudio(): Boolean = audioEntity == ENTITY_PHONE
 
     /**
      * iPhone answers accessory `POST /command` (modesChanged, iAPSendMessage)
@@ -69,6 +87,8 @@ class CarPlayEventChannel private constructor(
         }
     }
 
+    private val outboundCseq = AtomicInteger(1)
+
     fun start() {
         thread(name = "carplay-event", isDaemon = true) {
             val input = BufferedInputStream(socket.getInputStream())
@@ -88,6 +108,56 @@ class CarPlayEventChannel private constructor(
             }
             close()
         }
+    }
+
+    /**
+     * Fire-and-forget `POST /command` on the **event** socket (Events keys, own CSeq).
+     * CarDeck/DiPlay: HID arming (`hidSetInputMode`) must not go on the RTSP control
+     * connection — the HU ignores it there.
+     */
+    fun postCommand(plist: Map<String, Any?>): Boolean {
+        if (closed.get() || socket.isClosed) return false
+        return try {
+            val body = BinaryPlist.encode(plist)
+            val seq = outboundCseq.getAndIncrement()
+            val req = RtspMessage(
+                "POST /command RTSP/1.0",
+                linkedMapOf(
+                    "Content-Type" to "application/x-apple-binary-plist",
+                    "Content-Length" to body.size.toString(),
+                    "CSeq" to seq.toString(),
+                ),
+                body,
+            )
+            synchronized(writeLock) {
+                crypto.writeMessage(out, req.toBytes())
+                out.flush()
+            }
+            true
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "event postCommand failed", e)
+            false
+        }
+    }
+
+    /** Arm each `/info` hidDevices uuid so the HU starts sending touch reports. */
+    fun armHidInputModes(uuids: Collection<String>): Int {
+        var ok = 0
+        for (uuid in uuids) {
+            if (uuid.isBlank()) continue
+            val sent = postCommand(
+                linkedMapOf(
+                    "type" to "hidSetInputMode",
+                    "params" to linkedMapOf(
+                        "hidInputMode" to 0L,
+                        "uuid" to uuid,
+                    ),
+                ),
+            )
+            Log.i(CarPlayConsts.TAG, "event hidSetInputMode uuid=$uuid ok=$sent")
+            if (sent) ok++
+        }
+        return ok
     }
 
     private fun handle(msg: RtspMessage) {
@@ -169,11 +239,11 @@ class CarPlayEventChannel private constructor(
                     CarPlayConsts.TAG,
                     "event changeModes reason=$reason resources=${params?.get("resources")}",
                 )
-                // 200 body keeps MainScreen+MainAudio on the phone. An empty ACK left
-                // Audi black ~5s after BORROW. Do not also POST modesChanged here:
-                // that second claim made Audi BORROW again and then leave RTP running
-                // with the speakers silent.
-                val modes = phoneOwnedModesParams()
+                // Grant/release per WWDC resource manager. Refusing BORROW (always
+                // phone-owns) left Audi with RTP alive but speakers+wheel dead after
+                // backupCamera MainScreen borrow. Empty 200 → black ~5s then tear-down.
+                val restored = applyChangeModes(params)
+                val modes = currentModesParams()
                 val encoded = BinaryPlist.encode(
                     mapOf(
                         "status" to 0,
@@ -181,7 +251,19 @@ class CarPlayEventChannel private constructor(
                     ),
                     groupKeys = true,
                 )
-                Log.i(CarPlayConsts.TAG, "event changeModes → 200 body=${encoded.size}B")
+                Log.i(
+                    CarPlayConsts.TAG,
+                    "event changeModes → 200 body=${encoded.size}B " +
+                        "screen=$screenEntity/$screenPermanent audio=$audioEntity/$audioPermanent " +
+                        "restored=$restored",
+                )
+                if (restored) {
+                    try {
+                        onModesRestoredToPhone()
+                    } catch (e: Throwable) {
+                        Log.w(CarPlayConsts.TAG, "onModesRestoredToPhone failed", e)
+                    }
+                }
                 return encoded
             }
             "requestUI" -> {
@@ -193,26 +275,91 @@ class CarPlayEventChannel private constructor(
         return null
     }
 
-    /** Phone owns MainScreen + MainAudio (entity=1). Needed for Audi volume UI. */
-    private fun phoneOwnedModesParams(): Map<String, Any?> = linkedMapOf(
-        "resources" to listOf(
-            linkedMapOf(
-                "resourceID" to 1,
-                "entity" to 1,
-                "permanentEntity" to 1,
+    /**
+     * Apply HU take/borrow/untake/unborrow. @return true when at least one resource
+     * returned to the phone (controller) so control can re-announce modesChanged.
+     */
+    private fun applyChangeModes(params: Map<String, Any?>?): Boolean {
+        val resources = params?.get("resources") as? List<*> ?: return false
+        var restored = false
+        synchronized(modesLock) {
+            val screenBefore = screenEntity
+            val audioBefore = audioEntity
+            for (item in resources) {
+                val r = BinaryPlist.asDict(item) ?: continue
+                val id = BinaryPlist.intOf(r["resourceID"])?.toInt() ?: continue
+                val transfer = BinaryPlist.intOf(r["transferType"])?.toInt() ?: continue
+                when (id) {
+                    RESOURCE_MAIN_SCREEN -> {
+                        when (transfer) {
+                            TRANSFER_TAKE -> {
+                                screenEntity = ENTITY_ACCESSORY
+                                screenPermanent = ENTITY_ACCESSORY
+                            }
+                            TRANSFER_UNTAKE -> {
+                                screenEntity = ENTITY_PHONE
+                                screenPermanent = ENTITY_PHONE
+                            }
+                            TRANSFER_BORROW -> screenEntity = ENTITY_ACCESSORY
+                            TRANSFER_UNBORROW -> screenEntity = screenPermanent
+                            else -> Log.w(
+                                CarPlayConsts.TAG,
+                                "changeModes unknown transferType=$transfer resourceID=$id",
+                            )
+                        }
+                    }
+                    RESOURCE_MAIN_AUDIO -> {
+                        when (transfer) {
+                            TRANSFER_TAKE -> {
+                                audioEntity = ENTITY_ACCESSORY
+                                audioPermanent = ENTITY_ACCESSORY
+                            }
+                            TRANSFER_UNTAKE -> {
+                                audioEntity = ENTITY_PHONE
+                                audioPermanent = ENTITY_PHONE
+                            }
+                            TRANSFER_BORROW -> audioEntity = ENTITY_ACCESSORY
+                            TRANSFER_UNBORROW -> audioEntity = audioPermanent
+                            else -> Log.w(
+                                CarPlayConsts.TAG,
+                                "changeModes unknown transferType=$transfer resourceID=$id",
+                            )
+                        }
+                    }
+                    else -> Log.i(
+                        CarPlayConsts.TAG,
+                        "changeModes ignore resourceID=$id transferType=$transfer",
+                    )
+                }
+            }
+            if (screenBefore != ENTITY_PHONE && screenEntity == ENTITY_PHONE) restored = true
+            if (audioBefore != ENTITY_PHONE && audioEntity == ENTITY_PHONE) restored = true
+        }
+        return restored
+    }
+
+    /** Current MainScreen+MainAudio ownership snapshot (Audi volume / mixer). */
+    private fun currentModesParams(): Map<String, Any?> = synchronized(modesLock) {
+        linkedMapOf(
+            "resources" to listOf(
+                linkedMapOf(
+                    "resourceID" to RESOURCE_MAIN_SCREEN,
+                    "entity" to screenEntity,
+                    "permanentEntity" to screenPermanent,
+                ),
+                linkedMapOf(
+                    "resourceID" to RESOURCE_MAIN_AUDIO,
+                    "entity" to audioEntity,
+                    "permanentEntity" to audioPermanent,
+                ),
             ),
-            linkedMapOf(
-                "resourceID" to 2,
-                "entity" to 1,
-                "permanentEntity" to 1,
+            "appStates" to listOf(
+                linkedMapOf("appStateID" to 2, "entity" to 0),
+                linkedMapOf("appStateID" to 3, "entity" to 0),
+                linkedMapOf("appStateID" to 1, "entity" to 0, "speechMode" to -1),
             ),
-        ),
-        "appStates" to listOf(
-            linkedMapOf("appStateID" to 2, "entity" to 0),
-            linkedMapOf("appStateID" to 3, "entity" to 0),
-            linkedMapOf("appStateID" to 1, "entity" to 0, "speechMode" to -1),
-        ),
-    )
+        )
+    }
 
     private fun parseTouchReport(report: ByteArray) {
         if (report.size < 4) return
@@ -357,6 +504,13 @@ class CarPlayEventChannel private constructor(
     private fun parseOneByteReport(device: Int, report: ByteArray) {
         if (report.isEmpty()) return
         val v = report[0].toInt() and 0xff
+        if (device == CarPlayWheelController.DEV_MEDIA) {
+            Log.i(
+                CarPlayConsts.TAG,
+                "hid media report=${report.joinToString("") { "%02x".format(it) }} " +
+                    "usage=$v pressed=${v != 0}",
+            )
+        }
         onHidKey(device, if (v == 0) 0 else v, v != 0, v)
     }
 
@@ -413,6 +567,16 @@ class CarPlayEventChannel private constructor(
         private const val MEDIA_HID_UUID = "2a2a2a2c"
         private const val TELEPHONY_HID_UUID = "2a2a2a2d"
 
+        private const val RESOURCE_MAIN_SCREEN = 1
+        private const val RESOURCE_MAIN_AUDIO = 2
+        private const val ENTITY_ACCESSORY = 0
+        private const val ENTITY_PHONE = 1
+        /** CSM / Audi numeric transferType (matches live BORROW_CHANGE logs). */
+        private const val TRANSFER_TAKE = 1
+        private const val TRANSFER_UNTAKE = 2
+        private const val TRANSFER_BORROW = 3
+        private const val TRANSFER_UNBORROW = 4
+
         fun open(
             host: InetAddress,
             eventPort: Int,
@@ -423,6 +587,7 @@ class CarPlayEventChannel private constructor(
             onTouch: (Float, Float, Int) -> Unit,
             onHidKey: (Int, Int, Boolean, Int) -> Unit,
             onIapMessage: (ByteArray) -> Unit = {},
+            onModesRestoredToPhone: () -> Unit = {},
         ): CarPlayEventChannel? {
             if (eventPort <= 0 || eventPort > 65535) {
                 Log.w(CarPlayConsts.TAG, "eventPort invalid=$eventPort")
@@ -454,6 +619,7 @@ class CarPlayEventChannel private constructor(
                     touchMaxY = touchMaxY,
                     onHidKey = onHidKey,
                     onIapMessage = onIapMessage,
+                    onModesRestoredToPhone = onModesRestoredToPhone,
                 )
                 Log.i(
                     CarPlayConsts.TAG,

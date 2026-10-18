@@ -112,7 +112,7 @@
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="出口通道"
+                    android:text="投屏通道"
                     android:textAlignment="viewStart"
                     android:textColor="@color/color_text_secondary"
                     android:textSize="16sp" />
@@ -121,7 +121,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="4dp"
-                    android:text="互斥：同一时间只出画一路"
+                    android:text="同一时间只能投到一个通道"
                     android:textAlignment="viewStart"
                     android:textColor="@color/color_text_secondary"
                     android:textSize="12sp" />
@@ -266,7 +266,7 @@
 
         </FrameLayout>
 
-        <!-- CarPlay–only settings (Host / session). -->
+        <!-- CarPlay–only settings (session / cast). -->
         <FrameLayout
             android:id="@+id/panel_carplay"
             android:layout_width="match_parent"
@@ -299,7 +299,7 @@
                     android:textAlignment="viewStart"
                     android:textColor="@color/color_text_primary"
                     android:textSize="14sp"
-                    tools:text="会话：未连接\n内容源：CarPlay Host" />
+                    tools:text="服务：已就绪（等车机）\n画面：分屏投屏\nHost：运行中" />
 
                 <Button
                     android:id="@+id/btn_carplay_host"
@@ -307,7 +307,7 @@
                     android:layout_height="wrap_content"
                     android:layout_marginTop="12dp"
                     android:minHeight="40dp"
-                    android:text="启动 / 重开 Host" />
+                    android:text="启动 / 重开投屏" />
             </LinearLayout>
         </FrameLayout>
 

@@ -43,6 +43,9 @@ class CarPlayProjectionService : Service() {
 
         private const val EXTRA_LAUNCH_HOST_TRAMPOLINE = "launchHostTrampoline"
 
+        /** True once [ensureSession] created a live [CarPlaySourceSession] (RFCOMM listening). */
+        fun isSessionArmed(): Boolean = sessionRef.get() != null
+
         fun stop(context: Context) {
             val i = Intent(context, CarPlayProjectionService::class.java).setAction(CarPlayConsts.ACTION_STOP)
             context.startService(i)
@@ -87,7 +90,7 @@ class CarPlayProjectionService : Service() {
         nm.createNotificationChannel(
             NotificationChannel(
                 CarPlayConsts.NOTIFICATION_CHANNEL_ID,
-                "CarPlay projection",
+                "CarPlay 投屏",
                 NotificationManager.IMPORTANCE_LOW,
             ),
         )
@@ -99,7 +102,7 @@ class CarPlayProjectionService : Service() {
         )
         val notification = Notification.Builder(this, CarPlayConsts.NOTIFICATION_CHANNEL_ID)
             .setContentTitle("AADisplay CarPlay")
-            .setContentText("Wireless CarPlay Source session")
+            .setContentText("已就绪，等待车机连接")
             .setSmallIcon(R.drawable.ic_round_check_circle_24)
             .setContentIntent(pi)
             .setOngoing(true)
@@ -117,11 +120,14 @@ class CarPlayProjectionService : Service() {
 
     private fun ensureSession(launchHostTrampoline: Boolean = true) {
         if (session != null) {
-            // Mark live before any soft-reconnect create so Coolwalk rail settle
-            // cannot shrink CarPlay VDs under the encode canvas.
+            // Soft re-arm (AutoArm ladder / sticky restart): keep the existing
+            // SourceSession + RFCOMM listen. Rebinding GL here used to recycle
+            // MediaCodec 3× before the HU dialed and looked like connect failure.
             reportLive(true)
-            CarPlayHostRuntime.ensureStartedSync(this, timeoutMs = 5_000L)
-            glCompositorRef.get()?.let { session?.attachGlCompositor(it) }
+            if (!CarPlayHostRuntime.isRunning()) {
+                CarPlayHostRuntime.ensureStartedSync(this, timeoutMs = 5_000L)
+                glCompositorRef.get()?.let { session?.attachGlCompositor(it) }
+            }
             return
         }
         Log.i(CarPlayConsts.TAG, "CarPlayProjectionService CONNECT")

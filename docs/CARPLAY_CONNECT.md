@@ -27,7 +27,8 @@
 | 触发 | 行为 | 代码 |
 |------|------|------|
 | 状态页「出口通道 = CarPlay」 | `CarPlayChannel` 持久化 → `CarPlayProjectionService.CONNECT` | `CarPlayStatusUi`、`CarPlayChannel` |
-| 开机 / 换包 / BT ON / 解锁 | 若通道已是 CarPlay → 重武装 FGS（尽早 listen `…cafe`） | `CarPlayAutoArmReceiver` |
+| 开机 / BT ON / 解锁 | 若通道已是 CarPlay → **system_server** 尽早起 FGS listen `…cafe`（绕过 app 后台广播禁令） | `xposed/carplay/CarPlayBootArm` |
+| 开机 / 换包 / 解锁（回退） | App 侧 `BOOT_COMPLETED` 阶梯武装 | `CarPlayAutoArmReceiver` |
 | STOP / 切回 AA | `tearDown` → 停 Session / Host；通道改 AA | `CarPlayProjectionService` |
 
 通道文件：`filesDir/aadisplay_carplay_channel`（`0`=AA，`1`=CarPlay）。默认 **AA**，真车行为不变。
@@ -101,16 +102,17 @@ sequenceDiagram
 
 身份与车机策略（`carplay/profile/`）：
 
-- **`CarPlaySourceIdentity`**：BT 广告名、iAP/AirPlay 手机字段（默认 `iphone14_2`）。
+- **`CarPlaySourceIdentity`**：iAP/AirPlay 手机字段（默认 `iphone14_2`）；不改 BT 适配器名。
 - **`CarPlayHuProfile`**：dial 策略、AirPlay UA/HKP/版本、MIB3 vs Generic 无线路径。
 - **`CarPlayProfileResolver`**：按 iAP ident → SSID → BT 名（registry 内 hint）解析 HU；未命中 → `generic`。
 - 新手机 / 新车机：改注册表，禁止在 BT/iAP/RTSP 再写 `contains("audi")` / `"iPhone14,2"`。
 
 武装时：
 
-- 适配器改名为 `SourceIdentity.btAdvertiseName`（停会话时恢复）；尽量 `SCAN_MODE_CONNECTABLE_DISCOVERABLE`。
+- 不改蓝牙适配器名称；尽量 `SCAN_MODE_CONNECTABLE_DISCOVERABLE`。已有 inbound-preferred 车机 bond 时**不弹**系统「可被发现」对话框。
 - BT OFF 时挂 `STATE_CHANGED`，ON 后再 `beginRfcomm`（避免 reboot 永久放弃 → DiPlay SDP `scn=0`）。
-- bonded 扫描 dial `…caff`（按 accessory / wireless-CP UUID 排序）；`INBOUND_PREFERRED` 车机在 ACL/新配对后再 dial。**已有 socket 且 iAP 协商中禁止红 dial**。
+- bonded 扫描 dial `…caff`（按 accessory / wireless-CP UUID 排序）。`INBOUND_PREFERRED`（Audi）：**优先等车机 dial `…cafe`**；bond/ACL 后 **2.5s 一次性** `…caff` fallback；`BOND_BONDING` 禁拨（否则掐 SSP）。**已有 socket / iAP 协商中禁止红 dial**。
+- 配对：已知 HU（名 hint / 已 bonded 且含 CarPlay UUID）经 `prepareCarPlayHeadUnit` 由 **system_server** `setPairingConfirmation` 静默确认并 `abortBroadcast`，不弹 Settings；**禁止**在 `PAIRING_REQUEST` 上 `removeBond`（会逼每次重配）。
 - 保留 HFP；**不主动开 A2DP**（部分 HU 会超时提示「无法建立蓝牙」）。
 
 ### 4.2 iAP2 状态机（`protocol/Iap2Session`）
@@ -151,6 +153,8 @@ sequenceDiagram
 - 入网前 `CoreApi.preferCellularOverUnvalidatedWifi`，避免未验证 STA 抢默认路由掐蜂窝。
 - dial 前走 `CarPlayAccessoryNet` 绑到配件 Network，禁止走 LTE 默认路由撞 `10.x`。
 
+**连热点仍走流量（默认路由 vs socket 绑网）** 的完整梳理见 [CARPLAY_WIFI_CELLULAR.md](CARPLAY_WIFI_CELLULAR.md)。
+
 ### 4.4 控制 TCP / AirPlay（`CarPlayRtspSession`）
 
 `dialCarPlayControl`：
@@ -169,7 +173,8 @@ sequenceDiagram
 | 类 | 连接职责 |
 |----|----------|
 | `CarPlayChannel` | AA ↔ CarPlay 互斥通道持久化 |
-| `CarPlayAutoArmReceiver` | 开机/BT/解锁重武装 FGS |
+| `CarPlayBootArm`（system_server） | BT ON / 解锁时起 FGS（首连关键） |
+| `CarPlayAutoArmReceiver` | BOOT_COMPLETED / 换包回退武装 |
 | `CarPlayProjectionService` | FGS 拥有 Session；live 上报 |
 | `CarPlaySourceSession` | 编排 Bonjour + BT + iAP2 + Wi‑Fi + RTSP |
 | `CarPlayBluetoothLink` | RFCOMM listen/dial、名称/可发现、配对监听 |
@@ -186,14 +191,31 @@ sequenceDiagram
 
 | 现象 | 优先查 |
 |------|--------|
-| 车机只有普通蓝牙电话，无 CarPlay | RFCOMM 是否真正连上（`…cafe` accept / `…caff` dial）；通道是否 CarPlay；AutoArm 是否起了 FGS |
+| 车机只有普通蓝牙电话，无 CarPlay | RFCOMM 是否真正连上（`…cafe` accept / `…caff` dial）；通道是否 CarPlay；看 `AAD_CpBootArm start FGS` 是否早于 Audi SDP |
+| 开机第一连不上、第二才能连 | BT ON 时 app `STATE_CHANGED` 被拒；需 system_server BootArm + 重启换模块 |
 | DiPlay 有声无屏 / SDP `scn=0` | 本机是否在 listen `…cafe`（BT 未 ON 就放弃过） |
 | Auth 后无热点 / 无 StartSession | 是否 MIB3 路径；是否已发 `0x5702`；是否收到 `0x5703`/`0x4301` |
+| 有 Wi‑Fi 且久无 `0x4301` | 主路径仍等 StartSession；约 8s 后才看 `_airplay` 缓存 / 网关:7000 **兜底** |
+| pair-setup HTTP 403 | 主路径仍先 setup；403 时才重连 + verify + `X-Apple-PD`（查 `files/airplay_identity/`） |
 | 有 StartSession 但 dial 失败 | Wi‑Fi 是否 bind；是否走了蜂窝；IPv4 是否只有 `fe80` |
 | 连上又秒断 AP | Specifier hold 是否被 unregister；三星 UNWANTED |
 | GL/编码很热闹但车机无会话 | 旧 DiPlay RFCOMM 占着 socket，对新车 dial 被丢弃 |
 
 日志标签：`CarPlayConsts.TAG`（`AADisplay_CarPlay` 一类）。关键字样：`RFCOMM`、`iAP`、`WiFi handoff`、`CarPlayStartSession`、`AirPlay source dial`。
+
+### 6.1 CarDeck 协议坑 → **只加固，不替代主路径**
+
+主路径仍是我们已验证的：`0x4301` dial、MIB3 `OPTIONS→/info→pair-setup→verify`、事件通道收 `hidSendReport`、profile 定 MFi 挑战长度。下表仅为兜底，**不得抢主路径、不得改已通时序**。
+
+| 加固项 | 行为 | 明确不做 |
+|--------|------|----------|
+| 无 `0x4301` | Wi‑Fi bind 后**缓存** `_airplay`；**≥8s 仍无 StartSession** 才 dial / 网关:7000 | 一发现 mDNS 就 dial；挡 StartSession |
+| ctrl TXT `id` | 写真实 BT MAC；绑网 force 重注册 | 改 RFCOMM / Ident 主逻辑 |
+| pair-setup 403 | 捕获 403 → 重连 + 持久控制器 verify；`X-Apple-PD: 1` | 跳过 setup；跳过 MIB3 预热 /info |
+| `hidSetInputMode` | `/info` 有 hidDevices 时额外武装 | 臆造 `"0"`/`"1"`；替代现有触控解析 |
+| MFi 挑战记忆 | 本进程跳过已拆链长度 | 改写 MIB3 默认 20B / DiPlay 32B 优先 |
+
+未搬：modesChanged 改 SETUP 前；`awaitAck=false`；用 CarDeck 会话状态机替换 `Iap2Session`。
 
 ---
 
@@ -202,6 +224,7 @@ sequenceDiagram
 | 文档 | 内容 |
 |------|------|
 | **本文** | 建连时序与断点 |
+| [CARPLAY_WIFI_CELLULAR.md](CARPLAY_WIFI_CELLULAR.md) | 配件 Wi‑Fi 无网 + 整机继续走蜂窝 |
 | [EXECUTION.md §14](EXECUTION.md) | 运行时出画 / 音频 / 触控 / 包边界 |
 | [CARPLAY_REFS.md](CARPLAY_REFS.md) | 外部协议参考与字节序 |
 | [CARPLAY_MAC_TEST.md](CARPLAY_MAC_TEST.md) | Mac Simulator 联调 |

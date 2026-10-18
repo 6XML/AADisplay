@@ -20,9 +20,9 @@ import io.github.nitsuya.aa.display.xposed.util.logDebug
  * [io.github.nitsuya.aa.display.service.ClusterLyricMediaService] / gearhead egress
  * can feed the instrument-cluster ticker.
  *
- * Single-sounder ([AvMediaArbiter.pickWinner]) pauses other music ∪ video.
- * Cluster binds only QQ 车载 / HD / 汽水 via [AvMediaArbiter.pickClusterSource]
- * (whoever among them is PLAYING), independent of whether video co-plays.
+ * Single-sounder via [AvMediaArbiter.enforceSingleSounder] (shared with split restore).
+ * Cluster binds only QQ 车载 / HD / 汽水 while that trio is PLAYING; when video wins
+ * the speaker, preferred music is paused and cluster clears.
  * Runs in system_server after
  * [io.github.nitsuya.aa.display.xposed.CoreManagerService.systemReady].
  */
@@ -258,10 +258,13 @@ object ClusterLyricMirror {
     private fun onSessionsChanged(sessions: List<MediaController>?) {
         val ctx = appContext
         val layout = stackLayout()
-        // Audio ∪ video: one sounder. Cluster follows preferred music only.
-        val sounder = pickSounder(sessions)
-        if (ctx != null) {
-            AvMediaArbiter.pauseLosers(ctx, sessions, sounder)
+        // Audio ∪ video: one sounder (shared entry + throttle with SplitBuriedPlayback).
+        // force=false: skip pause when already ≤1 PLAYING — list churn must not thrash
+        // auto-resume apps; restore/promote still force via SplitBuriedPlayback.
+        val sounder = if (ctx != null) {
+            AvMediaArbiter.enforceSingleSounder(ctx, sessions, layout, force = false)
+        } else {
+            null
         }
         val pick = resolveClusterPick(sessions, sounder)
         if (pick == null) {
@@ -321,8 +324,9 @@ object ClusterLyricMirror {
     }
 
     /**
-     * Lyric-trio source for cluster bind — decoupled from [AvMediaArbiter.pickWinner].
-     * When QQ / 汽水 is PLAYING, cluster follows it even if video owns or shares AvMedia.
+     * Lyric-trio source for cluster bind.
+     * After [AvMediaArbiter.enforceSingleSounder], at most one AvMedia is PLAYING —
+     * if that is QQ/汽水, bind it; if video won, preferred are paused and this is null.
      */
     private fun resolveClusterPick(
         sessions: List<MediaController>?,

@@ -40,6 +40,15 @@ class CarPlayAacAudioEgress(
     private val running = AtomicBoolean(false)
     @Volatile private var worker: Thread? = null
     @Volatile private var txSocket: DatagramSocket? = null
+    /** One encoded silence frame reused on empty pulls (must not block MediaCodec). */
+    @Volatile private var silenceAu: ByteArray? = null
+
+    /**
+     * Optional hook when the RTP pacer falls far behind (~500ms). Kept for diagnostics;
+     * RtspSession intentionally leaves this null — posting modesChanged during a gap
+     * latches Audi MainAudio mute while AAC still flows.
+     */
+    @Volatile var onCadenceGap: (() -> Unit)? = null
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
@@ -119,14 +128,21 @@ class CarPlayAacAudioEgress(
                     val ms = sleepNs / 1_000_000L
                     val ns = (sleepNs % 1_000_000L).toInt()
                     Thread.sleep(ms, ns)
-                } else if (sleepNs < -frameNs * 8) {
+                } else if (sleepNs < -frameNs * REALIGN_FRAMES) {
+                    // Far behind: snap clock + ask session to reclaim MainAudio async.
+                    // Do NOT call modesChanged here — sync control I/O freezes this thread.
                     nextSendAt = System.nanoTime()
                     Log.i(
                         CarPlayConsts.TAG,
                         "CarPlay AAC cadence realign behindMs=${-sleepNs / 1_000_000L} " +
                             "packet=$packets q=${pendingAus.size}",
                     )
+                    runCatching { onCadenceGap?.invoke() }
+                        .onFailure { e ->
+                            Log.w(CarPlayConsts.TAG, "onCadenceGap failed", e)
+                        }
                 }
+                // Mildly behind: skip sleep and send ASAP to catch up (no clock snap).
 
                 if (pendingAus.size < 2) {
                     val got = try {
@@ -146,8 +162,17 @@ class CarPlayAacAudioEgress(
                 }
 
                 if (pendingAus.isEmpty()) {
-                    Thread.sleep(2)
-                    continue
+                    // Cached silence AU — avoid MediaCodec on the empty path (was a stall source).
+                    val silent = silenceAu
+                        ?: encoder.encode(ByteArray(frameBytes), frameBytes).firstOrNull()?.also {
+                            silenceAu = it
+                        }
+                    if (silent != null) {
+                        pendingAus.addLast(silent)
+                    } else {
+                        Thread.sleep(2)
+                        continue
+                    }
                 }
 
                 val au = pendingAus.removeFirst()
@@ -308,9 +333,9 @@ class CarPlayAacAudioEgress(
             var off = 0
             while (off < usable) {
                 val inIdx = try {
-                    // Must not block the RTP pacer. A 10s wait here starves the HU
-                    // jitter buffer (underrun → 杂音 → silence) while PCM piles up.
-                    c.dequeueInputBuffer(2_000L)
+                    // Must not block the RTP pacer. Even 2ms×N can stack into a ~300ms
+                    // hole (seen: cadence realign behindMs=285 → Audi latches mute).
+                    c.dequeueInputBuffer(INPUT_DEQUEUE_TIMEOUT_US)
                 } catch (_: Throwable) {
                     break
                 }
@@ -399,6 +424,10 @@ class CarPlayAacAudioEgress(
         private const val MAX_AU = 1400
         /** ~85 ms @ 48 kHz. Above this, stop pulling so encode cannot outrun the pacer. */
         private const val MAX_QUEUED_AUS = 4
+        /** dequeueInputBuffer wait — keep short so a stalled encoder cannot open a 300ms RTP hole. */
+        private const val INPUT_DEQUEUE_TIMEOUT_US = 500L
+        /** ~500ms @ 48 kHz — snap clock + async reclaim only past this. */
+        private const val REALIGN_FRAMES = 24
 
         const val AUDIO_FORMAT_AAC_LC_44100_STEREO = 4_194_304L // 0x400000
         const val AUDIO_FORMAT_AAC_LC_48000_STEREO = 8_388_608L // 0x800000
