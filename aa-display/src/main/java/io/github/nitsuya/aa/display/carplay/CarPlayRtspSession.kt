@@ -1827,8 +1827,8 @@ class CarPlayRtspSession(
             accessoryHidUuids.addAll(hidUuids.distinct())
             Log.i(CarPlayConsts.TAG, "accessory /info hidDevices uuids=$accessoryHidUuids")
         }
-        // Prefer 48 kHz AAC (matches our capture); fall back to 44.1 if that is all
-        // the HU advertises under type=102 media.
+        // MIB3: always SETUP 48 kHz AAC-LC stereo — matches CarPlayAudioCapture and
+        // avoids 44.1 encode vs 48 kHz PCM (no resampler). Audi advertises 48k.
         val formats = root["audioFormats"] as? List<*>
         var saw48 = false
         var saw44 = false
@@ -1846,15 +1846,13 @@ class CarPlayRtspSession(
                 saw44 = true
             }
         }
-        when {
-            saw48 -> {
-                accessoryAacSampleRate = 48_000
-                accessoryAacFormatBit = CarPlayAacAudioEgress.AUDIO_FORMAT_AAC_LC_48000_STEREO
-            }
-            saw44 -> {
-                accessoryAacSampleRate = 44_100
-                accessoryAacFormatBit = CarPlayAacAudioEgress.AUDIO_FORMAT_AAC_LC_44100_STEREO
-            }
+        accessoryAacSampleRate = 48_000
+        accessoryAacFormatBit = CarPlayAacAudioEgress.AUDIO_FORMAT_AAC_LC_48000_STEREO
+        if (!saw48 && saw44) {
+            Log.w(
+                CarPlayConsts.TAG,
+                "accessory /info AAC media only saw 44.1 — forcing 48 kHz to match capture",
+            )
         }
         Log.i(
             CarPlayConsts.TAG,

@@ -13,7 +13,10 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -25,9 +28,9 @@ import kotlin.concurrent.thread
  * Wire matches CSM [AudioRtpSender]: RTP PT=102, ChaCha20-Poly1305 over the AAC
  * access unit, AAD = RTP timestamp+SSRC, trailing 8-byte LE nonce.
  *
- * Cadence is locked to 1024 samples / sampleRate (≈21.3 ms @ 48 kHz). Bursting
- * AUs as fast as the encoder produced them (plus zero-padding short PCM pulls)
- * made the HU jitter buffer thrash → audible 杂音 even though the stream played.
+ * Encode and RTP pacing run on separate threads so MediaCodec / Binder stalls cannot
+ * tear the 1024-sample RTP timeline (that underrun used to become 杂音 then silence).
+ * Cadence stays locked to 1024 samples / sampleRate (≈21.3 ms @ 48 kHz).
  */
 class CarPlayAacAudioEgress(
     private val host: InetAddress,
@@ -38,10 +41,17 @@ class CarPlayAacAudioEgress(
     private val formatBit: Long,
 ) {
     private val running = AtomicBoolean(false)
-    @Volatile private var worker: Thread? = null
+    @Volatile private var encodeWorker: Thread? = null
+    @Volatile private var txWorker: Thread? = null
     @Volatile private var txSocket: DatagramSocket? = null
-    /** One encoded silence frame reused on empty pulls (must not block MediaCodec). */
+    /** One encoded silence frame reused when the AU queue is empty. */
     @Volatile private var silenceAu: ByteArray? = null
+    private val auQueue = ArrayBlockingQueue<ByteArray>(MAX_QUEUED_AUS)
+
+    private val silenceSends = AtomicInteger(0)
+    private val realignCount = AtomicInteger(0)
+    private val peakBehindMs = AtomicLong(0L)
+    private val pulledBytes = AtomicLong(0L)
 
     /**
      * Optional hook when the RTP pacer falls far behind (~500ms). Kept for diagnostics;
@@ -57,7 +67,8 @@ class CarPlayAacAudioEgress(
         } catch (e: Throwable) {
             Log.w(CarPlayConsts.TAG, "setCarPlayAudioEgressEnabled(true) failed", e)
         }
-        worker = thread(name = "carplay-audio-aac", isDaemon = true) { pump() }
+        encodeWorker = thread(name = "carplay-audio-aac-enc", isDaemon = true) { encodeLoop() }
+        txWorker = thread(name = "carplay-audio-aac-tx", isDaemon = true) { txLoop() }
         Log.i(
             CarPlayConsts.TAG,
             "CarPlay AAC media TX → $host:$dataPort control=$controlPort " +
@@ -72,22 +83,22 @@ class CarPlayAacAudioEgress(
         } catch (_: Throwable) {
         }
         txSocket = null
-        worker?.interrupt()
-        worker = null
+        encodeWorker?.interrupt()
+        txWorker?.interrupt()
+        encodeWorker = null
+        txWorker = null
+        auQueue.clear()
         Log.i(CarPlayConsts.TAG, "CarPlay AAC media TX stopped")
     }
 
-    private fun pump() {
-        val socket = CarPlayAccessoryNet.openUdp()
-        txSocket = socket
-        val target = InetSocketAddress(host, dataPort)
+    private fun encodeLoop() {
         val encoder = AacEncoder(sampleRate, CHANNELS, BITRATE)
         if (!encoder.start()) {
             Log.e(CarPlayConsts.TAG, "AAC encoder start failed — no media audio")
             running.set(false)
-            socket.close()
             return
         }
+        val frameBytes = SAMPLES_PER_FRAME * CHANNELS * 2
         // Drop capture filled before TX arm so the first AU is live.
         repeat(8) {
             val got = try {
@@ -97,6 +108,65 @@ class CarPlayAacAudioEgress(
             }
             if (got.isEmpty()) return@repeat
         }
+        // Warm silence AU once — AAC-LC usually needs a few frames before the
+        // first AU appears. TX must never call MediaCodec.
+        val zeros = ByteArray(frameBytes)
+        repeat(8) {
+            val au = encoder.encodeExactFrame(zeros)
+            if (au != null && silenceAu == null) silenceAu = au
+        }
+        if (silenceAu == null) {
+            Log.w(CarPlayConsts.TAG, "AAC silence AU warm-up failed")
+        }
+        val accum = ByteArray(frameBytes)
+        var accumLen = 0
+        val pullCap = frameBytes * 2
+        try {
+            while (running.get()) {
+                // Back-pressure: do not pull when the pacer already has a full queue.
+                if (auQueue.remainingCapacity() == 0) {
+                    Thread.sleep(2)
+                    continue
+                }
+                val got = try {
+                    CoreApi.pullCarPlayAudio(pullCap)
+                } catch (_: Throwable) {
+                    ByteArray(0)
+                }
+                if (got.isEmpty()) {
+                    Thread.sleep(2)
+                    continue
+                }
+                pulledBytes.addAndGet(got.size.toLong())
+                var off = 0
+                while (off < got.size && running.get()) {
+                    val need = frameBytes - accumLen
+                    val n = minOf(need, got.size - off)
+                    System.arraycopy(got, off, accum, accumLen, n)
+                    accumLen += n
+                    off += n
+                    if (accumLen < frameBytes) break
+                    val au = encoder.encodeExactFrame(accum)
+                    accumLen = 0
+                    if (au == null) continue
+                    // Drop oldest if full so live audio wins over stale AUs.
+                    while (!auQueue.offer(au)) {
+                        auQueue.poll() ?: break
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            if (running.get()) Log.w(CarPlayConsts.TAG, "CarPlay AAC encode ended", e)
+        } finally {
+            encoder.close()
+            Log.i(CarPlayConsts.TAG, "CarPlay AAC encode thread done pulled=${pulledBytes.get() / 1024}KB")
+        }
+    }
+
+    private fun txLoop() {
+        val socket = CarPlayAccessoryNet.openUdp()
+        txSocket = socket
+        val target = InetSocketAddress(host, dataPort)
         val cipher = Cipher.getInstance("ChaCha20-Poly1305")
         val rtp = ByteArray(12)
         val aad = ByteArray(8)
@@ -104,11 +174,7 @@ class CarPlayAacAudioEgress(
         // CSM increments before first seal → first nonce counter = 1.
         var nonceCounter = 1L
         var packets = 0
-        var pulled = 0L
         val ssrc = 0
-        val frameBytes = SAMPLES_PER_FRAME * CHANNELS * 2
-        val pullBuf = ByteArray(frameBytes * 2)
-        val pendingAus = ArrayDeque<ByteArray>()
         val frameNs = SAMPLES_PER_FRAME * 1_000_000_000L / sampleRate
         var nextSendAt = System.nanoTime()
         CarPlayMediaClock.ensureRunning()
@@ -119,9 +185,6 @@ class CarPlayAacAudioEgress(
         var rtpTimestamp = CarPlayMediaClock.rtpTimestamp(sampleRate)
         try {
             while (running.get()) {
-                // Pace before encode. Encoding first ate the 21ms slot, the thread
-                // stayed >1 frame late, and dropping those AUs opened a hole. Audi
-                // then keeps the mixer silent while RTP continues.
                 val now = System.nanoTime()
                 val sleepNs = nextSendAt - now
                 if (sleepNs > 0L) {
@@ -129,13 +192,14 @@ class CarPlayAacAudioEgress(
                     val ns = (sleepNs % 1_000_000L).toInt()
                     Thread.sleep(ms, ns)
                 } else if (sleepNs < -frameNs * REALIGN_FRAMES) {
-                    // Far behind: snap clock + ask session to reclaim MainAudio async.
-                    // Do NOT call modesChanged here — sync control I/O freezes this thread.
+                    val behindMs = -sleepNs / 1_000_000L
                     nextSendAt = System.nanoTime()
+                    realignCount.incrementAndGet()
+                    peakBehindMs.updateAndGet { maxOf(it, behindMs) }
                     Log.i(
                         CarPlayConsts.TAG,
-                        "CarPlay AAC cadence realign behindMs=${-sleepNs / 1_000_000L} " +
-                            "packet=$packets q=${pendingAus.size}",
+                        "CarPlay AAC cadence realign behindMs=$behindMs " +
+                            "packet=$packets q=${auQueue.size}",
                     )
                     runCatching { onCadenceGap?.invoke() }
                         .onFailure { e ->
@@ -144,38 +208,19 @@ class CarPlayAacAudioEgress(
                 }
                 // Mildly behind: skip sleep and send ASAP to catch up (no clock snap).
 
-                if (pendingAus.size < 2) {
-                    val got = try {
-                        CoreApi.pullCarPlayAudio(pullBuf.size)
-                    } catch (_: Throwable) {
-                        ByteArray(0)
-                    }
-                    if (got.isNotEmpty()) {
-                        pulled += got.size
-                        for (au in encoder.encode(got, got.size)) {
-                            pendingAus.addLast(au)
-                        }
-                    }
-                }
-                while (pendingAus.size > MAX_QUEUED_AUS) {
-                    pendingAus.removeFirst()
-                }
-
-                if (pendingAus.isEmpty()) {
-                    // Cached silence AU — avoid MediaCodec on the empty path (was a stall source).
-                    val silent = silenceAu
-                        ?: encoder.encode(ByteArray(frameBytes), frameBytes).firstOrNull()?.also {
-                            silenceAu = it
-                        }
-                    if (silent != null) {
-                        pendingAus.addLast(silent)
-                    } else {
+                var au = auQueue.poll()
+                var usedSilence = false
+                if (au == null) {
+                    au = silenceAu
+                    usedSilence = au != null
+                    if (au == null) {
+                        // Encode warm-up not ready yet.
                         Thread.sleep(2)
                         continue
                     }
+                    silenceSends.incrementAndGet()
                 }
 
-                val au = pendingAus.removeFirst()
                 var payload = stripAdtsIfPresent(au)
                 if (payload.size > MAX_AU) {
                     Log.w(CarPlayConsts.TAG, "AAC AU too large ${payload.size}B — drop")
@@ -228,20 +273,27 @@ class CarPlayAacAudioEgress(
                         CarPlayConsts.TAG,
                         "CarPlay AAC packet=$packets au=${payload.size}B " +
                             "wire=${datagram.size}B ts=$ts head=$head " +
-                            "pulled=${pulled / 1024}KB q=${pendingAus.size}",
+                            "pulled=${pulledBytes.get() / 1024}KB q=${auQueue.size} " +
+                            "silence=${silenceSends.get()} realign=${realignCount.get()} " +
+                            "peakBehindMs=${peakBehindMs.get()}" +
+                            if (usedSilence) " (silence)" else "",
                     )
                 }
             }
         } catch (e: Throwable) {
             if (running.get()) Log.w(CarPlayConsts.TAG, "CarPlay AAC TX ended", e)
         } finally {
-            encoder.close()
             if (txSocket === socket) txSocket = null
             try {
                 socket.close()
             } catch (_: Throwable) {
             }
-            Log.i(CarPlayConsts.TAG, "CarPlay AAC TX thread done packets=$packets")
+            Log.i(
+                CarPlayConsts.TAG,
+                "CarPlay AAC TX thread done packets=$packets " +
+                    "silence=${silenceSends.get()} realign=${realignCount.get()} " +
+                    "peakBehindMs=${peakBehindMs.get()}",
+            )
         }
     }
 
@@ -264,17 +316,24 @@ class CarPlayAacAudioEgress(
     ) {
         private val bufferInfo = MediaCodec.BufferInfo()
         private var codec: MediaCodec? = null
-        private var carry = ByteArray(0)
         private var queuedSamples = 0L
         private var closed = false
+        private val framePcmBytes = SAMPLES_PER_FRAME * channels * 2
+        /** AUs produced ahead of the 1:1 PCM→AU call (encoder delay / burst). */
+        private val pendingAus = ArrayDeque<ByteArray>()
 
         fun start(): Boolean {
             return try {
                 try {
-                    startWithProfile(true)
+                    startWithProfile(lc = true, cbr = true)
                 } catch (_: Throwable) {
                     release()
-                    startWithProfile(false)
+                    try {
+                        startWithProfile(lc = true, cbr = false)
+                    } catch (_: Throwable) {
+                        release()
+                        startWithProfile(lc = false, cbr = false)
+                    }
                 }
                 Log.i(
                     CarPlayConsts.TAG,
@@ -288,14 +347,14 @@ class CarPlayAacAudioEgress(
             }
         }
 
-        private fun startWithProfile(lc: Boolean) {
+        private fun startWithProfile(lc: Boolean, cbr: Boolean) {
             val format = MediaFormat.createAudioFormat(
                 MediaFormat.MIMETYPE_AUDIO_AAC,
                 sampleRate,
                 channels,
             )
             format.setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 65_536)
+            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, framePcmBytes)
             // Raw AAC access units (no ADTS). CarPlay type-102 expects this.
             format.setInteger(MediaFormat.KEY_IS_ADTS, 0)
             if (lc) {
@@ -304,75 +363,69 @@ class CarPlayAacAudioEgress(
                     MediaCodecInfo.CodecProfileLevel.AACObjectLC,
                 )
             }
+            if (cbr) {
+                format.setInteger(
+                    MediaFormat.KEY_BITRATE_MODE,
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR,
+                )
+            }
             val c = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
             c.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             c.start()
             codec = c
         }
 
-        fun encode(pcm: ByteArray, length: Int): List<ByteArray> {
-            val out = ArrayList<ByteArray>()
-            val c = codec ?: return out
-            if (closed || length <= 0) return out
-            var buf = pcm
-            var len = length
-            if (carry.isNotEmpty()) {
-                val merged = ByteArray(carry.size + len)
-                System.arraycopy(carry, 0, merged, 0, carry.size)
-                System.arraycopy(pcm, 0, merged, carry.size, len)
-                carry = ByteArray(0)
-                buf = merged
-                len = merged.size
+        /**
+         * Feed exactly one AAC frame (1024 stereo samples). Returns one AU when
+         * available (may be null while the encoder is still priming). Encode-thread only.
+         */
+        fun encodeExactFrame(pcm: ByteArray): ByteArray? {
+            val c = codec ?: return null
+            if (closed || pcm.size < framePcmBytes) return null
+            // Encode thread may wait — RTP pacer is separate, so this cannot open an RTP hole.
+            val inIdx = try {
+                c.dequeueInputBuffer(INPUT_DEQUEUE_TIMEOUT_US)
+            } catch (_: Throwable) {
+                return pendingAus.removeFirstOrNull()
             }
-            val frameBytes = channels * 2
-            // Only feed whole PCM frames; keep the remainder for the next call.
-            val usable = len - (len % frameBytes)
-            if (usable < len) {
-                carry = buf.copyOfRange(usable, len)
+            if (inIdx < 0) {
+                // Input stuck: still emit any primed AU so TX keeps getting real frames.
+                drainAvailable()
+                return pendingAus.removeFirstOrNull()
             }
-            var off = 0
-            while (off < usable) {
-                val inIdx = try {
-                    // Must not block the RTP pacer. Even 2ms×N can stack into a ~300ms
-                    // hole (seen: cadence realign behindMs=285 → Audi latches mute).
-                    c.dequeueInputBuffer(INPUT_DEQUEUE_TIMEOUT_US)
-                } catch (_: Throwable) {
-                    break
+            val input = c.getInputBuffer(inIdx) ?: return pendingAus.removeFirstOrNull()
+            input.clear()
+            input.put(pcm, 0, framePcmBytes)
+            c.queueInputBuffer(inIdx, 0, framePcmBytes, ptsUs(), 0)
+            queuedSamples += SAMPLES_PER_FRAME
+            val deadline = System.nanoTime() + ENCODE_DRAIN_BUDGET_NS
+            while (!closed && System.nanoTime() < deadline) {
+                val produced = drainAvailable()
+                if (produced == 0 && pendingAus.isNotEmpty()) break
+                if (produced == 0) {
+                    try {
+                        Thread.sleep(0, 200_000) // 0.2 ms
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
                 }
-                if (inIdx < 0) {
-                    // Prepend leftover usable bytes back onto carry.
-                    val left = buf.copyOfRange(off, usable)
-                    carry = if (carry.isEmpty()) left else left + carry
-                    break
-                }
-                val input = c.getInputBuffer(inIdx) ?: break
-                input.clear()
-                // Prefer one AAC frame (1024 samples) per queue — matches CSM spf=1024.
-                val want = minOf(input.remaining(), usable - off, SAMPLES_PER_FRAME * frameBytes)
-                val n = want - (want % frameBytes)
-                if (n <= 0) {
-                    c.queueInputBuffer(inIdx, 0, 0, ptsUs(), 0)
-                    break
-                }
-                input.put(buf, off, n)
-                c.queueInputBuffer(inIdx, 0, n, ptsUs(), 0)
-                queuedSamples += n / frameBytes
-                off += n
             }
-            drain(out)
-            return out
+            drainAvailable()
+            return pendingAus.removeFirstOrNull()
         }
 
-        private fun drain(out: MutableList<ByteArray>) {
-            val c = codec ?: return
+        private fun drainAvailable(): Int {
+            val c = codec ?: return 0
+            var n = 0
             while (!closed) {
                 val outIdx = try {
                     c.dequeueOutputBuffer(bufferInfo, 0L)
                 } catch (_: Throwable) {
-                    return
+                    return n
                 }
                 when {
-                    outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> return
+                    outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> return n
                     outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> continue
                     outIdx < 0 -> continue
                     else -> {
@@ -380,19 +433,21 @@ class CarPlayAacAudioEgress(
                             if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
                                 continue
                             }
-                            val output = c.getOutputBuffer(outIdx) ?: continue
                             if (bufferInfo.size <= 0) continue
+                            val output = c.getOutputBuffer(outIdx) ?: continue
                             val au = ByteArray(bufferInfo.size)
                             output.position(bufferInfo.offset)
                             output.limit(bufferInfo.offset + bufferInfo.size)
                             output.get(au)
-                            out.add(au)
+                            pendingAus.addLast(au)
+                            n++
                         } finally {
                             c.releaseOutputBuffer(outIdx, false)
                         }
                     }
                 }
             }
+            return n
         }
 
         private fun ptsUs(): Long = (queuedSamples * 1_000_000L) / sampleRate
@@ -400,6 +455,7 @@ class CarPlayAacAudioEgress(
         fun close() {
             if (closed) return
             closed = true
+            pendingAus.clear()
             release()
         }
 
@@ -422,10 +478,12 @@ class CarPlayAacAudioEgress(
         private const val SAMPLES_PER_FRAME = 1024
         private const val RTP_PT = 102
         private const val MAX_AU = 1400
-        /** ~85 ms @ 48 kHz. Above this, stop pulling so encode cannot outrun the pacer. */
+        /** ~85 ms @ 48 kHz. Above this, encode back-pressures instead of bursting. */
         private const val MAX_QUEUED_AUS = 4
-        /** dequeueInputBuffer wait — keep short so a stalled encoder cannot open a 300ms RTP hole. */
-        private const val INPUT_DEQUEUE_TIMEOUT_US = 500L
+        /** Encode-thread only — can wait longer without opening an RTP hole. */
+        private const val INPUT_DEQUEUE_TIMEOUT_US = 20_000L
+        /** Budget to wait for one AU after queueing a full PCM frame. */
+        private const val ENCODE_DRAIN_BUDGET_NS = 12_000_000L
         /** ~500ms @ 48 kHz — snap clock + async reclaim only past this. */
         private const val REALIGN_FRAMES = 24
 

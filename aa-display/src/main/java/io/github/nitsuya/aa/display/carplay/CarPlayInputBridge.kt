@@ -37,6 +37,14 @@ object CarPlayInputBridge {
     @Volatile
     var fullscreenPane: Int = SplitPane.FULLSCREEN_NONE
 
+    /**
+     * Fullscreen peel drag in progress — GL draws AA-style clip drawer preview
+     * (both full-size panes scissored) instead of a single fullscreen pane.
+     * [primaryRatio] is the live finger seam while this is true.
+     */
+    @Volatile
+    var peelPreviewActive: Boolean = false
+
     /** Half-width of the divider-strip hit zone, as a fraction of shell width. */
     private const val DIVIDER_ZONE = 0.04f
     /** Peel tab hit band at the left edge while fullscreen (fraction of width). */
@@ -129,6 +137,7 @@ object CarPlayInputBridge {
                 }
                 if (!chromeArmed) return false
                 chromeDragging = false
+                peelPreviewActive = false
                 chromeDownX = x
                 chromeDownAt = SystemClock.uptimeMillis()
                 ratioAtDown = primaryRatio.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO)
@@ -149,9 +158,11 @@ object CarPlayInputBridge {
                 }
                 if (chromeDragging) {
                     if (inFullscreen) {
-                        // Inward peel preview: map left-edge drag to an exit ratio hint.
-                        primaryRatio = x.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO)
+                        // Inward peel preview: finger X = seam; GL clips both full panes.
+                        primaryRatio = x.coerceIn(0f, 1f)
+                        peelPreviewActive = true
                     } else {
+                        peelPreviewActive = false
                         previewRatio(x)
                     }
                 }
@@ -166,6 +177,7 @@ object CarPlayInputBridge {
                 val ratioDelta = abs(x - ratioAtDown)
                 val wasDragging = chromeDragging
                 chromeDragging = false
+                peelPreviewActive = false
 
                 if (inFullscreen) {
                     handlePeelUp(x, heldMs, dist, wasDragging, action == MotionEvent.ACTION_CANCEL)
@@ -216,15 +228,18 @@ object CarPlayInputBridge {
         cancelled: Boolean,
     ) {
         if (cancelled) {
-            // Keep fullscreen; compositor reads fullscreenPane.
+            // Keep fullscreen; snap seam back so the next peel starts from stored ratio.
+            primaryRatio = ratioAtDown
             return
         }
         if (SplitPane.qualifiesDividerLongPress(false, heldMs) && dist <= DRAG_SLOP * 3f) {
+            primaryRatio = ratioAtDown
             CarPlayRecentsOverlay.open()
             return
         }
         if (!wasDragging && heldMs <= SplitPane.DIVIDER_TAP_SWAP_MAX_MS && dist <= DRAG_SLOP) {
             // Tap peel → flip visible fullscreen pane (AA peel tap).
+            primaryRatio = ratioAtDown
             val other = if (fullscreenPane == SplitPane.PRIMARY) {
                 SplitPane.SECONDARY
             } else {
@@ -235,6 +250,9 @@ object CarPlayInputBridge {
         }
         if (wasDragging && x > SplitPane.FULLSCREEN_EXIT_RATIO) {
             exitFullscreen(x.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO))
+        } else if (wasDragging) {
+            // Below exit threshold — same as AA onPeelCancelled: stay FS, restore ratio.
+            primaryRatio = ratioAtDown
         }
     }
 

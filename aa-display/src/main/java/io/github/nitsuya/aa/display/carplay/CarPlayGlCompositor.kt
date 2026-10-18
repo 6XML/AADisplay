@@ -435,11 +435,30 @@ class CarPlayGlCompositor {
 
         val fs = CarPlayInputBridge.fullscreenPane
         val seamX: Int
-        if (SplitPane.isFullscreenPane(fs)) {
+        val chromeFullscreen: Boolean
+        if (SplitPane.isFullscreenPane(fs) && CarPlayInputBridge.peelPreviewActive) {
+            // AA peel drawer: both VDs stay full-size; scissor reveals L/R strips.
+            // Do not scale into strips (that is split-mode preview).
+            val ratio = CarPlayInputBridge.primaryRatio.coerceIn(0f, 1f)
+            val gap = SplitPane.dividerPx(densityDpi)
+            val usable = (encodeWidth - gap).coerceAtLeast(2)
+            val leftW = (usable * ratio).toInt().coerceIn(0, usable)
+            val rightW = (usable - leftW).coerceAtLeast(0)
+            applyPaneBufferSize(0, encodeWidth, encodeHeight)
+            applyPaneBufferSize(1, encodeWidth, encodeHeight)
+            drawPeelClipPreview(leftW, gap, rightW)
+            seamX = leftW + gap / 2
+            // Morph peel tab → full split seam while dragging (AA setPeelDragSplitVisual).
+            chromeFullscreen = false
+        } else if (SplitPane.isFullscreenPane(fs)) {
+            // Both VDs stay full-size while fullscreen (AA dual full buffers) so peel
+            // can reveal the buried pane without a first-frame buffer resize flash.
+            applyPaneBufferSize(0, encodeWidth, encodeHeight)
+            applyPaneBufferSize(1, encodeWidth, encodeHeight)
             val paneIdx = if (fs == SplitPane.PRIMARY) 0 else 1
-            applyPaneBufferSize(paneIdx, encodeWidth, encodeHeight)
             drawPane(paneIdx, 0, 0, encodeWidth, encodeHeight)
             seamX = -1
+            chromeFullscreen = true
         } else {
             val ratio = CarPlayInputBridge.primaryRatio.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO)
             val gap = SplitPane.dividerPx(densityDpi)
@@ -450,8 +469,9 @@ class CarPlayGlCompositor {
             drawPane(0, 0, 0, leftW, encodeHeight)
             drawPane(1, leftW + gap, 0, rightW, encodeHeight)
             seamX = leftW + gap / 2
+            chromeFullscreen = false
         }
-        drawChromeLayer(seamX, SplitPane.isFullscreenPane(fs))
+        drawChromeLayer(seamX, chromeFullscreen)
 
         // Shared media clock (not frameIndex): audio RTP uses the same epoch so DiPlay
         // can keep lip-sync when audio SETUP starts after the encoder is already running.
@@ -462,6 +482,28 @@ class CarPlayGlCompositor {
         if (window.swapBuffers()) {
             deliveredFrames.incrementAndGet()
         }
+    }
+
+    /**
+     * Fullscreen peel drag preview: draw both panes at full encode size and
+     * scissor to L/R strips (matches AA [AaMainFragment.applyPeelClipPreview]).
+     * Window scissor origin is bottom-left.
+     */
+    private fun drawPeelClipPreview(leftW: Int, gap: Int, rightW: Int) {
+        GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+        if (leftW > 0) {
+            GLES20.glScissor(0, 0, leftW, encodeHeight)
+            drawPane(0, 0, 0, encodeWidth, encodeHeight)
+        }
+        if (rightW > 0) {
+            val x = (leftW + gap).coerceAtMost(encodeWidth)
+            val w = rightW.coerceAtMost((encodeWidth - x).coerceAtLeast(0))
+            if (w > 0) {
+                GLES20.glScissor(x, 0, w, encodeHeight)
+                drawPane(1, 0, 0, encodeWidth, encodeHeight)
+            }
+        }
+        GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
     }
 
     private fun drawPane(pane: Int, x: Int, y: Int, w: Int, h: Int) {
