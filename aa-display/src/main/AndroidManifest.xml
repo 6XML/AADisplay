@@ -71,6 +71,7 @@
             android:exported="false"
             android:excludeFromRecents="true"
             android:launchMode="singleTask"
+            android:taskAffinity="io.github.nitsuya.aa.display.carplay.host"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
         <service
             android:name=".service.AaActivityService"

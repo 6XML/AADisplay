@@ -34,10 +34,14 @@ class CarPlayProjectionService : Service() {
             sessionRef.get()?.attachGlCompositor(compositor)
         }
 
-        fun start(context: Context) {
-            val i = Intent(context, CarPlayProjectionService::class.java).setAction(CarPlayConsts.ACTION_CONNECT)
+        fun start(context: Context, launchHostTrampoline: Boolean = true) {
+            val i = Intent(context, CarPlayProjectionService::class.java)
+                .setAction(CarPlayConsts.ACTION_CONNECT)
+                .putExtra(EXTRA_LAUNCH_HOST_TRAMPOLINE, launchHostTrampoline)
             context.startForegroundService(i)
         }
+
+        private const val EXTRA_LAUNCH_HOST_TRAMPOLINE = "launchHostTrampoline"
 
         fun stop(context: Context) {
             val i = Intent(context, CarPlayProjectionService::class.java).setAction(CarPlayConsts.ACTION_STOP)
@@ -60,13 +64,14 @@ class CarPlayProjectionService : Service() {
             CarPlayConsts.ACTION_CONNECT -> {
                 CarPlayChannel.set(this, CarPlayChannel.CHANNEL_CARPLAY)
                 ensureForeground()
-                ensureSession()
+                val launchHost = intent.getBooleanExtra(EXTRA_LAUNCH_HOST_TRAMPOLINE, true)
+                ensureSession(launchHostTrampoline = launchHost)
             }
             // System restart / sticky re-delivery: only re-arm when the user chose CarPlay.
             else -> {
                 if (CarPlayChannel.useCarPlayEgress(this)) {
                     ensureForeground()
-                    ensureSession()
+                    ensureSession(launchHostTrampoline = true)
                 } else {
                     tearDown("channel-aa")
                     stopSelf()
@@ -110,7 +115,7 @@ class CarPlayProjectionService : Service() {
         }
     }
 
-    private fun ensureSession() {
+    private fun ensureSession(launchHostTrampoline: Boolean = true) {
         if (session != null) {
             // Mark live before any soft-reconnect create so Coolwalk rail settle
             // cannot shrink CarPlay VDs under the encode canvas.
@@ -133,7 +138,11 @@ class CarPlayProjectionService : Service() {
             s.attachGlCompositor(it)
         }
         s.start()
-        CarPlayHostActivity.launch(this)
+        // Skip when status page already armed us — trampoline + moveTaskToBack must not
+        // steal the UI task (see CarPlayHostActivity taskAffinity).
+        if (launchHostTrampoline) {
+            CarPlayHostActivity.launch(this)
+        }
     }
 
     private fun tearDown(reason: String) {

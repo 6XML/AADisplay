@@ -2,6 +2,10 @@ package io.github.nitsuya.aa.display.carplay.protocol
 
 import android.util.Log
 import io.github.nitsuya.aa.display.carplay.CarPlayConsts
+import io.github.nitsuya.aa.display.carplay.profile.CarPlayHuProfile
+import io.github.nitsuya.aa.display.carplay.profile.CarPlayProfileRegistry
+import io.github.nitsuya.aa.display.carplay.profile.CarPlayProfileResolver
+import io.github.nitsuya.aa.display.carplay.profile.CarPlaySourceIdentity
 import io.github.nitsuya.aa.display.carplay.protocol.Iap2Framing.CONTROL_ACK
 import io.github.nitsuya.aa.display.carplay.protocol.Iap2Framing.CONTROL_SYN
 import io.github.nitsuya.aa.display.carplay.protocol.Iap2Framing.LinkSyncPayload
@@ -11,7 +15,7 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Source-role (device / fake-iPhone) iAP2 state machine over RFCOMM.
+ * Source-role (device / spoofed handset) iAP2 state machine over RFCOMM.
  *
  * Against a HU / diplay receiver:
  * 1. Detect (`FF 55 02 00 EE 10`)
@@ -20,6 +24,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 4. Accessory authentication (`0xAA00`…`0xAA05`)
  * 5. Wireless handoff: transport id / `0x4E0D` / `0x5702` / `0x4300` →
  *    `0x5703` Wi-Fi creds and/or `0x4301` CarPlayStartSession (media TCP follows)
+ *
+ * Phone strings come from [sourceIdentity]; HU wireless path from [huProfile]
+ * (resolved via [CarPlayProfileResolver], not vendor name checks in this class).
  */
 class Iap2Session(
     private val sendRaw: (ByteArray) -> Unit,
@@ -31,6 +38,8 @@ class Iap2Session(
     private val onCarPlayStart: ((Iap2Csm.CarPlayStart) -> Unit)? = null,
     private val onNowPlayingUpdates: (() -> Unit)? = null,
     private val onFileTransferDatagram: ((ByteArray) -> Unit)? = null,
+    private val sourceIdentity: CarPlaySourceIdentity = CarPlayProfileRegistry.defaultSource(),
+    private val onHuProfileChanged: ((CarPlayHuProfile) -> Unit)? = null,
 ) {
     private enum class State {
         Idle,
@@ -71,8 +80,8 @@ class Iap2Session(
     private val wirelessStarted = AtomicBoolean(false)
     private var pendingChallenge: ByteArray? = null
     private var transportUsers = 0
-    /** Audi / MIB3: cert request and 20-byte challenge go out together. */
-    private var mib3 = false
+    /** MIB3-style: cert request and 20-byte challenge go out together. */
+    private var huProfile: CarPlayHuProfile = CarPlayProfileRegistry.defaultHu()
     private var mib3ChallengeSent = false
     private val startSessionSeen = AtomicBoolean(false)
     private val wifiRetryArmed = AtomicBoolean(false)
@@ -87,9 +96,15 @@ class Iap2Session(
         if (!linkReady) null else ourLsp.pack()
     }
 
+    /** Current HU profile (updated as peer / iAP ident signals arrive). */
+    fun currentHuProfile(): CarPlayHuProfile = synchronized(lock) { huProfile }
+
+    private val mib3: Boolean
+        get() = huProfile.usesMib3WirelessPath
+
     /**
      * True from first detect through a live auth/session — RFCOMM must not replace
-     * this peer as "idle" while we wait for Audi's SYN after ours.
+     * this peer as "idle" while we wait for the HU SYN after ours.
      */
     fun isNegotiatingOrLive(): Boolean = synchronized(lock) {
         state != State.Idle && state != State.Dead
@@ -104,17 +119,29 @@ class Iap2Session(
         private set
 
     /**
-     * BT peer label from RFCOMM. Audi MMI uses a different accessory-auth order than DiPlay.
+     * BT peer label from RFCOMM. Resolves [huProfile] via [CarPlayProfileResolver].
      */
     fun notePeer(name: String?, address: String?) {
-        val audi = looksLikeAudi(name)
-        synchronized(lock) {
-            mib3 = audi
-        }
+        val resolved = CarPlayProfileResolver.resolve(
+            CarPlayProfileResolver.Signals(btName = name),
+        )
+        applyHuProfile(resolved, reason = "bt-name")
         Log.i(
             CarPlayConsts.TAG,
-            "iAP peer name=$name addr=$address mib3=$audi",
+            "iAP peer name=$name addr=$address hu=${resolved.id} mib3=${resolved.usesMib3WirelessPath}",
         )
+    }
+
+    private fun applyHuProfile(resolved: CarPlayHuProfile, reason: String) {
+        val changed: Boolean
+        synchronized(lock) {
+            changed = huProfile.id != resolved.id
+            if (changed) {
+                huProfile = resolved
+                Log.i(CarPlayConsts.TAG, "iAP huProfile → ${resolved.id} ($reason)")
+            }
+        }
+        if (changed) onHuProfileChanged?.invoke(resolved)
     }
 
     fun onTransportConnected() {
@@ -218,6 +245,7 @@ class Iap2Session(
         startSessionSeen.set(false)
         wifiRetryArmed.set(false)
         mib3TransportAnnounced = false
+        huProfile = CarPlayProfileRegistry.defaultHu()
         linkReady = false
         identificationComplete = false
         authenticationComplete = false
@@ -443,14 +471,15 @@ class Iap2Session(
             Iap2Csm.START_IDENTIFICATION -> sendIdentificationInformationLocked()
             Iap2Csm.IDENTIFICATION_INFORMATION -> {
                 logIdentificationSummary(msg)
-                if (!mib3 && (
-                    looksLikeAudi(Iap2Csm.utf8(msg.parameters[0])) ||
-                        looksLikeAudi(Iap2Csm.utf8(msg.parameters[1])) ||
-                        looksLikeAudi(Iap2Csm.utf8(msg.parameters[2]))
+                if (!mib3) {
+                    val fromIdent = CarPlayProfileResolver.matchIap(
+                        Iap2Csm.utf8(msg.parameters[0]),
+                        Iap2Csm.utf8(msg.parameters[1]),
+                        Iap2Csm.utf8(msg.parameters[2]),
                     )
-                ) {
-                    mib3 = true
-                    Log.i(CarPlayConsts.TAG, "iAP accessory ident looks like Audi/MIB → MIB3 auth")
+                    if (fromIdent != null) {
+                        applyHuProfile(fromIdent, reason = "iap-ident")
+                    }
                 }
                 sendIdentificationAcceptedLocked()
             }
@@ -552,18 +581,19 @@ class Iap2Session(
 
     private fun sendIdentificationInformationLocked() {
         // Phone-shaped 0x1D01. Sent only when the HU asks (0x1D00). DiPlay identifies
-        // itself and does not take this path. Audi rejects an accessory-shaped ident.
+        // itself and does not take this path. MIB3 rejects an accessory-shaped ident.
         val mac = bluetoothTransportId()
         val serial = mac.replace(":", "").ifBlank { "000000000000" }
+        val id = sourceIdentity
         val params = linkedMapOf(
-            0x0000 to Iap2Framing.utf8Param("iPhone"),
-            0x0001 to Iap2Framing.utf8Param("iPhone14,2"),
-            0x0002 to Iap2Framing.utf8Param("Apple"),
+            0x0000 to Iap2Framing.utf8Param(id.iapName),
+            0x0001 to Iap2Framing.utf8Param(id.iapModel),
+            0x0002 to Iap2Framing.utf8Param(id.iapManufacturer),
             0x0003 to Iap2Framing.utf8Param(serial),
-            0x0004 to Iap2Framing.utf8Param("17.5.1"),
-            0x0005 to Iap2Framing.utf8Param("1.0"),
-            0x000C to Iap2Framing.utf8Param("zh-CN"),
-            0x000D to Iap2Framing.utf8Param("zh-CN"),
+            0x0004 to Iap2Framing.utf8Param(id.iapFirmwareVersion),
+            0x0005 to Iap2Framing.utf8Param(id.iapHardwareVersion),
+            0x000C to Iap2Framing.utf8Param(id.iapLanguage),
+            0x000D to Iap2Framing.utf8Param(id.iapRegion),
         )
         macBytes(mac)?.let { raw ->
             params[0x0011] = Iap2Csm.encodeGroup(
@@ -576,7 +606,7 @@ class Iap2Session(
             )
         }
         sendControlLocked(Iap2Framing.encodeCsm(Iap2Csm.IDENTIFICATION_INFORMATION, params))
-        Log.i(CarPlayConsts.TAG, "iAP IdentificationInformation (0x1D01) iPhone bt=$mac")
+        Log.i(CarPlayConsts.TAG, "iAP IdentificationInformation (0x1D01) ${id.iapName} bt=$mac")
     }
 
     private fun markIdentifiedLocked(reason: String) {
@@ -664,8 +694,11 @@ class Iap2Session(
         val serial = btId.replace(":", "")
         sendControlLocked(Iap2Csm.wirelessCarPlayUpdate(available = true))
         Log.i(CarPlayConsts.TAG, "iAP WirelessCarPlayUpdate AVAILABLE (0x4E0D)")
-        sendControlLocked(Iap2Csm.deviceInformationUpdate("iPhone"))
-        Log.i(CarPlayConsts.TAG, "iAP MIB3 DeviceInformationUpdate (0x4E09) name=iPhone")
+        sendControlLocked(Iap2Csm.deviceInformationUpdate(sourceIdentity.iapName))
+        Log.i(
+            CarPlayConsts.TAG,
+            "iAP MIB3 DeviceInformationUpdate (0x4E09) name=${sourceIdentity.iapName}",
+        )
         sendControlLocked(Iap2Csm.deviceTransportIdentifier(btId, serial))
         Log.i(CarPlayConsts.TAG, "iAP MIB3 DeviceTransportIdentifier (0x4E0E) bt=$btId serial=$serial")
         sendMib3AvailabilityLocked(btId, serial)
@@ -701,12 +734,6 @@ class Iap2Session(
                 "iAP MIB3 re-sent 0x4300 after Wi-Fi bound bt=$id sta=${wifiMac ?: "hidden"}",
             )
         }
-    }
-
-    private fun looksLikeAudi(text: String?): Boolean {
-        val n = text?.trim().orEmpty()
-        if (n.isEmpty()) return false
-        return n.contains("audi", ignoreCase = true) || n.contains("mmi", ignoreCase = true)
     }
 
     private fun macBytes(mac: String): ByteArray? {

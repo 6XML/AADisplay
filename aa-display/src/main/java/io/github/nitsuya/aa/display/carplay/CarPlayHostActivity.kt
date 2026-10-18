@@ -14,6 +14,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * GL/VD live in [CarPlayHostRuntime] (FGS-owned). This Activity only helps BAL and keeps a
  * brief visible window; finishing it must **not** tear down CarPlay video.
+ *
+ * Own [android:taskAffinity] so [moveTaskToBack] after the BAL window does not send the
+ * status-page ([MainActivity][io.github.nitsuya.aa.display.ui.main.MainActivity]) task away.
  */
 class CarPlayHostActivity : Activity() {
     companion object {

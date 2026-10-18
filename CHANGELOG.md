@@ -3,9 +3,15 @@
 ## Unreleased
 
 ### Changed
+- **CarPlay Source / HU Profile 化：** BT 名、iAP/AirPlay 身份与 MIB3/Generic 行为收敛到 `carplay/profile/`（`SourceIdentity` + `HuProfile` + Registry/Resolver）；协议 RFCOMM UUID 仍在 `CarPlayConsts`。默认仍为 iPhone14,2 + mib3/generic，行为不变；扩展多手机/多车机改注册表，不再在链路里写死 vendor 名。
 - **Recent 卡片图标美化：** 放大 × 居中盖在图标上（不再独占上方一行）；图标约 72dp（分屏列按槽高放大，`fitCenter` 不形变）；CarPlay Canvas Recents 同几何与命中对齐。
 
+### Changed
+- **状态页按出口通道切换配置：** 「出口通道」始终可见；选 Android Auto 只显示 VD DPI 等 AA 配置，选 CarPlay 只显示会话/Host 等 CarPlay 配置。
+
 ### Fixed
+- **状态页有时能滚有时不能：** edge-to-edge 只垫了顶栏 inset，ScrollView 按含导航栏的全高算「能放下」，底栏区域实际被挡且无滚动余量；CarPlay 状态文案变长时又突然能滚。改为四边 + IME inset。
+- **打开状态页就闪一下「CarPlay 通道出画」然后像退出：** 通道已是 CarPlay 时 `ensureArmedIfCarPlay` / FGS 会拉起同 task 的 `CarPlayHostActivity`，800ms 后 `moveTaskToBack` 把整栈（含状态页）压到后台。Host 改独立 `taskAffinity`；状态页 re-arm 只起 FGS/Runtime、不再弹 trampoline。
 - **CarPlay 奥迪 BORROW 之后一直无声：** 车机 `BORROW_CHANGE` 后除了 200 应答，又 POST 一次 `modesChanged` 把主音频抢回。车机立刻再 BORROW，随后 RTP 仍在发、喇叭不再出声。BORROW 只保留声明手机持有屏幕和主音频的 200，不再补发抢回。
 - **CarPlay AAC 放着放着杂音然后没声：** RTP 时间戳经微秒往返整除后每帧 1024 样本变成 1023，抖动缓冲慢慢被拖空。改为每发出一帧精确 +1024。随后「落后就丢帧」在编码超过 21ms 时连着掏空发送队列，奥迪空窗后不再出声；改为先按节拍睡再编码，只在落后超过约 170ms 时对齐时钟，不丢已编码帧。
 - **重启后 CarPlay 连不上：** `CarPlayAutoArmReceiver` 在 targetSdk 36 下 `exported=false`，系统不投递 `BOOT_COMPLETED` / `USER_UNLOCKED` / BT `STATE_CHANGED`，`…cafe` 无 listen，DiPlay SDP 失败。改为 `exported=true`。

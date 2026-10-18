@@ -24,13 +24,14 @@ import java.util.concurrent.atomic.AtomicBoolean
  * early event marker, or flush during the screen SETUP exchange sends it too
  * soon. After `0xAA05` the phone bursts session/language/time/name/location;
  * the HU then asks for NowPlaying / telephony / lists. Empty ACK alone makes
- * Audi tear AirPlay control down in ~12s with no picture.
+ * MIB3 tear AirPlay control down in ~12s with no picture.
  *
  * DiPlay keeps the previous behavior: echo a detect, and SYN|ACK the Bluetooth LSP.
  */
 class WifiIap2Link(
     private val linkSync: ByteArray = ByteArray(0),
-    private val audi: Boolean = false,
+    /** Former Audi CSM Wi‑Fi iAP path ([CarPlayHuProfile.usesMib3WirelessPath]). */
+    private val mib3Style: Boolean = false,
     private val sendFrame: (ByteArray) -> Boolean,
 ) {
     private val running = AtomicBoolean(true)
@@ -51,7 +52,7 @@ class WifiIap2Link(
     fun start() {
         Log.i(
             CarPlayConsts.TAG,
-            if (audi) {
+            if (mib3Style) {
                 "Wi-Fi iAP2 Audi wait for screen SETUP before detect"
             } else {
                 "Wi-Fi iAP2 wait for HU (no phone SYN) btLsp=${linkSync.size}B"
@@ -66,7 +67,7 @@ class WifiIap2Link(
      * are retransmits and are ignored.
      */
     fun announce() {
-        if (!audi || !running.get()) return
+        if (!mib3Style || !running.get()) return
         synchronized(lock) {
             detectArmed = true
             if (detectSent || synHandled) return
@@ -102,7 +103,7 @@ class WifiIap2Link(
 
     private fun onDetect() {
         Log.i(CarPlayConsts.TAG, "Wi-Fi iAP2 marker")
-        if (audi) {
+        if (mib3Style) {
             // Ignore pre-SETUP event detects — announce() after screen SETUP owns the one POST.
             if (detectArmed) announce()
             else Log.i(CarPlayConsts.TAG, "Wi-Fi iAP2 detect deferred until screen SETUP")
@@ -122,10 +123,10 @@ class WifiIap2Link(
             return
         }
         if (packet.hasSyn && packet.payload.isNotEmpty()) {
-            if (audi) handleAudiSyn(packet) else handleEchoSyn(packet)
+            if (mib3Style) handleAudiSyn(packet) else handleEchoSyn(packet)
             return
         }
-        if (!audi) {
+        if (!mib3Style) {
             if (synAck != null && packet.hasAck && !linkUp) {
                 linkUp = true
                 Log.i(CarPlayConsts.TAG, "Wi-Fi iAP2 link up ack=${packet.ack}")

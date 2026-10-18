@@ -91,18 +91,27 @@ sequenceDiagram
 
 ### 4.1 蓝牙 RFCOMM（`CarPlayBluetoothLink`）
 
+协议 UUID（Apple 常量，集中在 `CarPlayConsts`，不是某车机魔法值）：
+
 | UUID | 角色 | 谁 dial |
 |------|------|---------|
 | `…deafdecacafe` | Phone（本机 listen） | 车机 / DiPlay 回连 |
 | `…deafdecacaff` | Accessory（本机也可 listen；并对 bonded dial） | 本模块首连 HU |
 | Wireless CarPlay capability | SDP/EIR 能力广告 | —（VAG 等缺此 UUID 不出 CarPlay） |
 
+身份与车机策略（`carplay/profile/`）：
+
+- **`CarPlaySourceIdentity`**：BT 广告名、iAP/AirPlay 手机字段（默认 `iphone14_2`）。
+- **`CarPlayHuProfile`**：dial 策略、AirPlay UA/HKP/版本、MIB3 vs Generic 无线路径。
+- **`CarPlayProfileResolver`**：按 iAP ident → SSID → BT 名（registry 内 hint）解析 HU；未命中 → `generic`。
+- 新手机 / 新车机：改注册表，禁止在 BT/iAP/RTSP 再写 `contains("audi")` / `"iPhone14,2"`。
+
 武装时：
 
-- 适配器改名伪装 **iPhone**（停会话时恢复）；尽量 `SCAN_MODE_CONNECTABLE_DISCOVERABLE`。
+- 适配器改名为 `SourceIdentity.btAdvertiseName`（停会话时恢复）；尽量 `SCAN_MODE_CONNECTABLE_DISCOVERABLE`。
 - BT OFF 时挂 `STATE_CHANGED`，ON 后再 `beginRfcomm`（避免 reboot 永久放弃 → DiPlay SDP `scn=0`）。
-- bonded 扫描 dial `…caff`；ACL/新配对会再 dial。**已有 socket 且 iAP 协商中禁止红 dial**（会冲掉 Audi 首 SYN）。
-- 保留 HFP；**不主动开 A2DP**（奥迪会超时提示「无法建立蓝牙」）。
+- bonded 扫描 dial `…caff`（按 accessory / wireless-CP UUID 排序）；`INBOUND_PREFERRED` 车机在 ACL/新配对后再 dial。**已有 socket 且 iAP 协商中禁止红 dial**。
+- 保留 HFP；**不主动开 A2DP**（部分 HU 会超时提示「无法建立蓝牙」）。
 
 ### 4.2 iAP2 状态机（`protocol/Iap2Session`）
 
@@ -124,7 +133,7 @@ sequenceDiagram
 → 等 0x5703 和/或 0x4301
 ```
 
-**Audi MIB3**（peer 名含 audi/mmi）：
+**MIB3**（`HuProfile.id=mib3`；registry hint 含 audi/mmi，仅经 Resolver）：
 
 ```
 0x4E0C wireless session id + 0x5702   ← 先要热点

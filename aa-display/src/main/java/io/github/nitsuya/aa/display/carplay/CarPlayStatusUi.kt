@@ -3,6 +3,7 @@ package io.github.nitsuya.aa.display.carplay
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Intent
+import android.view.View
 import android.widget.Toast
 import io.github.nitsuya.aa.display.CoreApi
 import io.github.nitsuya.aa.display.R
@@ -12,6 +13,8 @@ import io.github.nitsuya.aa.display.egress.ProjectionSessionGate
 /**
  * Status-page CarPlay controls. Keeps [io.github.nitsuya.aa.display.ui.main.MainActivity]
  * free of CarPlay session / channel logic beyond a single bind call.
+ *
+ * Channel radio is always visible; [panel_aa] vs [panel_carplay] swap with the selection.
  */
 object CarPlayStatusUi {
     /** Swallows the listener callback raised while the channel radio is synced programmatically. */
@@ -74,14 +77,18 @@ object CarPlayStatusUi {
         }
     }
 
-    /** Start FGS when the persisted channel is CarPlay (idempotent if already live). */
+    /**
+     * Start FGS when the persisted channel is CarPlay (idempotent if already live).
+     * No Host trampoline: status page is already foreground; launching
+     * [CarPlayHostActivity] then [Activity.moveTaskToBack] used to send the whole
+     * status-page task to the background (felt like the app auto-exited).
+     */
     fun ensureArmedIfCarPlay(activity: Activity) {
         if (!CarPlayChannel.useCarPlayEgress(activity)) return
         try {
-            CarPlayProjectionService.start(activity)
+            CarPlayProjectionService.start(activity, launchHostTrampoline = false)
             if (!CarPlayHostRuntime.isRunning()) {
                 CarPlayHostRuntime.ensureStarted(activity)
-                CarPlayHostActivity.launch(activity)
             }
         } catch (e: Throwable) {
             android.util.Log.e(CarPlayConsts.TAG, "ensureArmedIfCarPlay failed", e)
@@ -96,31 +103,28 @@ object CarPlayStatusUi {
             ProjectionSessionGate.isCarPlayLive()
         }
         val channel = CarPlayChannel.get(activity)
+        val carPlay = channel == CarPlayChannel.CHANNEL_CARPLAY
         val hostUp = CarPlayHostRuntime.isRunning()
         val content = when {
-            channel == CarPlayChannel.CHANNEL_AA -> "Android Auto"
+            !carPlay -> "Android Auto"
             hostUp -> "CarPlay Host"
             live -> "测试图（Host 未就绪）"
             else -> "—"
         }
         binding.tvCarplayStatus.text =
-            "通道：" + (if (channel == CarPlayChannel.CHANNEL_CARPLAY) "CarPlay" else "Android Auto") +
-                "  会话：" + (if (live) "已连接" else "未连接") +
-                "\n内容源：$content（互斥，不同时出画）" +
-                if (channel == CarPlayChannel.CHANNEL_CARPLAY) {
-                    "\n能力：Host 分屏 · 60fps 自适应（DiPlay 需设帧率=60）· 全部应用音频出车机（通话留手机）· 仪表歌词+封面 · 方向盘 · 三列 Recents · 180s 延迟销毁"
-                } else {
-                    ""
-                }
-        val wantId = if (channel == CarPlayChannel.CHANNEL_CARPLAY) {
-            R.id.rb_channel_cp
-        } else {
-            R.id.rb_channel_aa
-        }
+            "会话：" + (if (live) "已连接" else "未连接") +
+                "\n内容源：$content" +
+                "\nHost：" + (if (hostUp) "运行中" else "未启动") +
+                "\n提示：DiPlay 帧率设 60；通话留手机，其余音频出车机"
+
+        val wantId = if (carPlay) R.id.rb_channel_cp else R.id.rb_channel_aa
         if (binding.rgCarplayChannel.checkedRadioButtonId != wantId) {
             channelChangeFromUser = false
             binding.rgCarplayChannel.check(wantId)
         }
+
+        binding.panelAa.visibility = if (carPlay) View.GONE else View.VISIBLE
+        binding.panelCarplay.visibility = if (carPlay) View.VISIBLE else View.GONE
     }
 
     private fun toast(activity: Activity, message: String) {

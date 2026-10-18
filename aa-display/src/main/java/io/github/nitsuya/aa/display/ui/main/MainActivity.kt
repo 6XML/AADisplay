@@ -103,8 +103,11 @@ class MainActivity : BaseActivity<ActivityMainBinding>(ActivityMainBinding::clas
 
     override fun onResume() {
         super.onResume()
-        refreshVdDensityUi()
         CarPlayStatusUi.refresh(this, baseBinding)
+        // DPI block is AA-only; skip when CarPlay panel is showing.
+        if (baseBinding.panelAa.visibility == View.VISIBLE) {
+            refreshVdDensityUi()
+        }
     }
 
     private fun refreshVdDensityUi() {

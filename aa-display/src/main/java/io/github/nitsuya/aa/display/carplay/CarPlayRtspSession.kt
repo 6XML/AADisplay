@@ -2,6 +2,9 @@ package io.github.nitsuya.aa.display.carplay
 
 import android.util.Log
 import io.github.nitsuya.aa.display.CoreApi
+import io.github.nitsuya.aa.display.carplay.profile.CarPlayHuProfile
+import io.github.nitsuya.aa.display.carplay.profile.CarPlayProfileRegistry
+import io.github.nitsuya.aa.display.carplay.profile.CarPlaySourceIdentity
 import io.github.nitsuya.aa.display.carplay.protocol.AirPlayPairVerify
 import io.github.nitsuya.aa.display.carplay.protocol.AirPlayPairing
 import io.github.nitsuya.aa.display.carplay.protocol.BinaryPlist
@@ -146,7 +149,8 @@ class CarPlayRtspSession(
         host: InetAddress,
         port: Int,
         deviceId: String?,
-        mib3: Boolean = false,
+        huProfile: CarPlayHuProfile = CarPlayProfileRegistry.defaultHu(),
+        sourceIdentity: CarPlaySourceIdentity = CarPlayProfileRegistry.defaultSource(),
         phoneMac: String? = null,
         wifiMac: String? = null,
     ) {
@@ -154,10 +158,14 @@ class CarPlayRtspSession(
             if (!running.get()) running.set(true)
             airplaySourceActive.set(true)
             try {
+                val mib3 = huProfile.usesMib3WirelessPath
                 val socket = CarPlayAccessoryNet.openTcp()
                 socket.connect(InetSocketAddress(host, port), 15_000)
                 socket.soTimeout = 15_000
-                Log.i(CarPlayConsts.TAG, "AirPlay source dial $host:$port deviceId=$deviceId")
+                Log.i(
+                    CarPlayConsts.TAG,
+                    "AirPlay source dial $host:$port deviceId=$deviceId hu=${huProfile.id}",
+                )
                 peer = socket
                 val input = BufferedInputStream(socket.getInputStream())
                 val out = BufferedOutputStream(socket.getOutputStream())
@@ -195,8 +203,8 @@ class CarPlayRtspSession(
                         return provisional.copy(body = body)
                     }
                 }
-                val userAgent = if (mib3) "AirPlay/980.77.1" else "AirPlay/950.7.1"
-                val hkp = if (mib3) "2" else "3"
+                val userAgent = huProfile.userAgent
+                val hkp = huProfile.hkp
                 fun post(path: String, body: ByteArray, contentType: String): ByteArray? {
                     val req = RtspMessage(
                         "POST $path RTSP/1.0",
@@ -301,7 +309,8 @@ class CarPlayRtspSession(
                     input = input,
                     out = out,
                     socket = socket,
-                    mib3 = mib3,
+                    huProfile = huProfile,
+                    sourceIdentity = sourceIdentity,
                     phoneMac = phoneMac,
                     wifiMac = wifiMac,
                 )
@@ -394,17 +403,19 @@ class CarPlayRtspSession(
         input: BufferedInputStream,
         out: BufferedOutputStream,
         socket: java.net.Socket,
-        mib3: Boolean = false,
+        huProfile: CarPlayHuProfile = CarPlayProfileRegistry.defaultHu(),
+        sourceIdentity: CarPlaySourceIdentity = CarPlayProfileRegistry.defaultSource(),
         phoneMac: String? = null,
         wifiMac: String? = null,
     ): Boolean {
+        val mib3 = huProfile.usesMib3WirelessPath
         var cseq = cseqStart
         val host = peerHost.hostAddress ?: peerHost.hostName
         val sessionId = (Random.nextLong() and Long.MAX_VALUE).toString()
         val sessionUrl = "rtsp://$host/$sessionId"
         val dacp = (deviceId ?: "AADISPLAY").replace(":", "").uppercase()
-        val userAgent = if (mib3) "AirPlay/980.77.1" else "AirPlay/950.7.1"
-        val hkp = if (mib3) "2" else "3"
+        val userAgent = huProfile.userAgent
+        val hkp = huProfile.hkp
         fun headers(extra: Map<String, String> = emptyMap()): LinkedHashMap<String, String> {
             val h = linkedMapOf(
                 "CSeq" to (cseq++).toString(),
@@ -664,13 +675,13 @@ class CarPlayRtspSession(
         val setupFields = linkedMapOf<String, Any?>(
             "deviceID" to setupDeviceId,
             "macAddress" to setupMac,
-            "model" to "iPhone14,2",
-            "name" to "AADisplay",
-            "osBuildVersion" to if (mib3) "17.5.1" else "20A392",
-            "osName" to "iPhone OS",
-            "osVersion" to if (mib3) "17.5.1" else "16.0",
+            "model" to sourceIdentity.airplayModel,
+            "name" to sourceIdentity.airplayName,
+            "osBuildVersion" to huProfile.osBuildVersion,
+            "osName" to sourceIdentity.airplayOsName,
+            "osVersion" to huProfile.osVersion,
             "sessionUUID" to sessionUuid,
-            "sourceVersion" to if (mib3) "980.77.1" else "950.7.1",
+            "sourceVersion" to huProfile.sourceVersion,
             "timingProtocol" to "NTP",
         )
         if (mib3) {
@@ -744,7 +755,7 @@ class CarPlayRtspSession(
             val wifi = if (mib3 || lsp != null) {
                 WifiIap2Link(
                     linkSync = lsp ?: ByteArray(0),
-                    audi = mib3,
+                    mib3Style = mib3,
                 ) { frame ->
                     postControlIap(frame)
                 }

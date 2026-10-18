@@ -6,6 +6,8 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import io.github.nitsuya.aa.display.CoreApi
+import io.github.nitsuya.aa.display.carplay.profile.CarPlayProfileRegistry
+import io.github.nitsuya.aa.display.carplay.profile.CarPlayProfileResolver
 import io.github.nitsuya.aa.display.carplay.protocol.Iap2Csm
 import io.github.nitsuya.aa.display.carplay.protocol.Iap2Session
 import io.github.nitsuya.aa.display.egress.ProjectionSessionGate
@@ -117,6 +119,7 @@ class CarPlaySourceSession(
             bj.startDiscovery()
         }.start()
 
+        val sourceIdentity = CarPlayProfileRegistry.defaultSource()
         val link = CarPlayBluetoothLink(
             appContext,
             onConnected = { iap2?.onTransportConnected() },
@@ -130,6 +133,7 @@ class CarPlaySourceSession(
             // Detect/SYN/auth all count as live — mid-negotiate must not be replaced.
             sessionLive = { iap2?.isNegotiatingOrLive() == true },
             onPeer = { name, address -> iap2?.notePeer(name, address) },
+            sourceIdentity = sourceIdentity,
         )
         bluetooth = link
         iap2 = Iap2Session(
@@ -145,7 +149,7 @@ class CarPlaySourceSession(
                 Log.i(CarPlayConsts.TAG, "iAP auth done → WiFi / CarPlayStartSession")
             },
             onWifiConfig = { wifi ->
-                // Before join: disable saved-STA autojoin so Audi/Carplay cannot
+                // Before join: disable saved-STA autojoin so accessory AP cannot
                 // become ACCEPT_UNVALIDATED default and kill cellular.
                 try {
                     CoreApi.preferCellularOverUnvalidatedWifi()
@@ -166,6 +170,7 @@ class CarPlaySourceSession(
             },
             onNowPlayingUpdates = { CarPlayNowPlaying.onUpdatesRequested() },
             onFileTransferDatagram = { dg -> CarPlayNowPlaying.onFileTransferDatagram(dg) },
+            sourceIdentity = sourceIdentity,
         )
         link.start()
 
@@ -215,17 +220,20 @@ class CarPlaySourceSession(
                     CarPlayAccessoryNet.openTcp().use { probe ->
                         probe.connect(java.net.InetSocketAddress(addr, port), 2_500)
                     }
-                    val mib3 = start.ssid?.let { ssid ->
-                        ssid.contains("audi", ignoreCase = true) ||
-                            ssid.contains("mmi", ignoreCase = true)
-                    } == true
+                    val bySsid = CarPlayProfileResolver.matchSsid(start.ssid)
+                    val hu = when {
+                        bySsid != null &&
+                            bySsid.id != CarPlayProfileRegistry.generic.id -> bySsid
+                        else -> iap2?.currentHuProfile() ?: CarPlayProfileRegistry.defaultHu()
+                    }
                     rtsp?.connectAsAirPlaySource(
-                        addr,
-                        port,
-                        start.deviceId,
-                        mib3,
-                        bluetooth?.localAddress(),
-                        wifiHandoff?.staMacForAnnounce(),
+                        host = addr,
+                        port = port,
+                        deviceId = start.deviceId,
+                        huProfile = hu,
+                        sourceIdentity = CarPlayProfileRegistry.defaultSource(),
+                        phoneMac = bluetooth?.localAddress(),
+                        wifiMac = wifiHandoff?.staMacForAnnounce(),
                     )
                     return@Thread
                 } catch (e: Throwable) {
