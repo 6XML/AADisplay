@@ -122,7 +122,7 @@ object CarPlayAudioCapture {
     private const val SPEECH_HIGH_WATERMARK_BYTES = SPEECH_BYTES_PER_MS * LIVE_HIGH_MS
     private const val SPEECH_LOW_WATERMARK_BYTES = SPEECH_BYTES_PER_MS * LIVE_LOW_MS
     private const val WATCHDOG_PERIOD_MS = 30_000L
-    /** CSM re-enforces local mute every 250ms — Samsung restores MUSIC when apps start. */
+    /** CSM re-enforces local mute every 250ms — some OEMs restore MUSIC when apps start. */
     private const val MUTE_ENFORCE_MS = 250L
     private const val PULL_TIMEOUT_MS = 5 * 60_000L
     /** Floor between projection-stop / pull-stall rearms while session still desired. */
@@ -201,7 +201,7 @@ object CarPlayAudioCapture {
         var reassertMute = false
         synchronized(opLock) {
             desired.set(enabled)
-            // Already armed: still re-assert phone mute (Samsung restores MUSIC on playback).
+            // Already armed: still re-assert phone mute (OEM may restore MUSIC on playback).
             if (enabled && armed.get()) {
                 if (mediaMode == "playback-capture") {
                     // Mute thread can die while capture stays armed (uncaught OEM
@@ -717,8 +717,8 @@ object CarPlayAudioCapture {
     }
 
     /**
-     * CSM-style sticky mute: One UI restores STREAM_MUSIC when media apps start,
-     * so a one-shot mute leaves the Z Flip speaker live while AAC still flows.
+     * CSM-style sticky mute: some OEMs restore STREAM_MUSIC when media apps start,
+     * so a one-shot mute leaves the phone speaker live while AAC still flows.
      *
      * Must NOT be called while holding [opLock]: [AudioManager.setStreamVolume] can
      * dispatch [VOLUME_CHANGED_ACTION] synchronously; the receiver used to take
@@ -743,8 +743,8 @@ object CarPlayAudioCapture {
             if (vol != null && vol != 0) {
                 if (stream == AudioManager.STREAM_MUSIC) restoredVol = vol
                 runCatching { am.setStreamVolume(stream, 0, 0) }
-                // One UI fine-volume can leave speaker audible after stream index 0.
-                zeroSamsungFineVolume(am, stream)
+                // OEM fine-volume APIs can leave speaker audible after stream index 0.
+                zeroOemFineVolume(am, stream)
                 touched = true
             }
         }
@@ -761,8 +761,8 @@ object CarPlayAudioCapture {
         }
     }
 
-    /** Best-effort One UI fine / sem volume → 0 (no-op on AOSP). */
-    private fun zeroSamsungFineVolume(am: AudioManager, stream: Int) {
+    /** Best-effort OEM fine / sem volume → 0 (no-op when APIs are absent). */
+    private fun zeroOemFineVolume(am: AudioManager, stream: Int) {
         val names = listOf("semSetFineVolume", "setFineVolume", "setFineVolumeIndex")
         for (name in names) {
             val ok = runCatching {
@@ -1398,19 +1398,19 @@ object CarPlayAudioCapture {
     }
 
     // ------------------------------------------------------------------
-    // MediaProjection acquisition (Samsung / AOSP)
+    // MediaProjection acquisition (OEM / AOSP ladders)
     // ------------------------------------------------------------------
 
     /**
-     * Root cause on Z Flip / One UI (API 33): we run inside system_server. Local
+     * Inside system_server, local
      * [MediaProjectionManagerService.BinderService.createProjection] uses
      * [Context.checkCallingPermission], which **always denies** when
-     * `callingPid == myPid` — even after [Binder.clearCallingIdentity]. Samsung also
-     * has no `createProjectionInternal`. Falling through to REMOTE_SUBMIX skips phone
-     * mute → sound plays on the Z Flip speaker while DiPlay still gets PCM.
+     * `callingPid == myPid` — even after [Binder.clearCallingIdentity]. Some OEMs
+     * also lack `createProjectionInternal`. Falling through to REMOTE_SUBMIX skips
+     * phone mute → sound plays on the handset speaker while the HU still gets PCM.
      *
      * Fix: construct the service's inner `MediaProjection` directly (same path the
-     * Binder method takes after the permission gate).
+     * Binder method takes after the permission gate), then try OEM/AOSP helpers.
      */
     private fun obtainMediaProjection(ctx: Context): MediaProjection? {
         runCatching {

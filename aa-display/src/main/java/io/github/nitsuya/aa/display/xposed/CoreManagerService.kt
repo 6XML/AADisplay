@@ -1210,7 +1210,7 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
             .onFailure { logDebug(TAG, "CarPlayProcessBoost.setBoost failed") }
         // Capture + phone mute follow the CarPlay FGS session, not individual RTSP
         // audio SETUP/TEARDOWN. DiPlay soft-reconnect briefly drops UDP egresses; if we
-        // disarmed there, Z Flip speaker came back before the next SETUP remuted.
+        // disarmed there, phone speaker came back before the next SETUP remuted.
         runCatching { CarPlayAudioCapture.setEnabled(live) }
             .onFailure {
                 logDebug(

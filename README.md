@@ -3,214 +3,211 @@
 [![基于](https://img.shields.io/badge/基于-Nitsuya%2FAADisplay-blue?logo=github)](https://github.com/Nitsuya/AADisplay)
 [![分支参考](https://img.shields.io/badge/参考-Stashboy%2FAADisplay-blue?logo=github)](https://github.com/Stashboy/AADisplay)
 ![Xposed Module](https://img.shields.io/badge/Xposed-Module-blue)
-![Android SDK min 33](https://img.shields.io/badge/Android%20SDK-%3E%3D%2033-brightgreen?logo=android)
-![Android SDK target 36](https://img.shields.io/badge/Android%20SDK-target%2036-brightgreen?logo=android)
+![Android 13+](https://img.shields.io/badge/Android-13%2B-brightgreen?logo=android)
 
-在 [Nitsuya/AADisplay](https://github.com/Nitsuya/AADisplay)（原作者）与 [Stashboy/AADisplay](https://github.com/Stashboy/AADisplay)（分支作者）基础上 Fork 修改而来的 **精简分屏版**：通过 LSPosed 在 Android Auto 车机上投屏运行手机应用，支持自定义双窗分屏、多应用保活与方向盘 / 蓝牙键鼠操作。
+让手机上的 App **出现在车机屏幕上**，左右分屏、用方向盘或触控操作。  
+基于 [Nitsuya/AADisplay](https://github.com/Nitsuya/AADisplay) / [Stashboy/AADisplay](https://github.com/Stashboy/AADisplay) 的精简版。
 
-## 版本与文档
+**你可以用两种方式连车机：**
 
-| 项 | 说明 |
-|----|------|
-| 当前版本 | `0.3#17.8-r1`（`versionCode` 3101） |
-| 变更记录 | [CHANGELOG.md](CHANGELOG.md) |
-| 历史版本说明 | [docs/archive/](docs/archive/) |
-| 开发者 / AI | [AGENTS.md](AGENTS.md)、运行时链路 [docs/EXECUTION.md](docs/EXECUTION.md) |
+| 方式 | 适合谁 |
+|------|--------|
+| **Android Auto** | 车机本身支持 Android Auto（手机装了 AA 时默认走这条） |
+| **无线 CarPlay** | 车机支持 CarPlay（例如 DiPlay 等盒子）；**手机没装 Android Auto 也能用** |
 
----
-
-## 系统特点
-
-### 精简设计
-
-- **无配置界面**：Delay Destroy 固定 **180 秒**；Auto Open、Restore Last Split 始终开启；不支持调整 DPI。
-- **不再申请 SU**：App 进程不申请 Magisk `su`（VirtualDisplay 等能力经 Xposed → system_server）。
-- **无桌面图标**：激活状态页从 LSPosed → AADisplay 打开；手机侧悬浮框已移除。
-- **不依赖第三方 Launcher**：内置应用选择器，不再纠结嘟嘟 MINI、氢桌面等选型。
-
-### 分屏与多任务
-
-- **自定义双 VirtualDisplay 分屏**，不依赖系统分屏壳；回收 Coolwalk 左侧导航轨，内容区更宽。
-- **每窗最多 3 个应用保活**：选新应用时旧应用进栈；栈顶为当前画面；满 3 个再加则挤出栈底。
-- **分屏比例 / 全屏 peel / 断线记忆**：拖动调比例、拖过边缘进全屏、下次连接自动恢复左右栈序与比例。
-- **Recent 三列**：左 → 虚拟屏左，中 → 虚拟屏右，右 → 手机；左 / 中列底栏可「添加应用」。
-
-### 交互与输入
-
-- **分屏条三个小点**（详见下方使用教程）：
-  - **拖动**：调整分屏比例（拖过边缘可进全屏；全屏向内拖可退出）
-  - **点按**：交换左右分屏（全屏时点 peel 切换可见侧）
-  - **长按**：进入 Task 应用栈（**松手后再打开**；全屏 peel 同理）
-- **方向盘**：短按仍控媒体键；长按下一曲 / 快进 → 交换分屏或切全屏侧；长按上一曲 / 快退 → 开 / 关 Recent。
-- **手机蓝牙键鼠**（连手机，AA 会话活跃时）：窗内当触控；分隔带可拖比例、短按交换、长按开 Recent；Ctrl+WASD 调比例、Ctrl+S 交换、Ctrl+R / Tab 开 Recent、中键切到对侧窗。
-
-### 媒体与兼容
-
-- **仪表横条歌词**：QQ 音乐车载、QQ 音乐 HD、汽水——三源同时只能一个播放，谁在播仪表跟谁；AA 顶栏同步歌词。
-- **音视频单发声**：音乐 、 抖音（AvMedia）同时只留一个发声；地图 / 浏览器压顶不会自动抢掉正在播的音乐。
-- **Android Auto 17.8 兼容**（亦覆盖 17.4）：**初次连接**须先装 Google App、Google Maps、Google 语音服务（TTS）完成 AA 首次设置；**过后可卸载**，模块会绕过 FRX 安装检查。抑制空媒体卡；锁屏下全屏把手仍可用。
-- **虚拟屏后仍支持方向盘控制**（短按注入焦点窗；直播等场景 next/prev 可能改写为滑动）。
+当前版本：**0.3#17.8-r2** · 更新说明见 [CHANGELOG.md](CHANGELOG.md)
 
 ---
 
-## 运行要求
+## 先看能不能用
 
-- Android 13+（SDK 33+）
-- 已 Root，并安装 LSPosed（或兼容 Xposed）
-- Android Auto（`com.google.android.projection.gearhead`）
+请逐条对照：
 
----
+1. 手机系统 **Android 13 或更高**（**缺一不可**）
+2. 手机已 **Root**，并装好 **LSPosed**（或同类 Xposed 框架）（**缺一不可**）
+3. **走 Android Auto**：手机装过 **Android Auto**，车机支持 AA
+4. **走无线 CarPlay**：车机支持 CarPlay，且能和手机 **蓝牙配对**（**不要求**手机装 Android Auto）
 
-## 安装与激活
-
-1. 编译或安装 APK（见下方「构建」）。
-2. 在 LSPosed 中启用本模块，至少勾选：
-   - **System Framework**
-   - **Android Auto**
-3. **重启设备**（system_server 侧钩子需重启才生效）。
-4. 在 LSPosed → AADisplay 打开模块（无桌面图标），确认状态为 **已激活** / **未激活** / **需要重启**。
-5. **首次连接车机前**，在手机上安装 **Google App**、**Google Maps**、**Google 语音服务（TTS）**，按 AA 走完首次设置；**首次连接成功并进入分屏后，这三项可删除**（后续重连不再依赖它们）。
-6. 连接 Android Auto，等待 Auto Open 进入分屏壳后验证触控与任务切换。
-
-改 AA 侧钩子后：可 `force-stop` gearhead 重拉；改 system_server 侧逻辑仍需重启手机。
+没 Root / 没 LSPosed → 本模块装了也不会生效，请先完成这两步再往下看。
 
 ---
 
-## 使用教程
+## 能做什么（白话）
 
-### 1. 首次连接与选应用
+- 车机上左右 **两个窗口**，各自跑不同 App（比如左地图、右音乐）。
+- 每个窗口最多同时「挂着」**3 个** App，随时切换，不用每次重开。
+- 中间那条 **三个小点** 可拖动调左右大小；拖到边可以变成单侧全屏。
+- 用 **方向盘** 切歌、换左右窗、打开应用列表。
+- 有的车上，仪表盘横条能显示 **QQ 音乐 / 汽水** 的歌词。
+- 可选 **无线 CarPlay**：声音从车机喇叭出，手机自己静音（电话铃声/通话仍走手机）。
 
-> **重要：Google 三件套（仅首次需要）**  
-> 第一次连 Android Auto 时，手机上须已安装 **Google App**、**Google Maps**、**Google 语音服务（TTS）**，并完成 AA 自带的首次设置向导。  
-> **首次进车机分屏成功后即可卸载这三项**——模块会绕过 FRX 的必装检查，日常重连不再要求它们。若从未装过就直连，可能卡在 AA 首次引导而无法进分屏。
+**刻意做简单的地方：**
 
-连接车机后模块会自动尝试打开 AADisplay 分屏界面（Auto Open）。若某一侧为空窗，**点击空白区域**打开应用选择器，点选即可启动到对应窗格。左右两窗相互独立，同一应用不能同时出现在左右两栈。
+- 没有一堆设置项（断开后约 **3 分钟**内再连，画面和应用尽量还在）。
+- **桌面上没有图标**——要打开模块状态页，去 **LSPosed → AADisplay**。
+- 不用再装嘟嘟、氢桌面之类第三方桌面。
 
-### 2. 分屏条操作
+---
 
-分屏条位于两窗之间的 **三个小点** 上：
+## 安装（按顺序做）
 
-| 手势 | 分屏模式 | 全屏（peel）模式 |
-|------|----------|------------------|
-| **拖动** | 实时预览比例，松手后生效 | 向外拖可 peel；松手超过阈值则退出全屏 |
-| **点按** | 交换左右两窗（含栈） | 只切换可见侧，不搬栈 |
-| **长按** | 松手后打开 Recent 三列 | 同左；手机锁屏时仍可开 Recent |
+### 1. 装好 APK
 
-注意：长按必须在 **手指抬起之后** 才打开 Recent，避免触控序列被打断导致 peel「点不动」。
+把本模块的 APK 装到手机上（自己编译见文末「自己编译」；或使用你拿到的安装包）。
 
-### 3. Task 应用栈（Recent）
+### 2. 在 LSPosed 里打开模块
 
-**入口**：分屏条长按（松手后）打开全屏 Recent 面板。
+1. 打开 **LSPosed**
+2. 找到 **AADisplay**（或本模块名称），打开开关
+3. 「作用域」里勾选：
+   - **系统框架**（有的机子写成 System Framework）——**不论走 AA 还是 CarPlay 都要勾**
+   - **Android Auto**——**只有要用 Android Auto 时才需要**；只用无线 CarPlay、手机没装 AA 时可以不勾
+4. **重启手机**（这一步很重要，不重启往往显示「未激活」）
 
-| 列 | 含义 |
-|----|------|
-| 左列 | 左窗（Primary）应用栈，底 → 顶 |
-| 中列 | 右窗（Secondary）应用栈 |
-| 右列 | 手机主屏上的任务 |
+### 3. 确认已经激活
 
-**常用操作**：
+1. 打开 **LSPosed → AADisplay**（记住：没有桌面图标）
+2. 看状态是否为 **已激活**
+3. 若提示 **需要重启** → 再重启一次手机
 
-- **点整行**（图标 / 标题 / 灰底）：将该应用拉到栈顶并显示，同时关闭面板。
-- **Close（×）**：关闭该任务；若关的是栈顶，自动显示栈中下一个。
-- **左 / 中列底栏「添加应用」**：在不挤掉当前显示的前提下往栈里加应用。
-- **拖拽排序**：调整同栈内顺序（松手后持久化）。
-- **右列任务拖到左 / 中列**：把手机上的应用搬到对应虚拟屏。
+### 4a. 只用无线 CarPlay（车机没有 AA / 手机没装 AA）
 
-### 4. 全屏 peel
+手机**没有**装 Android Auto 时，状态页会默认走 **CarPlay**（看不到「Android Auto」选项），一般不用再改通道。
 
-- 拖动分屏条 **越过边缘** 可进入单侧全屏（另一侧 VD 仍存在，只是被 peel 盖住）。
-- **点按 peel 把手**：在全屏时切换显示哪一侧。
-- **向内拖动 peel**：拖过退出阈值后回到分屏。
-- 全屏时 **长按 peel** 同样是在 **松手后** 打开 Recent。
+1. 打开状态页，允许 **蓝牙 / 附近设备** 权限（若弹出）
+2. 确认状态类似「等待车机连接」
+3. 在车机上用 **无线 CarPlay** 连接本机（首次可能弹出配对码 **3939**）
+4. 用 DiPlay 盒子时：盒子里 **设置 → 显示 → 帧率** 调成 **60**（新装常常是 30，画面会顿）
 
-### 5. 手机列
+车机连上后同样是左右分屏；某一侧是空的，就点空白处选 App。日常操作见下文「无线 CarPlay 多说几句」和「日常怎么用」里的分屏 / 方向盘说明。
 
-Recent 最右列为手机任务，可用于把手机上的应用 **滑到左 / 右窗**。在手机列 Close 任务 **不会** 清除分屏记忆快照。
+### 4b. 第一次连 Android Auto 前（只做这一次）
 
-### 6. 断开与重连
+第一次用 AA 连车机前，请先在手机上装好这三个：
 
-- 断开 Android Auto 后，虚拟屏默认 **延迟 180 秒** 再销毁（Delay Destroy），短断线重连可保留 VD 与应用状态。
-- 超过 180 秒或进程被系统回收后，需重新选应用；若存在有效快照，会自动 **Restore Last Split**（栈序、比例、全屏状态）。
+- **Google**（Google App）
+- **Google 地图**
+- **Google 语音服务 / 文字转语音（TTS）**
 
-### 7. 方向盘
+然后按 Android Auto 自己的提示走完 **首次设置**。
+
+> **成功进过分屏之后，这三个可以删掉。**  
+> 以后日常重连一般不再需要它们。  
+> 如果从来没装过就直接连车，有可能卡在 AA 的首次引导，进不了分屏。
+
+### 5. 连上车机（Android Auto）
+
+用数据线或无线把手机连到车机（按你车机平时连 Android Auto 的方式）。  
+正常时会 **自动打开** 分屏界面；某一侧是空的，就 **点一下空白处**，选要打开的 App。
+
+手机**已装** Android Auto、但想改用 **无线 CarPlay**：打开状态页，把出口通道改成 **CarPlay**，再按车机提示配对（首次可能弹出配对码 **3939**）。
+
+---
+
+## 日常怎么用（Android Auto）
+
+### 选 App、换 App
+
+- 空窗口 → **点空白** → 选出 App。
+- 左右两边互不影响；**同一个 App 不能同时开在左右两边**。
+- 每个窗口最多挂 3 个 App；再加新的，会把最旧的那个挤掉。
+
+### 中间三个小点（分屏条）
+
+| 你怎么做 | 结果 |
+|----------|------|
+| **按住拖动** | 调左右窗口大小；拖到很靠边 → 变成单侧全屏 |
+| **轻点一下** | 左右窗口对调；已经是全屏时 → 换成看另一侧 |
+| **长按，再松手** | 打开「最近应用」三列列表 |
+
+注意：长按要 **松手之后** 才会打开列表，按住不放不会开。
+
+### 「最近应用」三列列表
+
+长按中间小点并松手后会出现：
+
+| 列 | 是什么 |
+|----|--------|
+| 左边一列 | 左窗口里挂着的 App |
+| 中间一列 | 右窗口里挂着的 App |
+| 右边一列 | 手机自己屏幕上的任务 |
+
+常用操作：
+
+- **点某一行** → 那个 App 显示到前台，列表关掉
+- 点 **×** → 关掉这个任务
+- 左/中列下面的 **「添加应用」** → 往这个窗口再挂一个 App
+- 可把右列（手机）上的 App **拖到** 左列或中列，等于搬到车机窗口里
+
+### 拔掉线 / 断连之后
+
+- 大约 **3 分钟（180 秒）** 内再连上，左右窗口和应用往往还在。
+- 超过这个时间，可能要重新选 App；若模块记住了上次布局，会尽量自动恢复。
+
+### 方向盘
 
 | 操作 | 效果 |
 |------|------|
-| 短按播放 / 暂停 / 上一曲 / 下一曲等 | 注入到当前焦点窗（控制正在显示的应用） |
-| **长按** 下一曲 / 快进 | 与 **点按分屏条** 相同：分屏时交换左右；全屏时切换可见侧 |
-| **长按** 上一曲 / 快退 | 打开 / 关闭 Recent 三列 |
+| **短按** 播放/暂停、上一曲、下一曲等 | 控制 **当前正在看的那个窗口** 里的 App |
+| **长按** 下一曲 / 快进 | 和「点一下分屏条」一样：对调左右，或全屏时换另一侧 |
+| **长按** 上一曲 / 快退 | 打开 / 关掉「最近应用」列表 |
 
-### 8. 手机蓝牙键鼠
+### 手机上的蓝牙鼠标 / 键盘（可选）
 
-前提：键鼠连接 **手机**（非车机 USB）；AA 会话活跃且非 Delay Destroy 空窗期。
+键鼠要连在 **手机** 上（不是车机 USB），并且车机这边已经连着、分屏在用。
 
-| 操作 | 效果 |
-|------|------|
-| 窗内移动 / 左键 | 当触控注入当前窗格应用 |
-| 光标停在 **分隔带** 再拖动 | 调整分屏比例 |
-| 分隔带 **短按** | 交换左右窗 |
-| 分隔带 **长按再松手** | 打开 Recent |
-| **中键** | 跳到对侧窗中心并切换焦点 |
-| **Ctrl + 方向键 / WASD** | 分屏比例 ±5% |
-| **Ctrl + S** | 交换左右窗 |
-| **Ctrl + R / Tab / App Switch** | 打开 Recent |
+- 在窗口里移动、点左键 ≈ 用手指点屏幕
+- 光标停在中间分隔条上再拖 = 调左右大小；短按 = 对调；长按再松手 = 打开列表
+- 鼠标中键 = 跳到另一侧窗口
+- 键盘：`Ctrl + 方向键/WASD` 微调比例，`Ctrl + S` 对调，`Ctrl + R` 或 `Tab` 打开列表
 
-折叠屏等设备上光标由车机壳自绘；更多细节见 [docs/EXECUTION.md §10.1](docs/EXECUTION.md#101-手机蓝牙键鼠操作说明)。
+### 音乐和仪表歌词
 
-### 9. 音乐与仪表歌词
+支持把歌词推到部分车型的仪表横条 / AA 顶栏，目前跟这几个播放器（**同时只跟正在播的那一个**）：
 
-支持将歌词推到 **奥迪等车型的仪表横条** 与 AA 顶栏，当前绑定三源（同时只能一个播放）：
+- QQ 音乐车载
+- QQ 音乐 HD
+- 汽水
 
-- QQ 音乐车载（`com.tencent.qqmusiccar`）
-- QQ 音乐 HD（`com.tencent.qqmusicpad`）
-- 汽水（`com.luna.music`）
-
-**音视频互斥**：音乐与抖音等 AvMedia 同时只留一个发声；播抖音时音乐会暂停，仪表歌词也会清空。地图、浏览器等压顶 **不会** 自动暂停正在播放的音乐。
-
-技术备忘见 [docs/CLUSTER_LYRIC_CLOCK.md](docs/CLUSTER_LYRIC_CLOCK.md)。
-
-### 10. 无线 CarPlay（与 AA 双轨）
-
-状态页「出口通道」选 **CarPlay** 后，本模块作为 CarPlay Source 直连支持 CarPlay 的车机（已验证 DiPlay 0.2.19，车机保持原版）。与 AA 可同屏双轨，也可只走 CarPlay。
-
-| 能力 | 说明 |
-|------|------|
-| 画面 | 双分屏（左/右窗）投车机，默认 **60fps**，链路压力大时自动降到 30fps |
-| 音频 | **所有应用声音**（音乐 / 短视频 / 导航 TTS / 通知等）走 CarPlay 从车机喇叭出；手机端同步静音，断开恢复。**通话声音留手机** |
-| 方向盘 | 媒体键短按控制焦点窗（播放/暂停/切歌）、长按下一曲=换窗、长按上一曲=开 Recent、滚轮=滚动焦点窗 |
-| 触控 | 车机触控直接操作对应窗格应用；**拖动画面中间分隔条** 调分屏比例，**点分隔条** 开 Recent 三列 |
-| Recent | 三列（手机 / 左窗 / 右窗），点卡片把应用开进对应位置 |
-| 仪表歌词 | 与 AA 仪表横条同源：当前歌词行 + 封面推到车机（DiPlay 仪表卡片） |
-| 会话 | 断开后 180s 延迟销毁；手机息屏/后台保持出画（CarPlay 存活期自动 cgroup 提权） |
-
-**车机设置（重要）**：DiPlay **设置 → 显示 → 帧率 = 60**（新装默认 30，DiPlay 按自己的帧率解码，手机侧无法代改）。
-
-蓝牙需先与手机配对（iAP2）；首次连接车机会弹配对码 `3939`。
+一边播抖音一边播音乐会互相抢声音：同一时间只让一个出声。打开地图、浏览器 **不会** 自动把正在播的音乐掐掉。
 
 ---
 
-## 构建
+## 无线 CarPlay 多说几句
 
-```bash
-export GRADLE_USER_HOME="$HOME/.gradle"
-./gradlew :aa-display:assembleDebug
-./gradlew :aa-display:assembleRelease
-```
+出口是 **CarPlay** 时（手机没装 AA 会自动默认；有 AA 则在状态页手动切换）：
 
-产物：`aa-display/build/outputs/apk/*/aa-display-*.apk`（版本号中 `#` 替换为 `-`）。
+- 车机上同样是左右分屏，可以触控、调中间分隔条、开应用列表
+- **App 的声音从车机喇叭出来**，手机喇叭会静音；**打电话仍走手机**
+- **蓝牙直接配 Wi‑Fi**：车机经蓝牙下发热点信息，手机自动连上再出画（不用自己手填 Wi‑Fi）
+- **方向盘控制**：短按控当前窗口（切歌等）；长按下一曲 ≈ 换窗；长按上一曲 ≈ 打开应用列表
+- **奥迪 MIB3**：仪表台可显示 **QQ 音乐车载 / 汽水** 的歌曲、歌词与封面
+- **不支持多点触控**（受 CarPlay 协议限制，单指触控可用）
+- 断线后同样大约 3 分钟内再连，尽量保留状态
+
+和 Android Auto **可以一起用（有 AA 时二选一出口），也可以只开 CarPlay**——车机没有 AA、手机没装 AA 时，只开 CarPlay 即可。
 
 ---
 
-## 开发者文档
+## 常见问题
 
-| 主题 | 文档 |
-|------|------|
-| 项目约束 / 改动规则 | [AGENTS.md](AGENTS.md) |
-| 运行时链路（进程、IPC、触控） | [docs/EXECUTION.md](docs/EXECUTION.md) |
-| FacetBar / 重连分辨率 | [docs/COOLWALK_FACETBAR.md](docs/COOLWALK_FACETBAR.md) |
-| Open/Close 卡顿分析 | [docs/OPEN_CLOSE_LAG.md](docs/OPEN_CLOSE_LAG.md) |
-| 仪表歌词时钟试验 | [docs/CLUSTER_LYRIC_CLOCK.md](docs/CLUSTER_LYRIC_CLOCK.md) |
-| 历史版本用户说明 | [docs/archive/](docs/archive/) |
+**Q：桌面上找不到 AADisplay？**  
+A：正常。请到 **LSPosed** 里点模块名称打开状态页。
+
+**Q：状态显示未激活 / 需要重启？**  
+A：确认 LSPosed 里模块已开，作用域至少勾了「系统框架」，然后 **重启手机**。若要用 Android Auto，再勾「Android Auto」并重启。
+
+**Q：手机没装 Android Auto，能用吗？**  
+A：可以，只要车机支持 **无线 CarPlay**。LSPosed 勾「系统框架」即可；状态页会默认 CarPlay，按上面「4a」连车。
+
+**Q：第一次连 AA 一直卡在引导、进不了分屏？**  
+A：先装齐 Google App、地图、语音服务，走完 AA 首次设置；进过分屏后再卸也可以。
+
+**Q：改完模块文件 / 装了新 APK，钩子好像没变？**  
+A：只改 Android Auto 相关时，可在手机上强制停止 Android Auto 再连；涉及系统框架的改动，仍要 **重启手机**。
+
+**Q：有线 USB 假 iPhone 那种 CarPlay？**  
+A：仓库里有实验代码（见 [`archive/usb-carplay/`](archive/usb-carplay/)），目前仍是 **半成品**，公开版 **未开放**，状态页也没有入口；日常请用无线 CarPlay。
 
 ---
 
@@ -232,4 +229,30 @@ export GRADLE_USER_HOME="$HOME/.gradle"
 
 ## License
 
-继承上游许可证，GPL-3.0 license。
+继承上游许可证，GPL-3.0。
+
+---
+
+## 自己编译（给会命令行的人）
+
+```bash
+export GRADLE_USER_HOME="$HOME/.gradle"
+./gradlew :aa-display:assembleDebug
+./gradlew :aa-display:assembleRelease
+```
+
+生成的包在：`aa-display/build/outputs/apk/` 下，文件名类似 `aa-display-0.3-17.8-r1.apk`。
+
+---
+
+## 给开发者
+
+改代码、查链路、CarPlay 协议细节，请从这里进：
+
+| 想了解什么 | 去哪看 |
+|------------|--------|
+| 项目约定、别乱改什么 | [AGENTS.md](AGENTS.md) |
+| 运行时整条链路 | [docs/EXECUTION.md](docs/EXECUTION.md) |
+| 无线 CarPlay 怎么连上 | [docs/CARPLAY_CONNECT.md](docs/CARPLAY_CONNECT.md) |
+| 其它专题文档 | [docs/](docs/) |
+| 旧版用户说明 | [docs/archive/](docs/archive/) |

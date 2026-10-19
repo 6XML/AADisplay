@@ -24,6 +24,9 @@ class CarPlayProjectionService : Service() {
     companion object {
         private val sessionRef = AtomicReference<CarPlaySourceSession?>(null)
         private val glCompositorRef = AtomicReference<CarPlayGlCompositor?>(null)
+        private val usbStageRef = AtomicReference<String?>(null)
+        private val usbStageListeners =
+            java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
 
         /**
          * CarPlay-only Host GPU compositor (SurfaceTexture → GLES → encoder).
@@ -46,6 +49,23 @@ class CarPlayProjectionService : Service() {
         /** True once [ensureSession] created a live [CarPlaySourceSession] (RFCOMM listening). */
         fun isSessionArmed(): Boolean = sessionRef.get() != null
 
+        fun usbDaemonStage(): String? = usbStageRef.get()
+
+        fun addUsbStageListener(listener: (String) -> Unit) {
+            usbStageListeners.add(listener)
+            usbStageRef.get()?.let { listener(it) }
+        }
+
+        internal fun publishUsbStage(stage: String) {
+            usbStageRef.set(stage)
+            for (l in usbStageListeners) {
+                try {
+                    l(stage)
+                } catch (_: Throwable) {
+                }
+            }
+        }
+
         fun stop(context: Context) {
             val i = Intent(context, CarPlayProjectionService::class.java).setAction(CarPlayConsts.ACTION_STOP)
             context.startService(i)
@@ -59,22 +79,30 @@ class CarPlayProjectionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             CarPlayConsts.ACTION_STOP -> {
-                CarPlayChannel.set(this, CarPlayChannel.CHANNEL_AA)
+                // With Android Auto installed, STOP means switch back to AA (XOR egress).
+                // Without gearhead, keep CHANNEL_CARPLAY so BootArm / status-page re-arm still work.
+                if (CarPlayChannel.isAndroidAutoInstalled(this)) {
+                    CarPlayChannel.set(this, CarPlayChannel.CHANNEL_AA)
+                }
                 tearDown("stop-intent")
                 stopSelf()
                 return START_NOT_STICKY
             }
             CarPlayConsts.ACTION_CONNECT -> {
-                CarPlayChannel.set(this, CarPlayChannel.CHANNEL_CARPLAY)
+                // Preserve USB channel if already selected; otherwise default wireless.
+                if (!CarPlayChannel.useCarPlayEgress(this)) {
+                    CarPlayChannel.set(this, CarPlayChannel.CHANNEL_CARPLAY)
+                }
                 ensureForeground()
-                val launchHost = intent.getBooleanExtra(EXTRA_LAUNCH_HOST_TRAMPOLINE, true)
-                ensureSession(launchHostTrampoline = launchHost)
+                val launchHost = intent.getBooleanExtra(EXTRA_LAUNCH_HOST_TRAMPOLINE, true) &&
+                    !CarPlayChannel.useUsbCarPlay(this)
+                safeEnsureSession(launchHostTrampoline = launchHost)
             }
             // System restart / sticky re-delivery: only re-arm when the user chose CarPlay.
             else -> {
                 if (CarPlayChannel.useCarPlayEgress(this)) {
                     ensureForeground()
-                    ensureSession(launchHostTrampoline = true)
+                    safeEnsureSession(launchHostTrampoline = true)
                 } else {
                     tearDown("channel-aa")
                     stopSelf()
@@ -83,6 +111,20 @@ class CarPlayProjectionService : Service() {
             }
         }
         return START_STICKY
+    }
+
+    /**
+     * Missing BT runtime perms used to throw out of [onStartCommand] → process death →
+     * sticky restart crash loop. Keep the FGS up; RFCOMM soft-fails until perms are granted.
+     */
+    private fun safeEnsureSession(launchHostTrampoline: Boolean) {
+        try {
+            ensureSession(launchHostTrampoline = launchHostTrampoline)
+        } catch (e: SecurityException) {
+            Log.e(CarPlayConsts.TAG, "ensureSession SecurityException — grant BT perms", e)
+        } catch (e: Throwable) {
+            Log.e(CarPlayConsts.TAG, "ensureSession failed", e)
+        }
     }
 
     private fun ensureForeground() {
@@ -121,31 +163,28 @@ class CarPlayProjectionService : Service() {
     private fun ensureSession(launchHostTrampoline: Boolean = true) {
         if (session != null) {
             // Soft re-arm (AutoArm ladder / sticky restart): keep the existing
-            // SourceSession + RFCOMM listen. Rebinding GL here used to recycle
-            // MediaCodec 3× before the HU dialed and looked like connect failure.
-            reportLive(true)
-            if (!CarPlayHostRuntime.isRunning()) {
-                CarPlayHostRuntime.ensureStartedSync(this, timeoutMs = 5_000L)
-                glCompositorRef.get()?.let { session?.attachGlCompositor(it) }
-            }
+            // SourceSession + RFCOMM / RTSP listen. Do not re-report live or boot Host —
+            // idle AutoArm used to spin MediaCodec + dual VDs with no HU attached.
+            Log.d(CarPlayConsts.TAG, "CarPlayProjectionService already armed — keep listen")
             return
         }
-        Log.i(CarPlayConsts.TAG, "CarPlayProjectionService CONNECT")
-        // Live flag first: Host onCreateSplitDisplay must skip FacetBar settle.
-        reportLive(true)
-        // Sync Host before session: SETUP must see glCompositor, not tee test-pattern.
-        val hostOk = CarPlayHostRuntime.ensureStartedSync(this, timeoutMs = 5_000L)
-        Log.i(CarPlayConsts.TAG, "CarPlayProjectionService hostRuntime=$hostOk")
+        Log.i(CarPlayConsts.TAG, "CarPlayProjectionService CONNECT (listen-only)")
+        // Lightweight arm: BT cafe + RTSP listen only. Host GL / dual VD / MediaCodec /
+        // audio capture arm later in CarPlaySourceSession.prepareMediaPipeline when the
+        // HU actually dials (or screen SETUP arrives).
+        // Drop orphan VDs left by a prior force-stop / crash (apps kept rendering at 60fps).
+        CarPlayHostRuntime.releaseOrphansIfIdle("listen-arm")
         val s = CarPlaySourceSession(applicationContext)
         session = s
         sessionRef.set(s)
+        // If Host was already warm (manual prior session), reuse the compositor.
         (glCompositorRef.get() ?: CarPlayHostRuntime.compositorOrNull())?.let {
             glCompositorRef.set(it)
             s.attachGlCompositor(it)
         }
         s.start()
-        // Skip when status page already armed us — trampoline + moveTaskToBack must not
-        // steal the UI task (see CarPlayHostActivity taskAffinity).
+        // Optional trampoline only when an explicit UI path asked for it — AutoArm /
+        // BootArm pass false so we never bring up HostActivity on reboot.
         if (launchHostTrampoline) {
             CarPlayHostActivity.launch(this)
         }

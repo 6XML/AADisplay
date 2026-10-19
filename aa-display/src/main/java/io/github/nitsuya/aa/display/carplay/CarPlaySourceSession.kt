@@ -18,12 +18,15 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Orchestrates Bonjour + BT iAP2 + RTSP + AVC + RTP for one wireless CarPlay Source session.
+ * Orchestrates CarPlay Source session:
+ * - wireless: Bonjour + BT iAP2 + Wi‑Fi handoff + RTSP
+ * - wired USB: aad-usb carkit iAP2 + NCM handoff + RTSP (same media stack)
  */
 class CarPlaySourceSession(
     private val appContext: Context,
 ) {
     private val running = AtomicBoolean(false)
+    private val usbMode = AtomicBoolean(false)
     val tee = FrameEgressTee()
     private var glCompositor: CarPlayGlCompositor? = null
     private val keyframesLogged = AtomicLong(0)
@@ -59,24 +62,29 @@ class CarPlaySourceSession(
     }
     private var bonjour: CarPlayBonjour? = null
     private var bluetooth: CarPlayBluetoothLink? = null
+    private var usbLink: CarPlayUsbLink? = null
     private var rtsp: CarPlayRtspSession? = null
     private var iap2: Iap2Session? = null
     private var wifiHandoff: CarPlayWifiHandoff? = null
+    private var usbHandoff: CarPlayUsbHandoff? = null
     /** True once we dialed AirPlay (0x4301 or `_airplay._tcp` / gateway fallback). */
     private val airplayDialed = AtomicBoolean(false)
+    /** Host / reportLive / audio-capture armed — only after HU dial or screen SETUP. */
+    private val mediaPrepared = AtomicBoolean(false)
     @Volatile private var lastWifiSsid: String? = null
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
-        Log.i(CarPlayConsts.TAG, "CarPlaySourceSession start")
-        ProjectionSessionGate.setCarPlayLive(true)
+        val wired = CarPlayChannel.useUsbCarPlay(appContext)
+        usbMode.set(wired)
+        Log.i(
+            CarPlayConsts.TAG,
+            "CarPlaySourceSession start mode=${if (wired) "usb" else "wireless"} (listen-only)",
+        )
+        // Do not set ProjectionSessionGate / reportLive / encoder here — idle AutoArm
+        // used to burn ~40% CPU on 720p60 encode + dual VDs with streaming=false.
         airplayDialed.set(false)
-        wifiHandoff = CarPlayWifiHandoff(appContext).also { handoff ->
-            handoff.onBound = { mac ->
-                iap2?.noteAccessoryWifiBound(mac)
-                onAccessoryWifiBound(mac)
-            }
-        }
+        mediaPrepared.set(false)
 
         supplyFps = CarPlayConsts.DEFAULT_VIDEO_FPS
         badRateWindows = 0
@@ -117,6 +125,150 @@ class CarPlaySourceSession(
         )
         rtsp = rtspSession
         rtspSession.startServer()
+
+        if (wired) {
+            startUsbTransport(rtspSession)
+        } else {
+            startWirelessTransport(rtspSession)
+        }
+    }
+
+    /**
+     * Boots Host GL + dual VDs and reports session live (audio capture / process boost).
+     * Idempotent. Call only when the HU is actually connecting — not on AutoArm listen.
+     */
+    private fun prepareMediaPipeline(reason: String) {
+        if (!running.get()) return
+        val first = mediaPrepared.compareAndSet(false, true)
+        ProjectionSessionGate.setCarPlayLive(true)
+        try {
+            // Before Host onCreateSplitDisplay so Coolwalk does not shrink VD panes.
+            CoreApi.reportCarPlaySessionLive(true)
+        } catch (e: Throwable) {
+            Log.e(CarPlayConsts.TAG, "reportCarPlaySessionLive failed ($reason)", e)
+        }
+        if (!first && CarPlayHostRuntime.isRunning()) {
+            CarPlayHostRuntime.compositorOrNull()?.let { gl ->
+                if (glCompositor !== gl) {
+                    glCompositor = gl
+                    gl.onRateReport = { target, actual -> onRateReport(target, actual) }
+                }
+            }
+            return
+        }
+        Log.i(CarPlayConsts.TAG, "prepareMediaPipeline reason=$reason")
+        CarPlayHostRuntime.ensureStartedSync(appContext, timeoutMs = 5_000L)
+        CarPlayHostRuntime.compositorOrNull()?.let { gl ->
+            glCompositor = gl
+            gl.onRateReport = { target, actual -> onRateReport(target, actual) }
+        }
+    }
+
+    private fun startUsbTransport(rtspSession: CarPlayRtspSession) {
+        usbHandoff = CarPlayUsbHandoff(appContext)
+        val sourceIdentity = CarPlayProfileRegistry.defaultSource()
+        val link = CarPlayUsbLink(
+            onConnected = { iap2?.onTransportConnected() },
+            onDisconnected = {
+                if (iap2?.onTransportClosed() == false) return@CarPlayUsbLink
+                rtsp?.releaseMediaStreams("iap-usb-carkit-closed")
+                CarPlayNowPlaying.stop()
+                airplayDialed.set(false)
+            },
+            onBytes = { bytes -> iap2?.onBytes(bytes) },
+            onStage = { stage -> CarPlayProjectionService.publishUsbStage(stage) },
+        )
+        usbLink = link
+        // Lab: local HU stub replies to 0x1D00…0x4300 without Mac usbmux peer.
+        // Gate: /data/local/tmp/aad_iap2_hu_stub. Async reply avoids re-entering
+        // Iap2Session.lock from inside sendRaw. Stub starts after RTSP port is known.
+        val stubWanted = CarPlayUsbHuStub.enabled()
+        val huStubRef = java.util.concurrent.atomic.AtomicReference<CarPlayUsbHuStub?>(null)
+        iap2 = Iap2Session(
+            sendRaw = { bytes ->
+                link.sendRaw(bytes)
+                huStubRef.get()?.onPhoneBytes(bytes)
+            },
+            bluetoothTransportId = { "00:00:00:00:00:00" },
+            onLinkReady = {
+                Log.i(CarPlayConsts.TAG, "iAP USB link ready → Identification")
+            },
+            onIdentificationComplete = {
+                Log.i(CarPlayConsts.TAG, "iAP USB identification done → Auth")
+            },
+            onAuthComplete = {
+                Log.i(CarPlayConsts.TAG, "iAP USB auth done → CarPlayStartSession")
+            },
+            onWifiConfig = { wifi ->
+                // Wired path must not join accessory Wi‑Fi.
+                Log.i(CarPlayConsts.TAG, "iAP USB ignore Wi‑Fi creds ssid=${wifi.ssid}")
+            },
+            onCarPlayStart = { start ->
+                // Loopback 0x4301 (HU-stub) skips NCM bind; real HU still ensureUsbNetwork.
+                val host = CarPlayUsbHandoff.pickDialHost(start.ipAddresses)
+                if (host == "127.0.0.1" || host == "::1") {
+                    dialCarPlayControl(start)
+                } else {
+                    usbHandoff?.ensureUsbNetwork {
+                        dialCarPlayControl(start)
+                    } ?: dialCarPlayControl(start)
+                }
+            },
+            onNowPlayingUpdates = { CarPlayNowPlaying.onUpdatesRequested() },
+            onFileTransferDatagram = { dg -> CarPlayNowPlaying.onFileTransferDatagram(dg) },
+            sourceIdentity = sourceIdentity,
+            wired = true,
+        )
+        link.start()
+        link.arm()
+        if (stubWanted) {
+            Thread({
+                var waits = 0
+                while (running.get() && rtspSession.localPort <= 0 && waits < 50) {
+                    try {
+                        Thread.sleep(20L)
+                    } catch (_: InterruptedException) {
+                        return@Thread
+                    }
+                    waits++
+                }
+                val port = rtspSession.localPort
+                if (port <= 0 || usbLink !== link) return@Thread
+                val stub = CarPlayUsbHuStub(
+                    airplayHost = "127.0.0.1",
+                    airplayPort = port,
+                    onHuBytes = { bytes ->
+                        Thread({
+                            iap2?.onBytes(bytes)
+                        }, "usb-hu-stub").apply { isDaemon = true }.start()
+                    },
+                )
+                huStubRef.set(stub)
+                Log.i(CarPlayConsts.TAG, "USB HU-stub enabled → 0x4301 127.0.0.1:$port")
+                try {
+                    Thread.sleep(200L)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+                if (usbLink !== link) return@Thread
+                Log.i(CarPlayConsts.TAG, "USB HU-stub synthesize carkit transport-up")
+                iap2?.onTransportConnected()
+            }, "usb-hu-stub-arm").apply { isDaemon = true }.start()
+        }
+        Log.i(
+            CarPlayConsts.TAG,
+            "USB CarPlay armed — RTSP listen=${rtspSession.localPort} waiting carkit" +
+                if (stubWanted) " (+HU-stub pending)" else "",
+        )
+    }
+
+    private fun startWirelessTransport(rtspSession: CarPlayRtspSession) {
+        wifiHandoff = CarPlayWifiHandoff(appContext).also { handoff ->
+            handoff.onBound = { mac ->
+                iap2?.noteAccessoryWifiBound(mac)
+                onAccessoryWifiBound(mac)
+            }
+        }
 
         val bj = CarPlayBonjour(
             appContext,
@@ -199,8 +351,6 @@ class CarPlaySourceSession(
             sourceIdentity = sourceIdentity,
         )
         link.start()
-
-        ensureEncoder(CarPlayConsts.DEFAULT_VIDEO_WIDTH, CarPlayConsts.DEFAULT_VIDEO_HEIGHT)
     }
 
     /**
@@ -269,6 +419,7 @@ class CarPlaySourceSession(
         if (host == null || port <= 0 || port > 65535) return
         if (!airplayDialed.compareAndSet(false, true)) return
         Log.i(CarPlayConsts.TAG, "AirPlay dial $host:$port ($reason) [fallback]")
+        prepareMediaPipeline("airplay-fallback")
         val hu = iap2?.currentHuProfile() ?: CarPlayProfileRegistry.defaultHu()
         rtsp?.connectAsAirPlaySource(
             host = host,
@@ -284,11 +435,11 @@ class CarPlaySourceSession(
     private fun dialCarPlayControl(start: Iap2Csm.CarPlayStart) {
         val port = start.port ?: return
         if (port <= 0 || port > 65535) return
-        // Prefer explicit IPv4 from StartSession; DiPlay sometimes only puts fe80 in
+        val wired = usbMode.get()
+        // Prefer explicit IPv4/global from StartSession; DiPlay sometimes only puts fe80 in
         // 0x4301 — fall back to the accessory AP DHCP/gateway on the joined Wi‑Fi.
-        val host = start.ipAddresses.firstOrNull {
-            it.isNotBlank() && !it.startsWith("fe80:", ignoreCase = true)
-        } ?: wifiHandoff?.accessoryIpv4Hint(start.ssid)
+        val host = CarPlayUsbHandoff.pickDialHost(start.ipAddresses)
+            ?: if (!wired) wifiHandoff?.accessoryIpv4Hint(start.ssid) else null
             ?: start.ipAddresses.firstOrNull()
         if (host.isNullOrBlank()) {
             Log.i(
@@ -317,29 +468,48 @@ class CarPlaySourceSession(
                 Log.e(CarPlayConsts.TAG, "StartSession resolve failed $host", e)
                 return@Thread
             }
-            // Handoff / DHCP may still be settling after accessory Wi‑Fi bind.
+            // HU-stub / lab loopback: plain sockets, no accessory Network bind.
+            val loopback = addr.isLoopbackAddress
+            // Handoff / DHCP may still be settling after accessory Wi‑Fi / NCM bind.
             var lastErr: Throwable? = null
             for (attempt in 1..12) {
                 if (!running.get()) return@Thread
                 try {
-                    // Specifier Network handles die while wlan0 stays associated;
-                    // refresh AccessoryNet before every probe or dial hits LTE/null.
-                    val ssidForBind = start.ssid ?: lastWifiSsid
-                    if (!ssidForBind.isNullOrBlank()) {
-                        wifiHandoff?.rebindForDial(ssidForBind)
-                    }
-                    if (!CarPlayAccessoryNet.hasNetwork()) {
-                        throw IllegalStateException("accessory Wi-Fi Network not bound")
+                    if (!loopback) {
+                        if (wired) {
+                            usbHandoff?.rebindForDial()
+                        } else {
+                            val ssidForBind = start.ssid ?: lastWifiSsid
+                            if (!ssidForBind.isNullOrBlank()) {
+                                wifiHandoff?.rebindForDial(ssidForBind)
+                            }
+                        }
+                        if (!CarPlayAccessoryNet.hasNetwork()) {
+                            throw IllegalStateException(
+                                if (wired) "USB NCM Network not bound"
+                                else "accessory Wi-Fi Network not bound",
+                            )
+                        }
                     }
                     Log.i(
                         CarPlayConsts.TAG,
                         "AirPlay source dial from StartSession $host:$port " +
-                            "deviceId=${start.deviceId} attempt=$attempt",
+                            "deviceId=${start.deviceId} attempt=$attempt " +
+                            "mode=${if (wired) "usb" else "wifi"}" +
+                            if (loopback) " loopback" else "",
                     )
                     // Probe reachability before committing the AirPlay handshake thread.
-                    CarPlayAccessoryNet.openTcp().use { probe ->
-                        probe.connect(java.net.InetSocketAddress(addr, port), 2_500)
+                    if (loopback) {
+                        java.net.Socket().use { probe ->
+                            probe.connect(java.net.InetSocketAddress(addr, port), 2_500)
+                        }
+                    } else {
+                        CarPlayAccessoryNet.openTcp().use { probe ->
+                            probe.connect(java.net.InetSocketAddress(addr, port), 2_500)
+                        }
                     }
+                    // HU reachable — warm Host/VD/audio before SETUP so first frame is ready.
+                    prepareMediaPipeline("airplay-dial")
                     val bySsid = CarPlayProfileResolver.matchSsid(start.ssid)
                     val hu = when {
                         bySsid != null &&
@@ -353,7 +523,7 @@ class CarPlaySourceSession(
                         huProfile = hu,
                         sourceIdentity = CarPlayProfileRegistry.defaultSource(),
                         phoneMac = bluetooth?.localAddress(),
-                        wifiMac = wifiHandoff?.staMacForAnnounce(),
+                        wifiMac = if (wired) null else wifiHandoff?.staMacForAnnounce(),
                     )
                     return@Thread
                 } catch (e: Throwable) {
@@ -362,20 +532,25 @@ class CarPlaySourceSession(
                         CarPlayConsts.TAG,
                         "AirPlay dial attempt=$attempt failed: ${e.message}",
                     )
-                    // Stale/missing accessory Network: kick handoff so the next
-                    // probe binds to Wi‑Fi instead of LTE default (10.13.x → AP fail).
-                    val ssid = start.ssid
-                    if (!ssid.isNullOrBlank() &&
-                        (e.message?.contains("accessory Wi-Fi") == true ||
-                            !CarPlayAccessoryNet.hasNetwork())
-                    ) {
+                    if (wired) {
                         try {
-                            wifiHandoff?.ensureAccessoryWifi(
-                                ssid,
-                                start.passphrase,
-                                start.channel,
-                            ) {}
+                            usbHandoff?.ensureUsbNetwork {}
                         } catch (_: Throwable) {
+                        }
+                    } else {
+                        val ssid = start.ssid
+                        if (!ssid.isNullOrBlank() &&
+                            (e.message?.contains("accessory Wi-Fi") == true ||
+                                !CarPlayAccessoryNet.hasNetwork())
+                        ) {
+                            try {
+                                wifiHandoff?.ensureAccessoryWifi(
+                                    ssid,
+                                    start.passphrase,
+                                    start.channel,
+                                ) {}
+                            } catch (_: Throwable) {
+                            }
                         }
                     }
                     try {
@@ -435,6 +610,7 @@ class CarPlaySourceSession(
         // Ignore our own advertisement.
         if (port == rtsp?.localPort) return
         Log.i(CarPlayConsts.TAG, "dialing resolved CarPlay control $host:$port")
+        prepareMediaPipeline("bonjour")
         rtsp?.connect(host, port)
     }
 
@@ -467,6 +643,8 @@ class CarPlaySourceSession(
 
     private fun ensureEncoderMain(width: Int, height: Int, forceSurfaceRefresh: Boolean) {
         if (!running.get()) return
+        // Screen SETUP can arrive before dial warm-up finishes — arm Host/live first.
+        prepareMediaPipeline("video-setup")
         // MIB3 /info pixels as-is (Audi 1412×654). 16-align made SPS 1424×656 while
         // SETUP/CONFIG stayed 1412×654 — HU black + ~12s airplay-control kill.
         val (encW, encH) = if (
@@ -693,6 +871,10 @@ class CarPlaySourceSession(
         CarPlayNowPlaying.stop()
         wifiHandoff?.release()
         wifiHandoff = null
+        usbHandoff?.release()
+        usbHandoff = null
+        usbLink?.stop()
+        usbLink = null
         bluetooth?.stop()
         bluetooth = null
         iap2 = null
@@ -700,6 +882,8 @@ class CarPlaySourceSession(
         bonjour = null
         rtsp?.stop()
         rtsp = null
+        usbMode.set(false)
+        mediaPrepared.set(false)
         ProjectionSessionGate.setCarPlayLive(false)
     }
 

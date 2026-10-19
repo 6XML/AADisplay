@@ -446,7 +446,7 @@ flowchart TB
 | Ctrl + S | 对调两窗（`swapPanes`） |
 | 其它物理键 | `inject` 到当前焦点窗（跟随鼠标焦点） |
 
-**折叠屏注意（如三星 W7023）**
+**折叠屏 / 多面板注意**
 
 - 系统实体屏光标：`forceHideCursor` + 藏 icon；可见指针只在 AA 壳 overlay。
 - 可选一次 `setVirtualMousePointerDisplayId` 绑 shell，避免合盖外屏 mapper 画 ghost cursor。
@@ -555,12 +555,12 @@ CarPlay Host（唯一 CP 出画路径，GPU 零拷贝）:
     → MediaCodec createInputSurface → ScreenStreamEgress → 车机
 
 临时回退（Host Runtime 未就绪）:
-  FrameEgressTee 测试图案 → 同上编码器（FGS `CarPlayHostRuntime` 会先于 SETUP 武装；不依赖 Activity）
+  FrameEgressTee 测试图案 → 同上编码器（`prepareMediaPipeline` 在 AirPlay dial / SETUP 时武装 Host；空闲 AutoArm 仅 BT+RTSP listen）
 ```
 
 - SETUP `type=110` 后连 `dataPort`；密钥 = HKDF(pairVerify.shared, `DataStream-Salt{id}`, …)。
 - 帧率状态机在 `CarPlaySourceSession`（60↔30）；**不重发 SETUP**。DiPlay 解码帧率自持，车机需设 60fps。
-- **出画互斥**：`CarPlayChannel` AA XOR CarPlay；无 AA 壳双通道 tee。GL/VD 由 `CarPlayHostRuntime`（FGS 拥有）武装，`CarPlayHostActivity` 仅可选 trampoline（销毁不拆画面）。日志 `feed=gl-compositor`（正常）/ `feed=tee-canvas`（仅 Runtime 未挂上时）；`CarPlayGlCompositor rate ~XXfps`。
+- **出画互斥**：`CarPlayChannel` AA XOR CarPlay；无 AA 壳双通道 tee。GL/VD 由 `CarPlayHostRuntime`（FGS 拥有）在 `prepareMediaPipeline` 时武装（非开机空转）；`CarPlayHostActivity` 仅可选 trampoline。日志 `feed=gl-compositor`（正常）/ `feed=tee-canvas`（仅 Runtime 未挂上时）；`CarPlayGlCompositor rate ~XXfps`（仅 encoder attach 后）。
 
 **音频（media ⊕ speech，互斥内容）**
 

@@ -129,7 +129,7 @@ Audi 热点 SSID/策略不同；在 P0/P1 未过前不必深挖。
    - `BluetoothAdapter.setName("iPhone")`（或接近真机名）
    - `Iap2Session` Identification：`Name/Model/Manufacturer/Serial` 改为 iPhone 风格
    - `DeviceTransportIdentifier` 使用**真实对外可见**的 BT 地址（避免 Android 隐藏 MAC 时用合成地址与空中不一致）
-3. **USB 有线 fake iPhone（`docs/USB_CARPLAY.md`）的 VID/MAC 伪装与本问题无关** — 本次是无线 Audi MMI。
+3. **USB 有线 fake iPhone（`archive/usb-carplay/USB_CARPLAY.md`）的 VID/MAC 伪装与本问题无关** — 本次是无线 Audi MMI。
 
 ---
 

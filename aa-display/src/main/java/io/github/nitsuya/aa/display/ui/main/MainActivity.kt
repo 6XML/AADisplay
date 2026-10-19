@@ -110,6 +110,15 @@ class MainActivity : BaseActivity<ActivityMainBinding>(ActivityMainBinding::clas
         }
     }
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        CarPlayStatusUi.onPermissionsResult(this, baseBinding, requestCode, grantResults)
+    }
+
     private fun refreshVdDensityUi() {
         val configured = CoreApi.vdDensityDpi
         updateVdDensityInput(configured)

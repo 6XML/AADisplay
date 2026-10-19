@@ -73,6 +73,19 @@ object CarPlayHostRuntime {
 
     fun compositorOrNull(): CarPlayGlCompositor? = compositor
 
+    /**
+     * Destroy leftover system_server split VDs when this process is listen-only
+     * (Host never started). force-stop / crash used to leave Douyin/maps rendering
+     * into orphan 60fps VirtualDisplays and keep the phone hot.
+     */
+    fun releaseOrphansIfIdle(reason: String) {
+        if (isRunning()) return
+        Log.i(CarPlayConsts.TAG, "CarPlayHostRuntime releaseOrphansIfIdle reason=$reason")
+        runCatching { CoreApi.setPaneSurface(SplitPane.PRIMARY, null) }
+        runCatching { CoreApi.setPaneSurface(SplitPane.SECONDARY, null) }
+        runCatching { CoreApi.onDestroyDisplay() }
+    }
+
     /** Fire-and-forget; prefer [ensureStartedSync] before arming the encoder. */
     fun ensureStarted(context: Context) {
         ensureStartedSync(context, timeoutMs = 0L)

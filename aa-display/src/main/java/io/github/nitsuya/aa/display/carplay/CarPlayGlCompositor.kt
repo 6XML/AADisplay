@@ -168,8 +168,9 @@ class CarPlayGlCompositor {
         ready.await(3, TimeUnit.SECONDS)
         bootError?.let { throw it }
         if (!running.get()) return
+        // Do not start the 60 Hz renderTick until [attachEncoder] — Host can warm
+        // dual OES panes without burning GPU while waiting for screen SETUP.
         windowStart = SystemClock.uptimeMillis()
-        handler.post(renderTick)
         Log.i(
             CarPlayConsts.TAG,
             "CarPlayGlCompositor start panes=${paneWidth}x$paneHeight dpi=${this.densityDpi} " +
@@ -215,6 +216,8 @@ class CarPlayGlCompositor {
                 encoderAttached.set(true)
                 deliveredFrames.set(0)
                 windowStart = SystemClock.uptimeMillis()
+                handler.removeCallbacks(renderTick)
+                handler.post(renderTick)
                 ok.set(true)
                 Log.i(
                     CarPlayConsts.TAG,
@@ -352,6 +355,7 @@ class CarPlayGlCompositor {
     }
 
     private fun detachEncoderLocked() {
+        renderHandler?.removeCallbacks(renderTick)
         try {
             encoderWindow?.release()
         } catch (_: Throwable) {

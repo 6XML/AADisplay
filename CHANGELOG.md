@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.3#17.8-r2 — 有线 USB 归档 · CarPlay-only · 空闲不占 CPU
+
+versionCode **3102** / versionName **0.3#17.8-r2**。相对 r1：公开主线只保无线 CarPlay + AA；有线假 iPhone 进 archive；无 AA 可默认走 CarPlay；切通道/武装不再空转吃满 CPU。
+
+### Fixed
+- **切无线 CarPlay 进程崩溃循环：** 未申请 `BLUETOOTH_SCAN`/`CONNECT` 时 `BluetoothAdapter.getScanMode` 抛 `SecurityException`，sticky FGS 反复重启。状态页切无线前弹运行时权限；BT 链路与 ProjectionService 对缺权限软失败，不再杀进程。
+- **CarPlay 空闲占满 CPU 导致手机卡顿：** AutoArm / 切通道后在无车机时仍跑 720p60 MediaCodec + Host 双 VD + 音频采集（`streaming=false`、`dropMedia` 狂涨）。改为 listen-only（BT cafe + RTSP）；`prepareMediaPipeline` 延到 AirPlay dial / screen SETUP；GL renderTick 仅在 encoder attach 后启动；listen 时 `releaseOrphansIfIdle` 清掉 force-stop 残留 VD（抖音/地图继续 60fps 渲染）。
+
+### Changed
+- **无 Android Auto 也能用无线 CarPlay：** 未装 gearhead 时 `CarPlayChannel` 默认 `CHANNEL_CARPLAY`（首次写盘）；STOP 不再回落 AA；状态页隐藏 AA 电台并 arm FGS；BootArm 无持久化时同样按是否安装 AA 默认。README / AGENTS 拆出 CarPlay-only 安装路径（LSPosed 仅需系统框架）。
+- **有线 CarPlay（USB）归档开源准备：** 实验室工程与文档移至 [`archive/usb-carplay/`](archive/usb-carplay/)；`CarPlayChannel.USB_CARPLAY_ENABLED=false`，状态页隐藏 USB 通道，残留 `cp-usb` 回落 Android Auto（不误触 FGS / USB 传输）。App 侧 `CarPlayUsb*` 仍保留便于日后开启。推进细节见 archive 内 `USB_CARPLAY.md`。
+- **Version bump to `0.3#17.8-r2`** (`versionCode` 3102)。
+
 ## 0.3#17.8-r1
 
 ### Fixed

@@ -112,7 +112,7 @@
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="投屏通道"
+                    android:text="投到哪里"
                     android:textAlignment="viewStart"
                     android:textColor="@color/color_text_secondary"
                     android:textSize="16sp" />
@@ -121,7 +121,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="4dp"
-                    android:text="同一时间只能投到一个通道"
+                    android:text="同一时间只能选一个；换通道后原先那边会停掉"
                     android:textAlignment="viewStart"
                     android:textColor="@color/color_text_secondary"
                     android:textSize="12sp" />
@@ -131,23 +131,21 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="8dp"
-                    android:orientation="horizontal">
+                    android:orientation="vertical">
 
                     <RadioButton
                         android:id="@+id/rb_channel_aa"
-                        android:layout_width="0dp"
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:minHeight="40dp"
-                        android:text="Android Auto" />
+                        android:minHeight="48dp"
+                        android:text="Android Auto（原路投屏）" />
 
                     <RadioButton
                         android:id="@+id/rb_channel_cp"
-                        android:layout_width="0dp"
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:minHeight="40dp"
-                        android:text="CarPlay" />
+                        android:minHeight="48dp"
+                        android:text="CarPlay 无线（蓝牙连车机）" />
                 </RadioGroup>
             </LinearLayout>
         </FrameLayout>
@@ -266,7 +264,7 @@
 
         </FrameLayout>
 
-        <!-- CarPlay–only settings (session / cast). -->
+        <!-- CarPlay–only settings (plain-language status + how to connect). -->
         <FrameLayout
             android:id="@+id/panel_carplay"
             android:layout_width="match_parent"
@@ -286,28 +284,77 @@
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="CarPlay 配置"
+                    android:text="CarPlay 无线"
                     android:textAlignment="viewStart"
                     android:textColor="@color/color_text_secondary"
                     android:textSize="16sp" />
 
                 <TextView
-                    android:id="@+id/tv_carplay_status"
+                    android:id="@+id/tv_carplay_state"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="8dp"
+                    android:layout_marginTop="12dp"
+                    android:fontFamily="sans-serif-medium"
+                    android:textAlignment="viewStart"
+                    android:textColor="@color/color_primary"
+                    android:textSize="18sp"
+                    tools:text="等待车机连接" />
+
+                <TextView
+                    android:id="@+id/tv_carplay_detail"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
                     android:textAlignment="viewStart"
                     android:textColor="@color/color_text_primary"
                     android:textSize="14sp"
-                    tools:text="服务：已就绪（等车机）\n画面：分屏投屏\nHost：运行中" />
+                    tools:text="手机已准备好，请到车机上点连接 CarPlay" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:text="怎么连"
+                    android:textAlignment="viewStart"
+                    android:textColor="@color/color_text_secondary"
+                    android:textSize="14sp" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:lineSpacingExtra="4dp"
+                    android:text="1. 手机蓝牙先与车机配对（已配对可跳过）\n2. 上方选「CarPlay 无线」，允许蓝牙权限\n3. 在车机上打开 / 连接 CarPlay\n4. 若提示连车机热点，选加入"
+                    android:textAlignment="viewStart"
+                    android:textColor="@color/color_text_primary"
+                    android:textSize="13sp" />
 
                 <Button
                     android:id="@+id/btn_carplay_host"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="12dp"
-                    android:minHeight="40dp"
-                    android:text="启动 / 重开投屏" />
+                    android:layout_marginTop="16dp"
+                    android:minHeight="48dp"
+                    android:text="重新连接" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:text="使用提示"
+                    android:textAlignment="viewStart"
+                    android:textColor="@color/color_text_secondary"
+                    android:textSize="14sp" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:lineSpacingExtra="4dp"
+                    android:text="· 导航、音乐等声音从车机出；电话仍走手机听筒\n· 车机画面是双窗分屏，触控与分隔条用法和 AA 相同\n· 若用 DiPlay：设置 → 显示 → 帧率选 60（默认常为 30）"
+                    android:textAlignment="viewStart"
+                    android:textColor="@color/color_text_primary"
+                    android:textSize="13sp" />
             </LinearLayout>
         </FrameLayout>
 

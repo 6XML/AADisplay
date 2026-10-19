@@ -1,0 +1,13 @@
+=== plug Sun Oct 18 22:55:06 CST 2026 ===
+t=0 STATE present
+
+UDC=default
+2026-10-18 22:51 /dev/usb-ffs/usbmux/ep1 
+2026-10-18 22:51 /dev/usb-ffs/usbmux/ep2 
+---
+total 40
+-rw------- 1 root root 6152 2026-10-18 22:22 8080ef48-8dab-4d6c-9f48-f7bc424b185f
+-rw------- 1 root root 6152 2026-10-18 22:19 49556d41-abc8-4416-91de-7265d7e1bc2c
+-rw------- 1 root root 6152 2026-10-18 22:10 555481ac-690c-4431-85c5-2e92459d5598
+-rw------- 1 root root 6133 2026-10-18 21:35 49f27fec-bda7-04c0-3003-0527c14735c9
+-rw------- 1 root root 6133 2026-10-18 21:34 c9d892c6-d042-121a-58bf-169bcb63c51e

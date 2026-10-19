@@ -25,8 +25,8 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * App-side [io.github.nitsuya.aa.display.carplay.CarPlayAutoArmReceiver] cannot receive
  * [BluetoothAdapter.ACTION_STATE_CHANGED] while stopped
- * (`Background execution not allowed`). On Z Flip, BT (and Audi classic reconnect)
- * often comes up ~15–20s before [Intent.ACTION_BOOT_COMPLETED] starts the app — the HU
+ * (`Background execution not allowed`). Some OEMs enable Bluetooth (and classic HU
+ * reconnect) ~15–20s before [Intent.ACTION_BOOT_COMPLETED] starts the app — the HU
  * SDP for `…cafe` fails (`scn=0`) and backs off; the second connect works after cafe
  * is finally listening.
  *
@@ -143,8 +143,17 @@ object CarPlayBootArm {
     private fun isCarPlayChannelSelected(app: Context): Boolean {
         try {
             val v = Settings.Global.getInt(app.contentResolver, SETTINGS_CHANNEL, -1)
-            if (v == CarPlayChannel.CHANNEL_CARPLAY) return true
-            if (v == CarPlayChannel.CHANNEL_AA) return false
+            when (v) {
+                CarPlayChannel.CHANNEL_CARPLAY -> return true
+                CarPlayChannel.CHANNEL_CARPLAY_USB -> {
+                    if (CarPlayChannel.USB_CARPLAY_ENABLED) return true
+                    // Leftover wired selection while USB is disabled.
+                    val fallback = CarPlayChannel.defaultChannel(app)
+                    mirrorSettings(app, fallback)
+                    return fallback == CarPlayChannel.CHANNEL_CARPLAY
+                }
+                CarPlayChannel.CHANNEL_AA -> return false
+            }
         } catch (_: Throwable) {
         }
         val userId = Process.myUid() / 100_000
@@ -165,11 +174,26 @@ object CarPlayBootArm {
                     mirrorSettings(app, CarPlayChannel.CHANNEL_CARPLAY)
                     return true
                 }
+                CarPlayChannel.CHANNEL_CARPLAY_USB.toString(), "cp-usb", "carplay-usb", "usb" -> {
+                    if (CarPlayChannel.USB_CARPLAY_ENABLED) {
+                        mirrorSettings(app, CarPlayChannel.CHANNEL_CARPLAY_USB)
+                        return true
+                    }
+                    val fallback = CarPlayChannel.defaultChannel(app)
+                    mirrorSettings(app, fallback)
+                    return fallback == CarPlayChannel.CHANNEL_CARPLAY
+                }
                 CarPlayChannel.CHANNEL_AA.toString(), "aa" -> {
                     mirrorSettings(app, CarPlayChannel.CHANNEL_AA)
                     return false
                 }
             }
+        }
+        // No persisted choice yet: phones without gearhead default to CarPlay.
+        val def = CarPlayChannel.defaultChannel(app)
+        if (def == CarPlayChannel.CHANNEL_CARPLAY) {
+            mirrorSettings(app, CarPlayChannel.CHANNEL_CARPLAY)
+            return true
         }
         return false
     }

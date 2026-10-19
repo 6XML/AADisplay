@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.AtomicReference
  * Best-effort join of the accessory hotspot after iAP2 `0x5703` / `0x4301`.
  * Callers wait for [ensureAccessoryWifi] before dialing AirPlay TCP.
  *
- * Samsung / ephemeral [WifiNetworkSpecifier] quirks this class must survive:
+ * OEM / ephemeral [WifiNetworkSpecifier] quirks this class must survive:
  * - `WifiInfo.ssid` often stays `<unknown ssid>` after a specifier join, so
  *   "already on SSID" must use our own [boundSsid] or [ConnectivityManager]
  *   transport SSID — never re-request / unregister a live join.
@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicReference
  *   Adopt that STA and hold it with a listen callback instead.
  * - Specifier [onUnavailable] must not leave a zombie [callbackRef] (dial forever
  *   "already pending"), nor abandon the session without a holding re-request.
- * - Specifier [onAvailable] Network handles often die within ~0.5s on One UI
+ * - Specifier [onAvailable] Network handles often die within ~0.5s on some OEMs
  *   (`activeRequest: null` while wlan0 stays up). Never treat that as "leave the
  *   AP"; re-adopt from [ConnectivityManager.getAllNetworks] and keep dialing.
  * - A live specifier callback with **no** WIFI [Network] (agent already gone)
@@ -99,7 +99,7 @@ class CarPlayWifiHandoff(context: Context) {
 
         if (isBoundTo(ssid) || adoptIfAssociated(ssid, reason = "ensure")) {
             onReady()
-            // Saved-network adopt alone is killed by Samsung UNWANTED within seconds.
+            // Saved-network adopt alone is killed by OEM UNWANTED within seconds.
             ensureHoldingSpecifier(ssid)
             return
         }
@@ -109,7 +109,7 @@ class CarPlayWifiHandoff(context: Context) {
         if (liveCb != null && existing?.equals(ssid, ignoreCase = true) == true) {
             Log.i(CarPlayConsts.TAG, "WiFi handoff already pending ssid=$ssid — queue dial")
             pendingReady.add(onReady)
-            // Specifier callback can outlive a usable Network handle (Samsung).
+            // Specifier callback can outlive a usable Network handle (OEM).
             // Re-adopt from allNetworks before giving up to the watch loop.
             if (rebindForDial(ssid) || adoptIfAssociated(ssid, reason = "pending-flush")) {
                 fireReady()
@@ -152,10 +152,10 @@ class CarPlayWifiHandoff(context: Context) {
 
     /**
      * Keep a local-only specifier [NetworkCallback] registered for the whole CP
-     * session so Samsung cannot mark the AP UNWANTED and tear TCP mid-stream.
+     * session so the framework cannot mark the AP UNWANTED and tear TCP mid-stream.
      *
      * Never [switchToListenHold] after a Specifier join: unregistering the
-     * Specifier callback drops L2 immediately on One UI (dial then sees
+     * Specifier callback drops L2 immediately on some OEMs (dial then sees
      * "accessory Wi-Fi Network not bound" forever).
      */
     private fun ensureHoldingSpecifier(ssid: String) {
@@ -247,7 +247,7 @@ class CarPlayWifiHandoff(context: Context) {
         if (adoptIfAssociated(ssid, reason = "pre-request")) {
             fireReady()
             // Fall through and still register Specifier so we own the hold.
-            // switchToListenHold here used to unregister Specifier → Samsung drops L2.
+            // switchToListenHold here used to unregister Specifier → OEM drops L2.
         }
 
         try {
@@ -255,13 +255,13 @@ class CarPlayWifiHandoff(context: Context) {
             if (!passphrase.isNullOrEmpty()) {
                 specifierBuilder.setWpa2Passphrase(passphrase)
             }
-            // Channel is logged only. WifiNetworkSpecifier.setBand() makes Samsung's
+            // Channel is logged only. WifiNetworkSpecifier.setBand() makes some OEMs'
             // WifiNetworkFactory reject the request ("frequency bands not yet supported"),
             // so a 5 GHz Audi AP (ch 149) never gets scanned. Match by SSID.
             if (channel != null) {
                 Log.i(CarPlayConsts.TAG, "WiFi handoff ssid=$ssid ch=$channel (no band constraint)")
             }
-            // Local-only: do not require INTERNET/VALIDATED — otherwise Samsung
+            // Local-only: do not require INTERNET/VALIDATED — otherwise some OEMs
             // scores the AP 0 and emits CMD_UNWANTED_NETWORK within a few seconds.
             val request = NetworkRequest.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
@@ -548,7 +548,7 @@ class CarPlayWifiHandoff(context: Context) {
         }
         holdCellularForInternet()
         // system_server: drop ACCEPT_UNVALIDATED so LTE is default (needs reboot once
-        // for new Stub). Retry — Samsung may re-stamp accept on NetworkAgent recreate.
+        // for new Stub). Retry — OEM may re-stamp accept on NetworkAgent recreate.
         preferCellularNow()
         mainHandler.postDelayed({ preferCellularNow() }, 1_500L)
         mainHandler.postDelayed({ preferCellularNow() }, 4_000L)
@@ -725,7 +725,7 @@ class CarPlayWifiHandoff(context: Context) {
     private fun networkStillUsable(network: Network): Boolean {
         return try {
             if (cm.getNetworkCapabilities(network) != null) return true
-            // One UI: Specifier Network can lose capabilities while LinkProperties
+            // OEM: Specifier Network can lose capabilities while LinkProperties
             // still names wlan0 — treat that as usable for socket bind refresh.
             cm.getLinkProperties(network)?.interfaceName?.isNotBlank() == true
         } catch (_: Throwable) {

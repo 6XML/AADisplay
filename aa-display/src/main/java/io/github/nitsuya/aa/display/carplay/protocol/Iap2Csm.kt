@@ -107,6 +107,25 @@ object Iap2Csm {
     }
 
     /**
+     * USB / NCM path `0x4300`: wired group only (param 0). Available=`1`, id is a
+     * stable transport string (USB serial or all-zero BT placeholder).
+     * Grounded: ncm_carplayd `iap2_auth.c` + MIB3 wired half of [mib3CarPlayAvailability].
+     */
+    fun carPlayAvailabilityWired(transportId: String): ByteArray {
+        val available = byteArrayOf(WIRELESS_CP_AVAILABLE.toByte())
+        val wired = encodeGroup(
+            linkedMapOf(
+                0x0000 to available,
+                0x0001 to Iap2Framing.utf8Param(transportId),
+            ),
+        )
+        return Iap2Framing.encodeCsm(
+            CARPLAY_AVAILABILITY,
+            linkedMapOf(0x0000 to wired),
+        )
+    }
+
+    /**
      * MIB3 `0x4300`: wired group (param 0) and wireless group (param 1).
      * Available is the byte `1`. The id is the Bluetooth address, not the Wi-Fi STA.
      */
@@ -142,6 +161,9 @@ object Iap2Csm {
 
     fun parseCarPlayStart(msg: Iap2Framing.ControlMessage): CarPlayStart {
         require(msg.messageId == CARPLAY_START_SESSION)
+        // Wired (ncm_carplayd / ARMiPhoneIAP2): param0 = WiredAttributes { id0 IPAddress };
+        // wireless (DiPlay / MIB3): param1 group may carry SSID/pass/channel/IPs.
+        val wired = msg.parameters[0x0000]?.let { parseGroup(it) }.orEmpty()
         val wireless = msg.parameters[0x0001]?.let { parseGroup(it) }.orEmpty()
         val portBytes = msg.parameters[0x0002]
         val port = when {
@@ -151,26 +173,28 @@ object Iap2Csm {
                 ((portBytes[0].toInt() and 0xFF) shl 8) or (portBytes[1].toInt() and 0xFF)
             else -> portBytes[0].toInt() and 0xFF
         }
-        // ip_address may be repeated UTF-8 params inside wireless group (id 0x0003) or list blob.
         val ips = mutableListOf<String>()
+        utf8(wired[0x0000])?.let(ips::add)
         wireless[0x0003]?.let { utf8(it)?.let(ips::add) }
         // Some stacks put multiple NUL-separated IPs in one param.
         wireless[0x0003]?.let { raw ->
             val parts = String(raw, Charsets.UTF_8).split('\u0000').map { it.trim() }.filter { it.isNotEmpty() }
             if (parts.size > 1) {
                 ips.clear()
+                utf8(wired[0x0000])?.let(ips::add)
                 ips.addAll(parts)
             }
         }
         return CarPlayStart(
             port = port,
             deviceId = utf8(msg.parameters[0x0003]),
+            // Wired may put raw Ed25519 LTPK in param4; keep string parse best-effort.
             pairingId = utf8(msg.parameters[0x0004]),
             sourceVersion = utf8(msg.parameters[0x0005]),
             ssid = utf8(wireless[0x0000]),
             passphrase = utf8(wireless[0x0001]),
             channel = wireless[0x0002]?.firstOrNull()?.toInt()?.and(0xFF),
-            ipAddresses = ips,
+            ipAddresses = ips.distinct(),
         )
     }
 

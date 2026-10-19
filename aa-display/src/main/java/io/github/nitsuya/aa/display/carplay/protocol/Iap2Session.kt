@@ -22,8 +22,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * 2. Link Synchronization (SYN / SYN+ACK / ACK)
  * 3. Identification (`0x1D00` → `0x1D01` → `0x1D02`)
  * 4. Accessory authentication (`0xAA00`…`0xAA05`)
- * 5. Wireless handoff: transport id / `0x4E0D` / `0x5702` / `0x4300` →
- *    `0x5703` Wi-Fi creds and/or `0x4301` CarPlayStartSession (media TCP follows)
+ * 5. Handoff:
+ *    - wireless: transport id / `0x4E0D` / `0x5702` / `0x4300` →
+ *      `0x5703` Wi-Fi creds and/or `0x4301` CarPlayStartSession
+ *    - wired USB: `0x4300` (wired group only) → wait for HU `0x4301` (NCM IP:port)
  *
  * Phone strings come from [sourceIdentity]; HU wireless path from [huProfile]
  * (resolved via [CarPlayProfileResolver], not vendor name checks in this class).
@@ -40,6 +42,11 @@ class Iap2Session(
     private val onFileTransferDatagram: ((ByteArray) -> Unit)? = null,
     private val sourceIdentity: CarPlaySourceIdentity = CarPlayProfileRegistry.defaultSource(),
     private val onHuProfileChanged: ((CarPlayHuProfile) -> Unit)? = null,
+    /**
+     * Wired USB (carkit) transport: skip detect / link-sync probes and enter
+     * Identification (`0x1D00`) immediately after the stream is up.
+     */
+    private val wired: Boolean = false,
 ) : NowPlayingEgress {
     private enum class State {
         Idle,
@@ -147,6 +154,10 @@ class Iap2Session(
     }
 
     fun onTransportConnected() {
+        if (wired) {
+            onWiredTransportConnected()
+            return
+        }
         synchronized(lock) {
             transportUsers++
             resetLocked()
@@ -193,6 +204,25 @@ class Iap2Session(
                 }
             }
         }, "iap2-detect-probe").apply { isDaemon = true }.start()
+    }
+
+    /**
+     * USB carkit path: stream is already the iAP2 control session — skip FF55 detect
+     * and link-sync, jump to StartIdentification.
+     */
+    fun onWiredTransportConnected() {
+        synchronized(lock) {
+            transportUsers++
+            resetLocked()
+            rejectedChallengeSizes.clear()
+            detectSeen.set(true)
+            synSent.set(true)
+            linkReady = true
+            state = State.LinkReady
+            Log.i(CarPlayConsts.TAG, "iAP wired transport up → Identification")
+            onLinkReady?.invoke()
+            beginIdentificationLocked()
+        }
     }
 
     /** @return false when this close belongs to a socket already replaced by a newer peer. */
@@ -691,7 +721,38 @@ class Iap2Session(
         pendingChallenge = null
         Log.i(CarPlayConsts.TAG, "iAP authentication complete ($reason)")
         onAuthComplete?.invoke()
-        beginWirelessHandoffLocked()
+        if (wired) {
+            beginWiredHandoffLocked()
+        } else {
+            beginWirelessHandoffLocked()
+        }
+    }
+
+    /**
+     * USB carkit: announce wired CarPlay availability and wait for the HU's
+     * `0x4301` (NCM endpoint). Do **not** request accessory Wi-Fi.
+     */
+    private fun beginWiredHandoffLocked() {
+        if (!wirelessStarted.compareAndSet(false, true)) return
+        val transportId = bluetoothTransportId()
+            .replace(":", "")
+            .ifBlank { "000000000000" }
+        sendControlLocked(Iap2Csm.carPlayAvailabilityWired(transportId))
+        Log.i(CarPlayConsts.TAG, "iAP CarPlayAvailability (0x4300) wired id=$transportId")
+        Thread({
+            try {
+                Thread.sleep(2_500)
+            } catch (_: InterruptedException) {
+                return@Thread
+            }
+            synchronized(lock) {
+                if (startSessionSeen.get() || state == State.Dead || state == State.Idle) return@synchronized
+                if (!wired) return@synchronized
+                val id = bluetoothTransportId().replace(":", "").ifBlank { transportId }
+                sendControlLocked(Iap2Csm.carPlayAvailabilityWired(id))
+                Log.i(CarPlayConsts.TAG, "iAP wired re-sent 0x4300; 0x4301 not yet seen")
+            }
+        }, "iap2-wired-start-retry").apply { isDaemon = true }.start()
     }
 
     private fun beginWirelessHandoffLocked() {

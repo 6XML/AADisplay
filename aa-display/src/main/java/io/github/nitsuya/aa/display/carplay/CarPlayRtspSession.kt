@@ -179,12 +179,14 @@ class CarPlayRtspSession(
             airplaySourceActive.set(true)
             try {
                 val mib3 = huProfile.usesMib3WirelessPath
-                var socket = CarPlayAccessoryNet.openTcp()
+                val loopback = host.isLoopbackAddress
+                var socket = CarPlayAccessoryNet.openTcp(allowUnbound = loopback)
                 socket.connect(InetSocketAddress(host, port), 15_000)
                 socket.soTimeout = 15_000
                 Log.i(
                     CarPlayConsts.TAG,
-                    "AirPlay source dial $host:$port deviceId=$deviceId hu=${huProfile.id}",
+                    "AirPlay source dial $host:$port deviceId=$deviceId hu=${huProfile.id}" +
+                        if (loopback) " loopback" else "",
                 )
                 peer = socket
                 var input = BufferedInputStream(socket.getInputStream())
@@ -228,7 +230,7 @@ class CarPlayRtspSession(
                         socket.close()
                     } catch (_: Throwable) {
                     }
-                    socket = CarPlayAccessoryNet.openTcp()
+                    socket = CarPlayAccessoryNet.openTcp(allowUnbound = loopback)
                     socket.connect(InetSocketAddress(host, port), 15_000)
                     socket.soTimeout = 15_000
                     peer = socket

@@ -459,11 +459,11 @@ object PhoneHidRedirect {
     }
 
     /**
-     * Samsung W7023 ADB: Cursor mapper paints the sprite on the active physical panel
-     * (cover displayId=1 folded / main displayId=0 open) *before* InputFilter. Must bind
-     * pointer display to the AA VD; otherwise the cursor stays on the phone even when
-     * clicks are stolen. services.jar has setVirtualMousePointerDisplayId but it may live
-     * on IMS / LocalService with OEM signatures — search broadly.
+     * Foldable / multi-panel: Cursor mapper paints the sprite on the active physical panel
+     * (cover vs main) *before* InputFilter. Must bind pointer display to the AA VD;
+     * otherwise the cursor stays on the phone even when clicks are stolen. services.jar
+     * has setVirtualMousePointerDisplayId but it may live on IMS / LocalService with OEM
+     * signatures — search broadly.
      */
     private fun resolvePointerApi(ims: Any) {
         runCatching {
@@ -535,9 +535,9 @@ object PhoneHidRedirect {
     }
 
     /**
-     * W7023 ADB: AA pane VDs were touch NONE and absent from Input viewports, so
-     * mOverriddenPointerDisplayId=16 still painted the sprite on display 0. Inject our
-     * pane viewports into every WM→IMS viewport update while the session is live.
+     * When AA pane VDs are touch NONE and absent from Input viewports,
+     * mOverriddenPointerDisplayId still paints the sprite on the default display.
+     * Inject our pane viewports into every WM→IMS viewport update while the session is live.
      */
     private fun hookDisplayViewports() {
         val ims = imsInstance ?: return
@@ -1064,7 +1064,7 @@ object PhoneHidRedirect {
                 if (!device.isExternal) return false
                 val ds = device.sources
                 if (isFingerTouchscreenSource(ds)) return false
-                // External cursor / mouse / touchpad (BT Keyboard Mouse on W7023).
+                // External cursor / mouse / touchpad (BT keyboard / mouse).
                 if (hasFullSource(ds, InputDevice.SOURCE_MOUSE) ||
                     hasFullSource(ds, InputDevice.SOURCE_MOUSE_RELATIVE) ||
                     hasFullSource(ds, InputDevice.SOURCE_TOUCHPAD) ||

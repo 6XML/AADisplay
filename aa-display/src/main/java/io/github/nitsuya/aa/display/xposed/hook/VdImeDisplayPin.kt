@@ -16,7 +16,7 @@ import java.lang.reflect.Field
  *
  * Rule: client on AA VD → IME window/token on that same VD. OEM / A16 paths that
  * rewrite the target to [Display.DEFAULT_DISPLAY] (fallback when system decorations
- * are off, or Samsung Flip `isFolded` → 0) are corrected only for our pane VDs.
+ * are off, or foldable cover-panel routing → 0) are corrected only for our pane VDs.
  *
  * Soft-keyboard height: with a BT hard keyboard attached, LatinIME's
  * [android.inputmethodservice.InputMethodService.onEvaluateInputViewShown] returns

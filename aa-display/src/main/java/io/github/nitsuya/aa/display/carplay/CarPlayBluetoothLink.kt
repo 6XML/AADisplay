@@ -82,10 +82,31 @@ class CarPlayBluetoothLink(
      * When an inbound-preferred HU is already bonded, skip the system discoverable
      * dialog — reconnect uses the existing link key / ACL, not inquiry.
      */
+    /** Null when [BLUETOOTH_SCAN] is denied — never throw into the FGS start path. */
+    @SuppressLint("MissingPermission")
+    private fun readScanMode(bt: BluetoothAdapter): Int? {
+        return try {
+            bt.scanMode
+        } catch (e: SecurityException) {
+            Log.w(CarPlayConsts.TAG, "BT scanMode denied (need BLUETOOTH_SCAN): ${e.message}")
+            null
+        } catch (e: Throwable) {
+            Log.w(CarPlayConsts.TAG, "BT scanMode failed: ${e.message}")
+            null
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun armDiscoverable(bt: BluetoothAdapter) {
-        if (!bt.isEnabled) return
-        if (bt.scanMode == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) return
+        val enabled = try {
+            bt.isEnabled
+        } catch (e: SecurityException) {
+            Log.w(CarPlayConsts.TAG, "BT isEnabled denied (need BLUETOOTH_CONNECT): ${e.message}")
+            return
+        }
+        if (!enabled) return
+        val mode = readScanMode(bt) ?: return
+        if (mode == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) return
         if (!discoverableRequested.compareAndSet(false, true)) return
         val ok = try {
             val method = bt.javaClass.getMethod("setScanMode", Int::class.javaPrimitiveType)
@@ -94,8 +115,9 @@ class CarPlayBluetoothLink(
             Log.w(CarPlayConsts.TAG, "BT setScanMode discoverable failed: ${e.cause?.message ?: e.message}")
             false
         }
-        Log.i(CarPlayConsts.TAG, "BT discoverable ok=$ok scanMode=${bt.scanMode}")
-        if (ok || bt.scanMode == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) return
+        val after = readScanMode(bt)
+        Log.i(CarPlayConsts.TAG, "BT discoverable ok=$ok scanMode=$after")
+        if (ok || after == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) return
         if (bondedInboundPreferred(bt) != null) {
             Log.i(CarPlayConsts.TAG, "BT discoverable dialog skipped; HU already bonded")
             return
@@ -152,12 +174,29 @@ class CarPlayBluetoothLink(
             running.set(false)
             return
         }
-        if (!bt.isEnabled) {
+        val enabled = try {
+            bt.isEnabled
+        } catch (e: SecurityException) {
+            Log.e(
+                CarPlayConsts.TAG,
+                "BT permission missing — RFCOMM deferred (grant BLUETOOTH_CONNECT/SCAN)",
+                e,
+            )
+            running.set(false)
+            return
+        }
+        if (!enabled) {
             Log.w(CarPlayConsts.TAG, "Bluetooth off; iAP RFCOMM waiting for STATE_ON")
             armBtStateWatch()
             return
         }
-        beginRfcomm(bt)
+        try {
+            beginRfcomm(bt)
+        } catch (e: SecurityException) {
+            Log.e(CarPlayConsts.TAG, "BT RFCOMM arm denied — grant wireless CarPlay permissions", e)
+            rfcommArmed.set(false)
+            running.set(false)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -174,6 +213,8 @@ class CarPlayBluetoothLink(
             thread(name = "carplay-rfcomm-$name", isDaemon = true) {
                 try {
                     listen(bt, name, uuid)
+                } catch (e: SecurityException) {
+                    Log.e(CarPlayConsts.TAG, "RFCOMM listen denied uuid=$name", e)
                 } finally {
                     if (listenAlive.decrementAndGet() == 0 && running.get()) {
                         rfcommArmed.set(false)
@@ -193,26 +234,36 @@ class CarPlayBluetoothLink(
             // Keep HFP. Do not start A2DP: some HUs time that out and show
             // "cannot establish Bluetooth" instead of dialing iAP.
             // One-shot: the phone still held a key after the HU deleted the device.
-            val cleared = clearLeftoverHeadUnitBond(bt)
-            if (!cleared) {
-                // Pre-register bonded CarPlay peers so a later PAIRING_REQUEST is
-                // confirmed in system_server before Settings can pop.
-                prepareBondedCarPlayPeers(bt)
-                restoreHeadUnitAudio(bt)
+            try {
+                val cleared = clearLeftoverHeadUnitBond(bt)
+                if (!cleared) {
+                    // Pre-register bonded CarPlay peers so a later PAIRING_REQUEST is
+                    // confirmed in system_server before Settings can pop.
+                    prepareBondedCarPlayPeers(bt)
+                    restoreHeadUnitAudio(bt)
+                }
+                // Inbound-preferred HUs (Audi): do NOT arm a continuous …caff dial here.
+                // Cafe listen is the primary path; one-shot fallback after bond/ACL (and
+                // once at start if already bonded — force-stop does not re-fire ACL).
+                // Arming pending at start made dialBonded hit every 4s, racing cafe accept
+                // and cancelling SSP pairing.
+                bondedInboundPreferred(bt)?.let { scheduleHeadUnitDial(it) }
+            } catch (e: SecurityException) {
+                Log.e(CarPlayConsts.TAG, "BT dial prep denied", e)
             }
-            // Inbound-preferred HUs (Audi): do NOT arm a continuous …caff dial here.
-            // Cafe listen is the primary path; one-shot fallback after bond/ACL (and
-            // once at start if already bonded — force-stop does not re-fire ACL).
-            // Arming pending at start made dialBonded hit every 4s, racing cafe accept
-            // and cancelling SSP pairing.
-            bondedInboundPreferred(bt)?.let { scheduleHeadUnitDial(it) }
             while (running.get() && rfcommArmed.get()) {
-                armDiscoverable(bt)
-                // Only dial when there is no RFCOMM peer. A connected socket mid-negotiate
-                // (!sessionLive) must not be redialed — createRfcommSocket races the pump
-                // and leaves Audi silent after our first SYN.
-                if (clientSocket?.isConnected != true) {
-                    dialBonded(bt)
+                try {
+                    armDiscoverable(bt)
+                    // Only dial when there is no RFCOMM peer. A connected socket mid-negotiate
+                    // (!sessionLive) must not be redialed — createRfcommSocket races the pump
+                    // and leaves Audi silent after our first SYN.
+                    if (clientSocket?.isConnected != true) {
+                        dialBonded(bt)
+                    }
+                } catch (e: SecurityException) {
+                    Log.e(CarPlayConsts.TAG, "BT dial loop denied — stopping RFCOMM", e)
+                    rfcommArmed.set(false)
+                    return@thread
                 }
                 try {
                     Thread.sleep(DIAL_RETRY_MS)

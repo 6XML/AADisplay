@@ -30,4 +30,7 @@ jadx-*.zip
 /docs/capture/
 /tmp_mp_probe/
 /frida/iphone-event*.txt
+/archive/usb-carplay/frida/pair-*.txt
+**/__pycache__/
+*.py[cod]
 /*.apk

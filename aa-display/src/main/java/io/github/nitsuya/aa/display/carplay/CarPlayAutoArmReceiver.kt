@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicLong
  * reaches iAP2 — classic BT audio may already work, so the user hears sound long before
  * the CarPlay display comes up.
  *
- * Z Flip / Samsung often enable Bluetooth and let DiPlay take A2DP **before**
+ * Some OEMs enable Bluetooth and let the HU take A2DP **before**
  * [Intent.ACTION_BOOT_COMPLETED]. Manifest [BluetoothAdapter.ACTION_STATE_CHANGED]
  * is blocked while the app is stopped (`Background execution not allowed`); early
  * arm is done in system_server ([io.github.nitsuya.aa.display.xposed.carplay.CarPlayBootArm]).
@@ -112,17 +112,11 @@ class CarPlayAutoArmReceiver : BroadcastReceiver() {
             }
             Log.i(CarPlayConsts.TAG, "CarPlayAutoArm action=$action reason=$reason → start FGS")
             try {
-                CarPlayProjectionService.start(app)
+                // Listen-only: FGS + cafe RFCOMM / RTSP. Host/encoder wait for HU dial.
+                CarPlayProjectionService.start(app, launchHostTrampoline = false)
             } catch (e: Throwable) {
                 Log.e(CarPlayConsts.TAG, "CarPlayAutoArm start FGS failed ($reason)", e)
                 if (debounce) lastArmElapsed.set(0L)
-                return
-            }
-            // FGS ensureSession arms CarPlayHostRuntime (GL/VD) without needing an Activity.
-            // Best-effort trampoline — BAL may block; runtime already owns out-paint.
-            if (!CarPlayHostRuntime.isRunning()) {
-                CarPlayHostRuntime.ensureStarted(app)
-                CarPlayHostActivity.launch(app)
             }
         }
     }

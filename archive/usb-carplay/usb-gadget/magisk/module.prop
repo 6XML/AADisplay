@@ -1,0 +1,6 @@
+id=aadusb
+name=AADisplay USB CarPlay daemon
+version=0.1.0
+versionCode=1
+author=nitsuya
+description=Fake-iPhone USB gadget daemon (configfs/FunctionFS; usbmux+lockdown device side; bridges carkit to the AADisplay app on 127.0.0.1:48350). See archive/usb-carplay/USB_CARPLAY.md.

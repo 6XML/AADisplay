@@ -10,12 +10,12 @@ AADisplay 是 [Nitsuya/AADisplay](https://github.com/Nitsuya/AADisplay) 的生�
 
 | 项 | 说明 |
 |----|------|
-| 平台 | 仅 Android 手机 + Android Auto（无 iOS / Web / Desktop） |
+| 平台 | 仅 Android 手机；出口为 Android Auto 和/或无线 CarPlay（无 iOS / Web / Desktop） |
 | 最低系统 | Android 13+（`minSdk 33`），`compileSdk` / `targetSdk` 36 |
-| 运行前提 | Root + LSPosed（或兼容 Xposed）；至少勾选 System Framework + Android Auto |
-| AA 包名 | `com.google.android.projection.gearhead` |
+| 运行前提 | Root + LSPosed（或兼容 Xposed）；**System Framework 必选**；要用 AA 再勾 Android Auto。无 gearhead 时默认无线 CarPlay |
+| AA 包名 | `com.google.android.projection.gearhead`（可选；未安装也可只开 CarPlay） |
 | 许可证 | GPLv3（见 `LICENSE`） |
-| 版本号 | `0.24#<AA版本>-rN`（以 `aa-display/build.gradle.kts` 的 `versionName` / `versionCode` 为准） |
+| 版本号 | `0.3#<AA版本>-rN`（以 `aa-display/build.gradle.kts` 的 `versionName` / `versionCode` 为准） |
 
 本仓库 **无 CI、无有效自动化测试**；真机 + LSPosed + Android Auto 联调是主验证方式。
 
@@ -106,7 +106,7 @@ App 进程**不申请 Magisk `su`**（已移除 libsu）；VirtualDisplay 等能
 
 ### LSPosed scope
 
-见 `aa-display/src/main/res/values/arrays.xml`：`android`、`gearhead`。改 scope 会影响模块生效范围，勿随意删改。
+见 `aa-display/src/main/res/values/arrays.xml`：`android`、`gearhead`。改 scope 会影响模块生效范围，勿随意删改。仅无线 CarPlay（无 gearhead）时用户只需勾 `android`；`gearhead` 项保留给 AA 用户。`CarPlayChannel` 在未装 gearhead 时默认 `CHANNEL_CARPLAY`。
 仪表横条歌词：QQ 音乐车载（`com.tencent.qqmusiccar` → `METADATA_KEY_LYRIC`）+ QQ 音乐 HD（`com.tencent.qqmusicpad` → 同字段）+ 汽水（`com.luna.music`）——三源同时只能一个播放，谁在播谁更新仪表。音视频互斥：`AvMediaArbiter`（音乐 ∪ 抖音）单发声；粘性焦点——正在播的 AvMedia 不因地图/浏览器压顶自动丢权，仅停播 / 出栈 / 另一 Av 开始播时让出；`ClusterLyricMirror` 只绑三源中 PLAYING 的赢家。链路：`ClusterLyricMirror` → `ClusterLyricStore` → `:cluster` `ClusterLyricMediaService` Title 出站。换句仍改 TITLE；`AaClusterLyricEgressHook` 读壳 metadata 注入歌词/封面、HU 出站补 album、`setTitle` 原地改字（AA 顶栏）；同曲换句不 `scheduleProgressReassert`；Egress：`play_q`/`play_l` 500ms 窗 + `pushPlaybackNow`（Store 整秒 **+1s**，不 hook GAL）。MEDIA_ID 按曲稳定（不含 artRevision）；真机不闪 0:00（见 `docs/CLUSTER_LYRIC_CLOCK.md`）。`AaMediaAllowlistHook` 免开未知来源。LSPosed scope 仅 `android` + `gearhead`。
 
 ## 4. 构建与验证
@@ -151,10 +151,10 @@ Debug 联调可 `adb install -r aa-display/build/outputs/apk/debug/aa-display-*.
 安装验证流程：
 
 1. 安装 APK
-2. LSPosed 启用模块：至少 **System Framework** + **Android Auto**
+2. LSPosed 启用模块：**System Framework** 必选；用 AA 时再勾 **Android Auto**
 3. 重启设备
 4. 在 LSPosed → AADisplay 打开状态页查看激活状态（无桌面图标）
-5. 连接 Android Auto，验证双屏分屏、触控、任务切换、断开后约 180s 延迟销毁
+5. 连 AA 或无线 CarPlay，验证双屏分屏、触控、任务切换、断开后约 180s 延迟销毁
 
 改 AA 钩子后：对照目标 gearhead 版本；确认 DexKit 解析仍命中；查阅 `CHANGELOG.md`、`README.md` 与 `docs/archive/` 中的稳定性约束（如 display profile lock、TaskView）。
 
@@ -248,6 +248,7 @@ Debug 联调可 `adb install -r aa-display/build/outputs/apk/debug/aa-display-*.
 | VD DPI pin / Metrics 镜像 / 竖屏 letterbox 铺满 / Presentation 拦截 / IME 落屏 | `xposed/hook/VdDensityPin.kt`、`VdMetricsMirror.kt`、`VdOrientationFill.kt`、`PanePresentationGuard.kt`、`VdImeDisplayPin.kt` |
 | 手机蓝牙键鼠（操作 / 双窗 / 分隔条 / 堆栈） | [docs/EXECUTION.md](docs/EXECUTION.md) §10.1；`xposed/hook/PhoneHidRedirect.kt` |
 | 无线 CarPlay 出口（与 AA 双轨） | [docs/EXECUTION.md](docs/EXECUTION.md) §14（§14.1 播放链路速查 + 包边界）；**建连时序** [docs/CARPLAY_CONNECT.md](docs/CARPLAY_CONNECT.md)；**连热点仍走流量** [docs/CARPLAY_WIFI_CELLULAR.md](docs/CARPLAY_WIFI_CELLULAR.md)；协议外参 [docs/CARPLAY_REFS.md](docs/CARPLAY_REFS.md)；`carplay/`、`egress/ProjectionSessionGate`、`xposed/carplay/`；iAP2 → `protocol/Iap2Session.kt` |
+| **有线 CarPlay（USB fake-iPhone，WIP）** | 归档 [`archive/usb-carplay/`](archive/usb-carplay/)（`usb-gadget` / 文档 / pair 实验室）；App 侧 `CarPlayUsb*` 仍在树内但 `CarPlayChannel.USB_CARPLAY_ENABLED=false`，UI 隐藏，残留 `cp-usb` 回落 AA |
 | 重连分辨率结算（HU vs 内容区） | [docs/COOLWALK_FACETBAR.md](docs/COOLWALK_FACETBAR.md)、`util/DisplayProfileSettle.kt` + `CoreManagerService.resolveDisplayProfile`；`AaUiHook` starve `GhFacetBar` |
 | 仪表横条歌词（AA Title） | `xposed/cluster/ClusterLyricMirror.kt`、`LyricLineExtractor.kt`；`service/ClusterLyricMediaService.kt`（`:cluster`）；gearhead `AaMediaAllowlistHook` / `AaClusterLyricEgressHook` |
 | 音视频单发声 / 三源仪表 | `util/AvMediaArbiter.kt`、`util/MusicAppClassifier.kt`；`SplitBuriedPlayback` |

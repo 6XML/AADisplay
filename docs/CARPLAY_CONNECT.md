@@ -10,10 +10,11 @@
 
 ```
 状态页选 CarPlay
-  → FGS + Host GL 武装
+  → FGS 轻量武装（BT cafe + RTSP listen；不启 Host/编码器）
   → BT RFCOMM（listen …cafe / dial …caff）
   → iAP2（Detect → Link Sync → Ident → Auth → Wi‑Fi / StartSession）
   → 加入车机热点
+  → AirPlay dial / screen SETUP 时才 prepareMediaPipeline（Host GL + VD + 编码 + 音频采集）
   → AirPlay/RTSP 控制 TCP（GET /info → Pair-Setup → SETUP/RECORD）
   → screen / audio / event 通道
 ```
@@ -33,14 +34,20 @@
 
 通道文件：`filesDir/aadisplay_carplay_channel`（`0`=AA，`1`=CarPlay）。默认 **AA**，真车行为不变。
 
-FGS `ensureSession()` 顺序（硬约束）：
+FGS `ensureSession()`（开机 AutoArm / 切通道）只做**监听**：
 
-1. `reportCarPlaySessionLive(true)`（先于 Host / SETUP，避免 Coolwalk 把 VD 压小）
-2. `CarPlayHostRuntime.ensureStartedSync`（GL 先于编码器）
-3. `CarPlaySourceSession.start()`
-4. 可选 `CarPlayHostActivity` trampoline（销毁不拆画面）
+1. `CarPlaySourceSession.start()` → BT cafe + RTSP listen（**不** `reportLive`、**不** Host、**不** MediaCodec）
+2. AutoArm / BootArm 传 `launchHostTrampoline=false`
 
-会话存活：app 内 `ProjectionSessionGate`；system_server 经 `CoreApi.reportCarPlaySessionLive` → Delay Destroy 挂起 + `CarPlayProcessBoost`。
+真正建连时 `prepareMediaPipeline(reason)`（硬约束顺序）：
+
+1. `ProjectionSessionGate` + `reportCarPlaySessionLive(true)`（先于 Host，避免 Coolwalk 压小 VD）
+2. `CarPlayHostRuntime.ensureStartedSync`（GL / 双 VD）
+3. screen SETUP → `ensureEncoder` → MediaCodec + GL attach
+
+触发点：AirPlay TCP probe 成功 / Bonjour dial / screen SETUP（兜底）。
+
+会话存活：app 内 `ProjectionSessionGate`；system_server 经 `CoreApi.reportCarPlaySessionLive` → Delay Destroy 挂起 + `CarPlayProcessBoost` + 音频采集。
 
 ---
 
@@ -58,8 +65,7 @@ sequenceDiagram
     participant HU as 车机 / DiPlay
 
     UI->>FGS: CONNECT（channel=CP）
-    FGS->>FGS: reportLive + HostRuntime
-    FGS->>SS: start()
+    FGS->>SS: start() listen-only
     SS->>RTSP: startServer()（本机 listen）
     SS->>SS: Bonjour register + discover
     SS->>BT: start() listen cafe/caff/wcp + dial bonded
@@ -75,9 +81,10 @@ sequenceDiagram
     IAP->>WIFI: ensureAccessoryWifi
     WIFI->>HU: 加入配件热点
     IAP->>SS: onCarPlayStart
+    SS->>SS: prepareMediaPipeline（reportLive + Host）
     SS->>RTSP: connectAsAirPlaySource(IP, port)
     RTSP->>HU: GET /info → Pair-Setup → SETUP/RECORD
-    Note over RTSP,HU: screen dataPort / audio / event
+    Note over RTSP,HU: screen SETUP → ensureEncoder；audio / event
 ```
 
 并行注意：
@@ -229,4 +236,4 @@ sequenceDiagram
 | [CARPLAY_REFS.md](CARPLAY_REFS.md) | 外部协议参考与字节序 |
 | [CARPLAY_MAC_TEST.md](CARPLAY_MAC_TEST.md) | Mac Simulator 联调 |
 | [AUDI_CARPLAY_CONNECT_ANALYSIS.md](AUDI_CARPLAY_CONNECT_ANALYSIS.md) | 奥迪 MMI 连不上的监测与计划 |
-| [USB_CARPLAY.md](USB_CARPLAY.md) | **有线** USB fake-iPhone（另一条物理路径） |
+| [archive/usb-carplay/](../archive/usb-carplay/) | **有线** USB fake-iPhone（WIP，默认关闭 / UI 隐藏） |

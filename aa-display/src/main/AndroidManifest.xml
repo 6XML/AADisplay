@@ -5,7 +5,10 @@
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="31" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="32" />
     <uses-permission
@@ -101,8 +104,8 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
         <!-- Re-arm cafe RFCOMM after reboot / replace / unlock / BT ON (channel=CarPlay).
-             Z Flip often brings BT (A2DP sound) up before BOOT_COMPLETED; STATE_ON must
-             arm …cafe before DiPlay SDP backs off.
+             Some OEMs bring BT (A2DP sound) up before BOOT_COMPLETED; STATE_ON must
+             arm …cafe before the HU SDP backs off.
              Must be exported=true: targetSdk 36 + exported=false drops system
              BOOT_COMPLETED / USER_UNLOCKED / BT STATE_CHANGED, so cafe never listens. -->
         <receiver

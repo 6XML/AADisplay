@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * at background importance the cgroup scheduler starves the encoder (observed 2-4 fps
  * supply in background vs 11-15 foreground — docs/OPEN_CLOSE_LAG.md). system_server moves
  * the app pid into the top-app cgroup while CarPlay is live and back to foreground on
- * stop; a short watchdog re-asserts (Samsung reparents into `cpuset:/abnormal` within
+ * stop; a short watchdog re-asserts (some OEMs reparent into `cpuset:/abnormal` within
  * seconds if only `cpu` is boosted).
  *
  * Best-effort: any failure (OEM cgroup layout, SELinux) only disables the boost — the
@@ -28,7 +28,7 @@ object CarPlayProcessBoost {
     private const val TAG = "AAD_CpProcBoost"
 
     private const val TARGET_PACKAGE = "io.github.nitsuya.aa.display"
-    /** Samsung reparents to `cpuset:/abnormal` within a few seconds; 30s was too slow. */
+    /** OEMs may reparent to `cpuset:/abnormal` within a few seconds; 30s was too slow. */
     private const val WATCHDOG_PERIOD_MS = 3_000L
     private const val CGROUP_V2_ROOT = "/sys/fs/cgroup"
 
@@ -110,8 +110,8 @@ object CarPlayProcessBoost {
      * Writes [pid] into the given Android cgroup group across the controllers that matter
      * for encode throughput on hybrid OEM layouts:
      * - `cpu` (`/dev/cpuctl` or v2) — share / weight
-     * - `cpuset` (`/dev/cpuset`) — Samsung parks FGS in `abnormal` (CPUs 0-3 only); must
-     *   reassert `top-app` (0-7) or supply sticks at ~15 fps with 400ms gaps
+     * - `cpuset` (`/dev/cpuset`) — some OEMs park FGS in `abnormal` (few CPUs only); must
+     *   reassert `top-app` or supply sticks at ~15 fps with 400ms gaps
      * - `freezer` — leave OEM `abnormal` freezer so the process is not periodically frozen
      *
      * Best-effort: success on any primary controller counts; missing paths are ignored.
