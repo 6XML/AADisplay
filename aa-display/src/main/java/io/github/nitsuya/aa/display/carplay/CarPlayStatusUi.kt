@@ -40,6 +40,12 @@ object CarPlayStatusUi {
         }
         binding.btnCarplayHost.setOnClickListener {
             applyChannel(activity, binding, CarPlayChannel.CHANNEL_CARPLAY)
+            // Re-prompt discoverable so the HU can find the phone after reconnect.
+            CarPlayProjectionService.requestDiscoverable(activity)
+        }
+        binding.btnBtDiscoverable.setOnClickListener {
+            CarPlayProjectionService.requestDiscoverable(activity)
+            toast(activity, "请允许蓝牙可被发现（300 秒）")
         }
         refresh(activity, binding)
         ensureArmedIfCarPlay(activity)
@@ -92,7 +98,8 @@ object CarPlayStatusUi {
         if (CarPlayChannel.useCarPlayEgress(activity)) {
             // Listen-only until the HU dials — do not boot Host/VD/encoder here.
             CarPlayProjectionService.start(activity, launchHostTrampoline = false)
-            toast(activity, "已切到 CarPlay，请到车机上连接")
+            CarPlayProjectionService.requestDiscoverable(activity)
+            toast(activity, "已切到 CarPlay，请允许蓝牙可发现后到车机上连接")
         } else {
             CarPlayProjectionService.stop(activity)
             CarPlayHostActivity.current?.finish()
@@ -203,7 +210,8 @@ object CarPlayStatusUi {
             binding.rgCarplayChannel.check(wantId)
         }
 
-        binding.panelAa.visibility = if (carPlay || !aaInstalled) View.GONE else View.VISIBLE
+        // DPI panel stays visible for both AA and CarPlay (labels adapt in MainActivity).
+        binding.panelAa.visibility = View.VISIBLE
         binding.panelCarplay.visibility = if (carPlay) View.VISIBLE else View.GONE
     }
 

@@ -141,10 +141,10 @@ object CarPlayHostRuntime {
             appContext = app
             val w = CarPlayConsts.ENCODE_WIDTH
             val h = CarPlayConsts.ENCODE_HEIGHT
-            // Encode canvas is fixed 1280×720 — use ENCODE_UI_DENSITY_DPI so 1dp≈1px.
-            // Phone displayMetrics.densityDpi (often 360–480) inflated dividerPx into a fat
-            // black gutter between panes on DiPlay.
-            val dpi = CarPlayConsts.ENCODE_UI_DENSITY_DPI
+            // CarPlay has no HU density negotiate. Default ENCODE_UI_DENSITY_DPI (1dp≈1px
+            // on 1280×720); manual override from DisplayDpiStore / status page.
+            // Never use phone displayMetrics (360–480) — that fattened the divider gutter.
+            val dpi = resolveEncodeDpi()
             val paneW = (w / 2).coerceAtLeast(16)
             val gl = CarPlayGlCompositor()
             try {
@@ -291,7 +291,7 @@ object CarPlayHostRuntime {
             if (pendingCreateW == width && pendingCreateH == height) {
                 return true
             }
-            val dpi = CarPlayConsts.ENCODE_UI_DENSITY_DPI
+            val dpi = resolveEncodeDpi()
             val ratio = CarPlayInputBridge.primaryRatio.coerceIn(
                 SplitPane.MIN_RATIO,
                 SplitPane.MAX_RATIO,
@@ -310,6 +310,44 @@ object CarPlayHostRuntime {
             )
             return true
         }
+    }
+
+    /**
+     * Status-page DPI apply while Host is live: keep GL divider + split VD density matched.
+     * No-op when Host is idle (listen-only); next boot picks up [resolveEncodeDpi].
+     */
+    fun applyConfiguredDpi() {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            applyConfiguredDpiMain()
+        } else {
+            mainHandler.post { applyConfiguredDpiMain() }
+        }
+    }
+
+    private fun applyConfiguredDpiMain() {
+        synchronized(bootLock) {
+            if (!started.get()) return
+            val gl = compositor ?: return
+            val dpi = resolveEncodeDpi()
+            if (dpi == pendingCreateDpi && gl.currentDensityDpi() == dpi) return
+            pendingCreateDpi = dpi
+            gl.updateDensityDpi(dpi)
+            val w = pendingCreateW.takeIf { it > 0 } ?: CarPlayConsts.ENCODE_WIDTH
+            val h = pendingCreateH.takeIf { it > 0 } ?: CarPlayConsts.ENCODE_HEIGHT
+            val ratio = pendingCreateRatio.coerceIn(SplitPane.MIN_RATIO, SplitPane.MAX_RATIO)
+            syncGlBuffersForRatio(gl, ratio, w, h, dpi)
+            requestCreateSplitDisplay("dpi-$dpi")
+            Log.i(CarPlayConsts.TAG, "CarPlayHostRuntime applyConfiguredDpi dpi=$dpi")
+        }
+    }
+
+    /**
+     * Manual override from CoreApi, else fixed encode default.
+     * CarPlay never follows leftover Android Auto HU-reported density.
+     */
+    private fun resolveEncodeDpi(): Int {
+        val configured = runCatching { CoreApi.vdDensityDpi }.getOrDefault(0)
+        return if (configured > 0) configured else CarPlayConsts.ENCODE_UI_DENSITY_DPI
     }
 
     fun stop(reason: String) {

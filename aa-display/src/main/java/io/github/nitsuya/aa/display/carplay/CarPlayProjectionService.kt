@@ -70,6 +70,19 @@ class CarPlayProjectionService : Service() {
             val i = Intent(context, CarPlayProjectionService::class.java).setAction(CarPlayConsts.ACTION_STOP)
             context.startService(i)
         }
+
+        /**
+         * Status-page: show the 300s discoverable dialog so the HU can find the phone
+         * without opening Bluetooth Settings.
+         */
+        fun requestDiscoverable(context: Context) {
+            val session = sessionRef.get()
+            if (session != null) {
+                session.requestDiscoverableDialog()
+            } else {
+                CarPlayBluetoothLink.launchDiscoverableDialog(context)
+            }
+        }
     }
 
     private var session: CarPlaySourceSession? = null

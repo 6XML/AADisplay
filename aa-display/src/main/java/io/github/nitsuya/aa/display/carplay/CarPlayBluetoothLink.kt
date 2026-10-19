@@ -79,8 +79,10 @@ class CarPlayBluetoothLink(
      * After the HU deletes the phone, inquiry only sees a discoverable adapter.
      * Connectable-only keeps the old bond reconnecting and the new pair times out.
      *
-     * When an inbound-preferred HU is already bonded, skip the system discoverable
-     * dialog — reconnect uses the existing link key / ACL, not inquiry.
+     * Do **not** skip the system dialog just because a bond still exists on the phone —
+     * the HU may have wiped the phone while we keep a leftover key. Privileged
+     * [BluetoothAdapter.setScanMode] rarely works from the app uid; the 300s
+     * [BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE] dialog is the reliable path.
      */
     /** Null when [BLUETOOTH_SCAN] is denied — never throw into the FGS start path. */
     @SuppressLint("MissingPermission")
@@ -107,7 +109,6 @@ class CarPlayBluetoothLink(
         if (!enabled) return
         val mode = readScanMode(bt) ?: return
         if (mode == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) return
-        if (!discoverableRequested.compareAndSet(false, true)) return
         val ok = try {
             val method = bt.javaClass.getMethod("setScanMode", Int::class.javaPrimitiveType)
             method.invoke(bt, BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) as? Boolean ?: false
@@ -118,18 +119,29 @@ class CarPlayBluetoothLink(
         val after = readScanMode(bt)
         Log.i(CarPlayConsts.TAG, "BT discoverable ok=$ok scanMode=$after")
         if (ok || after == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) return
-        if (bondedInboundPreferred(bt) != null) {
-            Log.i(CarPlayConsts.TAG, "BT discoverable dialog skipped; HU already bonded")
-            return
-        }
-        // setScanMode needs a privileged uid. The system dialog is the app-visible path.
+        // Dial loop calls this often — show the consent dialog at most once per arm cycle.
+        if (!discoverableRequested.compareAndSet(false, true)) return
+        showDiscoverableDialog()
+    }
+
+    /**
+     * Status-page / reconnect: always re-prompt the 300s discoverable system dialog
+     * so the HU can find the phone without opening Bluetooth Settings.
+     */
+    fun requestDiscoverableDialog() {
+        discoverableRequested.set(false)
+        showDiscoverableDialog()
+        discoverableRequested.set(true)
+    }
+
+    private fun showDiscoverableDialog() {
         try {
             val intent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).apply {
                 putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             appContext.startActivity(intent)
-            Log.i(CarPlayConsts.TAG, "BT discoverable request dialog shown")
+            Log.i(CarPlayConsts.TAG, "BT discoverable request dialog shown (300s)")
         } catch (e: Throwable) {
             Log.w(CarPlayConsts.TAG, "BT discoverable request failed", e)
         }
@@ -967,6 +979,7 @@ class CarPlayBluetoothLink(
     fun stop() {
         running.set(false)
         rfcommArmed.set(false)
+        discoverableRequested.set(false)
         disarmBtStateWatch()
         disarmPeerWatch()
         disarmPairingWatch()
@@ -983,9 +996,25 @@ class CarPlayBluetoothLink(
         }
     }
 
-    private companion object {
-        const val DIAL_RETRY_MS = 4_000L
+    companion object {
+        private const val DIAL_RETRY_MS = 4_000L
         /** Wait for inbound …cafe before one …caff attempt (inbound-preferred HUs). */
-        const val INBOUND_DIAL_FALLBACK_MS = 2_500L
+        private const val INBOUND_DIAL_FALLBACK_MS = 2_500L
+
+        /** Status page when FGS is not yet armed — same 300s system dialog. */
+        fun launchDiscoverableDialog(context: Context) {
+            try {
+                val intent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).apply {
+                    putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
+                    if (context !is android.app.Activity) {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                }
+                context.startActivity(intent)
+                Log.i(CarPlayConsts.TAG, "BT discoverable request dialog shown (300s, static)")
+            } catch (e: Throwable) {
+                Log.w(CarPlayConsts.TAG, "BT discoverable request failed", e)
+            }
+        }
     }
 }

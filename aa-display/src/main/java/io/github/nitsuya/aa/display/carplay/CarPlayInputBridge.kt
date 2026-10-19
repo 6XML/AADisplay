@@ -298,8 +298,8 @@ object CarPlayInputBridge {
         val gl = CarPlayHostRuntime.compositorOrNull() ?: return
         val w = shellWidthPx.coerceAtLeast(2)
         val h = shellHeightPx.coerceAtLeast(1)
-        // Same dpi as HostRuntime / GlCompositor — not live phone/VD dpi (mismatch → black gutters).
-        val gap = SplitPane.dividerPx(CarPlayConsts.ENCODE_UI_DENSITY_DPI)
+        // Same dpi as HostRuntime / GlCompositor / VD (manual override or encode default).
+        val gap = SplitPane.dividerPx(gl.currentDensityDpi())
         val usable = (w - gap).coerceAtLeast(2)
         val left = (usable * ratio).toInt().coerceAtLeast(1)
         val right = (usable - left).coerceAtLeast(1)

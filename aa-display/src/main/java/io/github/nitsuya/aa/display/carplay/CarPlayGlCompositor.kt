@@ -147,7 +147,7 @@ class CarPlayGlCompositor {
      */
     fun start(paneWidth: Int, paneHeight: Int, densityDpi: Int = 160) {
         if (!running.compareAndSet(false, true)) return
-        this.densityDpi = densityDpi.coerceAtLeast(160)
+        this.densityDpi = densityDpi.coerceAtLeast(1)
         val thread = HandlerThread("carplay-gl-compose", Thread.MAX_PRIORITY).also { it.start() }
         renderThread = thread
         val handler = Handler(thread.looper)
@@ -177,6 +177,13 @@ class CarPlayGlCompositor {
                 "primary=${primarySurfaceRef.get() != null}",
         )
     }
+
+    /** Keep in lockstep with VD dpi after a status-page override. */
+    fun updateDensityDpi(dpi: Int) {
+        densityDpi = dpi.coerceAtLeast(1)
+    }
+
+    fun currentDensityDpi(): Int = densityDpi
 
     /**
      * Keep OES [SurfaceTexture] default buffers in lockstep with VD pane sizes after a

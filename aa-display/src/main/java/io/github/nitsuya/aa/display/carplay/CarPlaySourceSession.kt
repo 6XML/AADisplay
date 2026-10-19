@@ -853,6 +853,12 @@ class CarPlaySourceSession(
         }
     }
 
+    /** Prompt the 300s Bluetooth discoverable system dialog (pairing / re-pair). */
+    fun requestDiscoverableDialog() {
+        bluetooth?.requestDiscoverableDialog()
+            ?: CarPlayBluetoothLink.launchDiscoverableDialog(appContext)
+    }
+
     fun stop() {
         if (!running.compareAndSet(true, false)) return
         val (sent, bytes) = rtsp?.rtpStats() ?: (0L to 0L)

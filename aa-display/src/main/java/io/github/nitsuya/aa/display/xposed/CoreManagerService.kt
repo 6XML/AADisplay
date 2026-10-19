@@ -204,22 +204,30 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
         private fun resolveEffectiveDensityDpi(reportedHostDpi: Int): Int {
             val override = DisplayDpiStore.loadConfigured(contentResolverOrNull())
             if (override > 0) return override
+            // CarPlay: no HU density negotiate — stick to Host-reported encode dpi
+            // (ENCODE_UI_DENSITY_DPI). Do not fall back to a leftover AA gearhead value.
+            if (carPlaySessionLive) {
+                return reportedHostDpi.coerceAtLeast(1)
+            }
             val host = reportedHostDpi.takeIf { it > 0 }
                 ?: mLastReportedHostDensityDpi.takeIf { it > 0 }
                 ?: DisplayDpiStore.loadLastHuReported(contentResolverOrNull())
             return host.coerceAtLeast(1)
         }
 
-        /** Apply configured override / latest host dpi to a live AA session. */
+        /** Apply configured override / latest host dpi to a live AA / CarPlay session. */
         private fun applyDensityOverrideLive() {
             val controller = mSplitController ?: return
             val profile = mLockedDisplayProfile ?: return
             val configured = DisplayDpiStore.loadConfigured(contentResolverOrNull())
-            val host = mLastReportedHostDensityDpi.takeIf { it > 0 }
-                ?: DisplayDpiStore.loadLastHuReported(contentResolverOrNull())
             val newDpi = if (configured > 0) {
                 configured
+            } else if (carPlaySessionLive) {
+                // No AA HU leftover: keep current profile (Host already sent encode default).
+                profile.densityDpi.coerceAtLeast(1)
             } else {
+                val host = mLastReportedHostDensityDpi.takeIf { it > 0 }
+                    ?: DisplayDpiStore.loadLastHuReported(contentResolverOrNull())
                 host.coerceAtLeast(1)
             }
             if (newDpi == profile.densityDpi && controller.mDensityDpi == newDpi) return
@@ -227,7 +235,8 @@ class CoreManagerService private constructor() : ICoreManager.Stub() {
             logDebug(
                 TAG,
                 "vdDensityDpi live apply: ${profile.densityDpi} -> $newDpi " +
-                    "configured=$configured host=$host controller=${controller.mDensityDpi}",
+                    "configured=$configured carPlay=$carPlaySessionLive " +
+                    "controller=${controller.mDensityDpi}",
             )
             controller.onReconnected(profile.width, profile.height, newDpi)
         }
