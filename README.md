@@ -232,6 +232,14 @@ A：仓库里有实验代码（见 [`archive/usb-carplay/`](archive/usb-carplay/
 - [Nitsuya](https://github.com/Nitsuya) — 原作者
 - [Stashboy](https://github.com/Stashboy) — 分支作者
 
+## 请作者喝杯咖啡吧
+
+<p align="center">
+  <img src="docs/donate/wechat-pay.jpg" alt="微信支付" width="280" />
+  &nbsp;&nbsp;
+  <img src="docs/donate/alipay.jpg" alt="支付宝" width="280" />
+</p>
+
 ## License
 
 继承上游许可证，GPL-3.0。
