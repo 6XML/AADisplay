@@ -72,6 +72,28 @@ class CarPlaySourceSession(
     /** Host / reportLive / audio-capture armed — only after HU dial or screen SETUP. */
     private val mediaPrepared = AtomicBoolean(false)
     @Volatile private var lastWifiSsid: String? = null
+    @Volatile private var pendingAudioReleaseReason = ""
+
+    /**
+     * HU media gone, but DiPlay often TEARDOWNs and SETUPs again within a couple
+     * of seconds. Wait before dropping session-live so phone volume returns on a
+     * real disconnect without flashing the speaker on a soft reconnect.
+     */
+    private val releasePhoneAudio = Runnable {
+        if (!running.get()) return@Runnable
+        if (rtsp?.isStreaming() == true) {
+            Log.i(CarPlayConsts.TAG, "skip phone audio release — streaming again")
+            return@Runnable
+        }
+        val reason = pendingAudioReleaseReason
+        Log.i(CarPlayConsts.TAG, "CarPlay HU gone ($reason) — restore phone volume")
+        ProjectionSessionGate.setCarPlayLive(false)
+        try {
+            CoreApi.reportCarPlaySessionLive(false)
+        } catch (e: Throwable) {
+            Log.e(CarPlayConsts.TAG, "reportCarPlaySessionLive(false) failed", e)
+        }
+    }
 
     fun start() {
         if (!running.compareAndSet(false, true)) return
@@ -122,6 +144,7 @@ class CarPlaySourceSession(
             onTouchEvent = { x, y, action -> CarPlayInputBridge.injectNormalized(x, y, action) },
             onForceKeyFrame = { encoder.requestKeyFrame() },
             linkSyncBytes = { iap2?.acceptedLinkSync() },
+            onHuMediaEnded = { reason -> schedulePhoneAudioRelease(reason) },
         )
         rtsp = rtspSession
         rtspSession.startServer()
@@ -139,6 +162,7 @@ class CarPlaySourceSession(
      */
     private fun prepareMediaPipeline(reason: String) {
         if (!running.get()) return
+        cancelPhoneAudioRelease()
         val first = mediaPrepared.compareAndSet(false, true)
         ProjectionSessionGate.setCarPlayLive(true)
         try {
@@ -859,8 +883,21 @@ class CarPlaySourceSession(
             ?: CarPlayBluetoothLink.launchDiscoverableDialog(appContext)
     }
 
+    private fun schedulePhoneAudioRelease(reason: String) {
+        if (!running.get()) return
+        pendingAudioReleaseReason = reason
+        Log.i(CarPlayConsts.TAG, "schedule phone audio release ($reason)")
+        mainHandler.removeCallbacks(releasePhoneAudio)
+        mainHandler.postDelayed(releasePhoneAudio, PHONE_AUDIO_RELEASE_DELAY_MS)
+    }
+
+    private fun cancelPhoneAudioRelease() {
+        mainHandler.removeCallbacks(releasePhoneAudio)
+    }
+
     fun stop() {
         if (!running.compareAndSet(true, false)) return
+        cancelPhoneAudioRelease()
         val (sent, bytes) = rtsp?.rtpStats() ?: (0L to 0L)
         Log.i(CarPlayConsts.TAG, "CarPlaySourceSession stop rtpSent=$sent rtpBytes=$bytes")
         cancelGlRebindRetry()
@@ -905,5 +942,8 @@ class CarPlaySourceSession(
 
         private const val GL_REBIND_DELAY_MS = 1_000L
         private const val GL_REBIND_MAX = 15
+
+        /** Real HU drop vs DiPlay TEARDOWN→SETUP. Volume stays held inside this window. */
+        private const val PHONE_AUDIO_RELEASE_DELAY_MS = 4_000L
     }
 }

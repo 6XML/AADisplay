@@ -582,7 +582,7 @@ USAGE_ASSISTANCE_NAVIGATION_GUIDANCE / ASSISTANT / SONIFICATION
 - Mute：仅 playback-capture → stream mute（含 VOICE_CALL/RING）+ local-device mute；`audio-policy-render` → **不** mute；remotesubmix 回退 → **不**静音。
 - 范围：手机→车机 **播放**（含通话下行）；车机麦上行 / 完整 CarPlay 电话协议不在此路径。
 - MediaProjection：system_server 内勿走 `BinderService.createProjection`（同进程 `checkCallingPermission` 恒拒）；直接构造服务内 `MediaProjection`（三星无 `createProjectionInternal`）。
-- 采集启停跟 FGS `reportCarPlaySessionLive`；egress `setEnabled(true)` 再断言，会话 live 时 ignore disable。
+- 采集启停跟 `reportCarPlaySessionLive`：HU dial / screen SETUP 置 true；FGS tearDown，或媒体链路结束（peer close / TEARDOWN / AirPlay control 结束，约 4s 内未再 SETUP）置 false 并恢复手机音量。仅 UDP egress 停不停采集。会话仍 live 时 ignore egress disable。`setStreamMute` 由 system uid 持有，不恢复则关模块也要重启才能动音量。
 
 **NowPlaying（仪表卡 / 歌词行）**
 

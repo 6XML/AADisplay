@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- **断开 CarPlay 后手机音量键失效，关模块也要重启：** 播放采集用 system uid `setStreamMute` 把各流静音，并在音量变化时立刻打回 0。会话 live 以前只在 FGS 销毁时清掉，车机断开后前台服务仍在听，静音就留在 `system_server`。现于媒体链路真正结束后约 4 秒恢复音量（期间若重新 SETUP 则取消）；采集已卸但静音还在时，`setEnabled(false)` 也会清 mute / 细音量。
+
 ## 0.3#17.8-r2 — 有线 USB 归档 · CarPlay-only · 空闲不占 CPU
 
 versionCode **3102** / versionName **0.3#17.8-r2**。相对 r1：公开主线只保无线 CarPlay + AA；有线假 iPhone 进 archive；无 AA 可默认走 CarPlay；切通道/武装不再空转吃满 CPU。

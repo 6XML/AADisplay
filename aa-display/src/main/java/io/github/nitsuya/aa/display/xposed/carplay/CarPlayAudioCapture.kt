@@ -47,8 +47,10 @@ import java.util.concurrent.atomic.AtomicLong
  * Scope: phone→car **playback** (media, nav, ringtone, call downlink). Car mic
  * uplink / full CarPlay telephony protocol is out of scope here.
  *
- * Arm / disarm follows the CarPlay FGS session ([reportCarPlaySessionLive]), not
- * individual RTSP audio SETUP/TEARDOWN — soft reconnect must not unmute the phone.
+ * Arm follows [reportCarPlaySessionLive] true (HU dial / screen SETUP).
+ * Disarm + volume restore follows live=false: FGS tearDown, or HU media actually
+ * gone (peer close / TEARDOWN) after a short debounce so a soft reconnect that
+ * SETUPs again does not flash the phone speaker. UDP-only egress stop does not disarm.
  */
 object CarPlayAudioCapture {
     private const val TAG = "AAD_CarPlayAudioCap"
@@ -158,6 +160,8 @@ object CarPlayAudioCapture {
     private var savedVolumes: IntArray? = null
     /** Parallel to [savedVolumes] — only streams that accepted get/set on this OEM. */
     private var mutedStreamTypes: IntArray? = null
+    /** Parallel to [mutedStreamTypes]. -1 = this OEM has no fine-volume API. */
+    private var savedFineVolumes: IntArray? = null
     private var phoneMuted = false
     /** Remotesubmix path: speaker-device volume zeroed (stream mute would silence the mix). */
     private var speakerDeviceMuted = false
@@ -199,6 +203,9 @@ object CarPlayAudioCapture {
 
     fun setEnabled(enabled: Boolean) {
         var reassertMute = false
+        // Tap already down (rearm gap / enable failed) but stream mute still held.
+        // enabled==armed used to return here and leave setStreamMute until reboot.
+        var restoreWhileIdle = false
         synchronized(opLock) {
             desired.set(enabled)
             // Already armed: still re-assert phone mute (OEM may restore MUSIC on playback).
@@ -211,7 +218,7 @@ object CarPlayAudioCapture {
                 }
                 // Fall through: enforce outside opLock (see below).
             } else if (enabled == armed.get()) {
-                return
+                restoreWhileIdle = !enabled && (phoneMuted || speakerDeviceMuted)
             } else {
                 // AIDL arrives with the app uid; MediaProjection / REMOTE_SUBMIX / AudioPolicy
                 // all check Binder.getCallingUid() for CAPTURE_AUDIO_OUTPUT /
@@ -227,6 +234,21 @@ object CarPlayAudioCapture {
                     Binder.restoreCallingIdentity(identity)
                 }
                 return
+            }
+        }
+        if (restoreWhileIdle) {
+            val identity = Binder.clearCallingIdentity()
+            try {
+                val am = audioManager
+                if (am != null) {
+                    synchronized(opLock) {
+                        if (!desired.get() && !armed.get()) {
+                            clearHeldMuteLocked(am, "setEnabled(false)-idle")
+                        }
+                    }
+                }
+            } finally {
+                Binder.restoreCallingIdentity(identity)
             }
         }
         if (reassertMute) {
@@ -263,6 +285,7 @@ object CarPlayAudioCapture {
         if (!phoneMuted) {
             mutedStreamTypes = null
             savedVolumes = null
+            savedFineVolumes = null
         }
         if (!speakerDeviceMuted) {
             savedSpeakerVolumes = null
@@ -454,6 +477,7 @@ object CarPlayAudioCapture {
         if (phoneMuted) restorePhoneStreams(am)
         if (speakerDeviceMuted) restoreLocalPlaybackDevices()
         savedVolumes = null
+        savedFineVolumes = null
         mutedStreamTypes = null
         phoneMuted = false
         speakerDeviceMuted = false
@@ -518,6 +542,7 @@ object CarPlayAudioCapture {
                 restoreLocalPlaybackDevices()
             }
             savedVolumes = null
+            savedFineVolumes = null
             mutedStreamTypes = null
             phoneMuted = false
             speakerDeviceMuted = false
@@ -678,17 +703,23 @@ object CarPlayAudioCapture {
     private fun mutePhoneStreams(am: AudioManager): Boolean {
         val firstArm = mutedStreamTypes == null || savedVolumes == null
         val vols = ArrayList<Int>(MUTED_STREAMS.size)
+        val fines = ArrayList<Int>(MUTED_STREAMS.size)
         val types = ArrayList<Int>(MUTED_STREAMS.size)
         for (stream in MUTED_STREAMS) {
             val cur = runCatching { am.getStreamVolume(stream) }.getOrNull() ?: continue
+            val fine = if (firstArm) readOemFineVolume(am, stream) else -1
             runCatching { am.setStreamMute(stream, true) }
             val setOk = runCatching { am.setStreamVolume(stream, 0, 0) }
             if (setOk.isFailure) {
                 logDebug(TAG, "setStreamVolume($stream) skipped: ${setOk.exceptionOrNull()?.message}")
                 continue
             }
+            if (firstArm) zeroOemFineVolume(am, stream)
             types.add(stream)
-            if (firstArm) vols.add(cur)
+            if (firstArm) {
+                vols.add(cur)
+                fines.add(fine)
+            }
         }
         if (types.isEmpty()) {
             log(TAG, "phone stream mute: no usable streams")
@@ -698,21 +729,28 @@ object CarPlayAudioCapture {
         if (firstArm) {
             mutedStreamTypes = types.toIntArray()
             savedVolumes = vols.toIntArray()
-            log(TAG, "phone stream mute ok streams=${types} saved=${vols}")
+            savedFineVolumes = fines.toIntArray()
+            log(TAG, "phone stream mute ok streams=${types} saved=${vols} fine=${fines}")
         }
         return true
     }
 
     private fun restorePhoneStreams(am: AudioManager?) {
         if (am == null) return
-        val types = mutedStreamTypes ?: return
-        val vols = savedVolumes ?: return
+        val types = mutedStreamTypes ?: MUTED_STREAMS.toIntArray()
+        val vols = savedVolumes
+        val fines = savedFineVolumes
+        // Always clear setStreamMute. A system-uid mute survives module disable
+        // until process restart, and volume keys will not move the stream.
         for (i in types.indices) {
-            if (i >= vols.size) break
             val stream = types[i]
-            val vol = vols[i]
             runCatching { am.setStreamMute(stream, false) }
-            runCatching { am.setStreamVolume(stream, vol, 0) }
+            val vol = vols?.getOrNull(i)
+            if (vol != null && vol > 0) {
+                runCatching { am.setStreamVolume(stream, vol, 0) }
+            }
+            val fine = fines?.getOrNull(i) ?: -1
+            if (fine >= 0) writeOemFineVolume(am, stream, fine)
         }
     }
 
@@ -782,6 +820,56 @@ object CarPlayAudioCapture {
                         }
                         4 -> if (pts.all { it == Int::class.javaPrimitiveType }) {
                             m.invoke(am, stream, 0, 0, 2 /* SPEAKER */)
+                            return@runCatching true
+                        }
+                    }
+                }
+                false
+            }.getOrNull() == true
+            if (ok) return
+        }
+    }
+
+    /** @return fine index, or -1 when this OEM has no readable fine-volume API. */
+    private fun readOemFineVolume(am: AudioManager, stream: Int): Int {
+        val names = listOf("semGetFineVolume", "getFineVolume", "getFineVolumeIndex")
+        for (name in names) {
+            val value = runCatching {
+                val methods = am.javaClass.methods.filter { it.name == name }
+                for (m in methods) {
+                    val pts = m.parameterTypes
+                    if (pts.size == 1 && pts[0] == Int::class.javaPrimitiveType) {
+                        val got = m.invoke(am, stream)
+                        if (got is Int) return@runCatching got
+                    }
+                }
+                null
+            }.getOrNull()
+            if (value != null) return value
+        }
+        return -1
+    }
+
+    private fun writeOemFineVolume(am: AudioManager, stream: Int, index: Int) {
+        val names = listOf("semSetFineVolume", "setFineVolume", "setFineVolumeIndex")
+        for (name in names) {
+            val ok = runCatching {
+                val methods = am.javaClass.methods.filter { it.name == name }
+                for (m in methods) {
+                    val pts = m.parameterTypes
+                    when (pts.size) {
+                        2 -> if (pts[0] == Int::class.javaPrimitiveType &&
+                            pts[1] == Int::class.javaPrimitiveType
+                        ) {
+                            m.invoke(am, stream, index)
+                            return@runCatching true
+                        }
+                        3 -> if (pts.all { it == Int::class.javaPrimitiveType }) {
+                            m.invoke(am, stream, index, 0)
+                            return@runCatching true
+                        }
+                        4 -> if (pts.all { it == Int::class.javaPrimitiveType }) {
+                            m.invoke(am, stream, index, 0, 2 /* SPEAKER */)
                             return@runCatching true
                         }
                     }
@@ -1694,8 +1782,9 @@ object CarPlayAudioCapture {
         handler.postDelayed(
             {
                 if (!desired.get()) {
-                    // Session released — if somehow still armed, full unmute path.
-                    if (armed.get()) setEnabled(false)
+                    // Session released. Also restore when the tap is already down but
+                    // setStreamMute / device index was left held across a rearm gap.
+                    if (armed.get() || phoneMuted || speakerDeviceMuted) setEnabled(false)
                     return@postDelayed
                 }
                 if (System.currentTimeMillis() - lastPullMs.get() > PULL_TIMEOUT_MS) {

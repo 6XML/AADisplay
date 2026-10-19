@@ -51,6 +51,11 @@ class CarPlayRtspSession(
     private val onForceKeyFrame: () -> Unit = {},
     /** Bluetooth-negotiated LSP. Null until iAP link sync has finished. */
     private val linkSyncBytes: () -> ByteArray? = { null },
+    /**
+     * HU media producers dropped (not listen-socket stop).
+     * Caller debounces before restoring phone volume.
+     */
+    private val onHuMediaEnded: (reason: String) -> Unit = {},
 ) {
     private val running = AtomicBoolean(false)
     private val streaming = AtomicBoolean(false)
@@ -475,6 +480,10 @@ class CarPlayRtspSession(
         CarPlayWheelController.setEnabled(false)
         CarPlayMediaClock.clear()
         Log.i(CarPlayConsts.TAG, "releaseMediaStreams reason=$reason")
+        // rtsp-stop is FGS/session teardown, which restores volume itself.
+        if (reason != "rtsp-stop") {
+            onHuMediaEnded(reason)
+        }
     }
 
     /** MIB3 Wi‑Fi iAP2 NowPlaying transport, or null when DiPlay / not yet armed. */
